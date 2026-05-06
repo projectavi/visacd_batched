@@ -320,6 +320,7 @@ vector<unsigned int> run_optix(vector<Vec3D> vertices, vector<bool> new_mask, Me
   CUCHK(cudaFree((void *)d_rg_rec));
   CUCHK(cudaFree((void *)d_ms_rec));
   CUCHK(cudaFree((void *)d_hg_rec));
+  if (d_new_mask) CUCHK(cudaFree(d_new_mask));
 
   return h_uM;
 }
