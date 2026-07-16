@@ -10,7 +10,7 @@ At the core of the approach is a **visibility edge** concavity metric: edges bet
 
 ## Installation
 
-**Requirements:** CUDA-capable GPU, NVIDIA OptiX 8.0, Python ≥ 3.8. Tested with CUDA 12.2.
+**Requirements:** CUDA-capable GPU, NVIDIA OptiX 8.0, Python ≥ 3.8. Tested with CUDA 12.2. RTX 50-series GPUs (compute capability 12.0) require CUDA 12.8 or newer; CUDA 12.8 is recommended for this configuration.
 
 ### 1. Clone with submodules
 
@@ -27,16 +27,46 @@ Download [OptiX 8.0](https://developer.nvidia.com/designworks/optix/downloads/le
 export OptiX_INSTALL_DIR=/path/to/optix
 ```
 
-### 3. Set CUDA compiler (if not on PATH)
+### 3. Install and select the CUDA compiler
+
+For an RTX 50-series GPU, install CUDA 12.8 in the Conda environment:
 
 ```bash
-export CUDACXX=/path/to/cuda/bin/nvcc
+conda activate visacd
+conda install -c nvidia cuda-nvcc=12.8
+
+# Reactivate the environment so the newly installed CUDA compiler hooks run.
+# Clearing these variables also removes stale values left by another CUDA version.
+conda deactivate
+unset NVCC_PREPEND_FLAGS NVCC_PREPEND_FLAGS_BACKUP
+unset NVCC_APPEND_FLAGS NVCC_APPEND_FLAGS_BACKUP
+conda activate visacd
+
+export CUDACXX="$CONDA_PREFIX/bin/nvcc"
+nvcc --version
+```
+
+The reported compiler version should be CUDA 12.8. The `CUDA Version` shown by `nvidia-smi` is the maximum version supported by the driver, not necessarily the version of `nvcc` used for this build.
+
+If CUDA 12.8 is installed outside Conda instead, select its compiler explicitly:
+
+```bash
+export CUDACXX=/path/to/cuda-12.8/bin/nvcc
+```
+
+On a machine with multiple GPUs, set the PTX compute capability explicitly to avoid passing multiple values from `nvidia-smi` to the build. For an RTX 5090:
+
+```bash
+export PTX_COMPUTE=120
 ```
 
 ### 4. Install (might take a while)
 
+When changing CUDA compilers, remove the previous generated build directory first so CMake does not reuse the old compiler path:
+
 ```bash
-pip install .
+rm -rf build
+python -m pip install -e .
 ```
 
 ## Usage

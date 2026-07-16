@@ -26,7 +26,7 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake")
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-stringop-overflow")
-set(OPENVDB_CORE_SHARED OFF)
+set(OPENVDB_CORE_SHARED OFF CACHE BOOL "" FORCE)
 set(TBB_TEST OFF CACHE BOOL "" FORCE)
 
 
@@ -118,7 +118,8 @@ find_package(CUDA REQUIRED)
 target_include_directories(visacd_core PRIVATE ${CUDA_INCLUDE_DIRS})
 
 find_library(CUDA_DRIVER_LIBRARY cuda
-    HINTS ${CUDA_TOOLKIT_ROOT_DIR}/lib64/stubs
+    HINTS ${CUDA_TOOLKIT_ROOT_DIR}/lib/stubs
+          ${CUDA_TOOLKIT_ROOT_DIR}/lib64/stubs
           ${CUDA_TOOLKIT_ROOT_DIR}/targets/x86_64-linux/lib/stubs
 )
 target_link_libraries(visacd_core PRIVATE ${CUDA_LIBRARIES} ${CUDA_DRIVER_LIBRARY} dl)
