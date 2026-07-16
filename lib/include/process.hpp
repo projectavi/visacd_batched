@@ -13,6 +13,8 @@ struct ProcessResult {
 };
 
 ProcessResult process(Mesh mesh, double concavity, int num_parts);
+std::vector<ProcessResult> process_batch(MeshList meshes, double concavity,
+                                         int num_parts);
 double compute_final_concavity(MeshList &parts, MeshList &hulls);
 
 

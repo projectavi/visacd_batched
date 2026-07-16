@@ -35,7 +35,11 @@ PYBIND11_MODULE(visacd, m)
                        &neural_acd::Config::use_flat_surfaces)
         .def_readwrite("flat_surface_k",
                        &neural_acd::Config::flat_surface_k)
-        .def_readwrite("use_merging", &neural_acd::Config::use_merging);
+        .def_readwrite("use_merging", &neural_acd::Config::use_merging)
+        .def_readwrite("max_batch_size",
+                       &neural_acd::Config::max_batch_size)
+        .def_readwrite("batch_memory_fraction",
+                       &neural_acd::Config::batch_memory_fraction);
 
     m.def("make_vecarray3i", [](py::array_t<int> input)
           {
@@ -67,4 +71,6 @@ PYBIND11_MODULE(visacd, m)
 
     m.def("process", &neural_acd::process, py::arg("mesh"), py::arg("concavity"),
           py::arg("num_parts"));
+    m.def("process_batch", &neural_acd::process_batch, py::arg("meshes"),
+          py::arg("concavity"), py::arg("num_parts"));
 }

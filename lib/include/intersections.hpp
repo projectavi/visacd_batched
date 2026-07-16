@@ -1,7 +1,9 @@
 #pragma once
 
 #include <core.hpp>
+#include <memory>
 #include <optixUtils.hpp>
+#include <utility>
 #include <vector>
 
 namespace neural_acd {
@@ -20,9 +22,38 @@ struct HitgroupData {
   const uint3 *indices;
 };
 
+class OptixRuntime {
+public:
+  OptixRuntime();
+  ~OptixRuntime();
+
+  OptixRuntime(const OptixRuntime &) = delete;
+  OptixRuntime &operator=(const OptixRuntime &) = delete;
+  OptixRuntime(OptixRuntime &&) noexcept;
+  OptixRuntime &operator=(OptixRuntime &&) noexcept;
+
+  struct Impl;
+
+private:
+  std::unique_ptr<Impl> impl_;
+
+  friend std::vector<std::vector<std::pair<unsigned int, unsigned int>>>
+  compute_intersection_matrices(
+      const std::vector<std::pair<Mesh *, Mesh *>> &, OptixRuntime &, size_t,
+      double);
+};
+
 std::vector<std::pair<unsigned int, unsigned int>>
 compute_intersection_matrix(Mesh &mesh, Mesh &cage,
                             OptixDeviceContext &context);
-// Returns upper-triangular part of intersection matrix (row-major)
+
+// Each request contains the point mesh and the cage to test it against. The
+// returned edge lists have the same order as requests. Independent OptiX jobs
+// are submitted concurrently in memory-aware waves.
+std::vector<std::vector<std::pair<unsigned int, unsigned int>>>
+compute_intersection_matrices(
+    const std::vector<std::pair<Mesh *, Mesh *>> &requests,
+    OptixRuntime &runtime, size_t max_batch_size = 0,
+    double memory_fraction = 0.7);
 
 } // namespace neural_acd

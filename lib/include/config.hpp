@@ -14,6 +14,8 @@ public:
   double flat_surface_k;
 
   bool use_merging;
+  int max_batch_size;
+  double batch_memory_fraction;
 
   Config() {
     return_parts = false;
@@ -24,6 +26,8 @@ public:
     use_flat_surfaces = true;
     flat_surface_k = 2.0;
     use_merging = false;
+    max_batch_size = 0;
+    batch_memory_fraction = 0.7;
   }
 };
 
