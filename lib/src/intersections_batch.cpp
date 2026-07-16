@@ -8,6 +8,7 @@
 #include <limits>
 #include <memory>
 #include <optixUtils.hpp>
+#include <optix_function_table_definition.h>
 #include <sstream>
 #include <stdexcept>
 #include <string>

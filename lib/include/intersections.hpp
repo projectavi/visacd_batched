@@ -43,10 +43,6 @@ private:
       double);
 };
 
-std::vector<std::pair<unsigned int, unsigned int>>
-compute_intersection_matrix(Mesh &mesh, Mesh &cage,
-                            OptixDeviceContext &context);
-
 // Each request contains the point mesh and the cage to test it against. The
 // returned edge lists have the same order as requests. Independent OptiX jobs
 // are submitted concurrently in memory-aware waves.
