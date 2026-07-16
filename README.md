@@ -102,6 +102,43 @@ for part in result.parts:
 scene.export("decomposition.glb")
 ```
 
+### Batch decomposition
+
+When several meshes are available up front, submit them together so independent
+GPU work can overlap:
+
+```python
+def load_visacd_mesh(path):
+    tm = trimesh.load(path, force="mesh")
+    mesh = visacd.Mesh()
+    mesh.vertices = visacd.VecArray3d(tm.vertices.tolist())
+    mesh.triangles = visacd.make_vecarray3i(
+        np.asarray(tm.faces, dtype=np.int32)
+    )
+    return mesh
+
+meshes = [load_visacd_mesh(path) for path in mesh_paths]
+visacd.set_seed(42)
+results = visacd.process_batch(
+    meshes, concavity=0.04, num_parts=32
+)
+```
+
+The returned list has one `ProcessResult` per input mesh in the same order.
+All meshes share `concavity` and `num_parts`; their vertex counts may differ.
+
+Batching targets the current CUDA device. Intersection and plane-scoring jobs run
+on independent streams and are divided into memory-aware waves:
+
+- `visacd.config.max_batch_size = 0` lets VisACD choose the wave size. Set a
+  positive value to cap the number of work items processed in one GPU wave.
+- `visacd.config.batch_memory_fraction = 0.7` controls the fraction of currently
+  free VRAM a wave may use and must be in `(0, 1]`.
+
+Call `set_seed` immediately before each `process_batch` call for repeatable
+whole-batch results. A seeded batch is not required to match separate seeded
+`process` calls because random candidate generation is interleaved across meshes.
+
 ## decompose.py
 
 [decompose.py](decompose.py) is a ready-to-use CLI script:

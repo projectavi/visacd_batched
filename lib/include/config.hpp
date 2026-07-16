@@ -14,8 +14,8 @@ public:
   double flat_surface_k;
 
   bool use_merging;
-  int max_batch_size;
-  double batch_memory_fraction;
+  int max_batch_size;           // 0 selects memory-aware automatic sizing
+  double batch_memory_fraction; // fraction of currently free device memory
 
   Config() {
     return_parts = false;
