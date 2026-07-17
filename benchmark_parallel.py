@@ -70,6 +70,11 @@ def parse_args():
         action="store_true",
         help="show native per-mesh progress output",
     )
+    parser.add_argument(
+        "--stage-timing",
+        action="store_true",
+        help="print native cumulative stage timings to stderr",
+    )
     args = parser.parse_args()
 
     if args.num_meshes < 1:
@@ -153,6 +158,10 @@ def main():
         )
     else:
         os.environ.pop("VISACD_OPTIX_MAX_CONCURRENCY", None)
+    if args.stage_timing:
+        os.environ["VISACD_STAGE_TIMING"] = "1"
+    else:
+        os.environ.pop("VISACD_STAGE_TIMING", None)
 
     print(
         "mesh={} n={} repeats={} cpu_threads={} max_batch_size={} "

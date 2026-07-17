@@ -60,6 +60,117 @@ constexpr size_t kMaxAutomaticCpuThreads = 200;
 constexpr size_t kCandidatePlaneCount = 2500;
 constexpr size_t kCandidateAttemptMultiplier = 5;
 
+enum class ProfileStage {
+  preprocess,
+  flat_surfaces,
+  components_gpu,
+  components_cpu,
+  intersections,
+  selection_hulls,
+  hausdorff,
+  candidates,
+  plane_scoring,
+  plane_selection,
+  clip_prepare,
+  clip_construct,
+  child_cage,
+  final_hulls_cpu,
+  merges,
+  count
+};
+
+constexpr size_t kProfileStageCount =
+    static_cast<size_t>(ProfileStage::count);
+
+class StageProfiler {
+public:
+  StageProfiler() {
+    const char *value = getenv("VISACD_STAGE_TIMING");
+    enabled_ = value && *value && string(value) != "0";
+    for (auto &value : nanoseconds_)
+      value.store(0, memory_order_relaxed);
+    for (auto &value : calls_)
+      value.store(0, memory_order_relaxed);
+    for (auto &value : items_)
+      value.store(0, memory_order_relaxed);
+  }
+
+  bool enabled() const { return enabled_; }
+
+  void record(ProfileStage stage, chrono::steady_clock::duration duration,
+              size_t items) {
+    const size_t index = static_cast<size_t>(stage);
+    nanoseconds_[index].fetch_add(
+        chrono::duration_cast<chrono::nanoseconds>(duration).count(),
+        memory_order_relaxed);
+    calls_[index].fetch_add(1, memory_order_relaxed);
+    items_[index].fetch_add(items, memory_order_relaxed);
+  }
+
+  void report(chrono::steady_clock::duration total, size_t mesh_count) const {
+    if (!enabled_)
+      return;
+    static const array<const char *, kProfileStageCount> names = {
+        "preprocess",       "flat_surfaces",   "components_gpu",
+        "components_cpu",  "intersections",   "selection_hulls",
+        "hausdorff",        "candidates",      "plane_scoring",
+        "plane_selection", "clip_prepare",    "clip_construct",
+        "child_cage",       "final_hulls_cpu", "merges"};
+
+    ostringstream output;
+    output << fixed << setprecision(3)
+           << "[visacd stages] total_ms="
+           << chrono::duration<double, milli>(total).count()
+           << " meshes=" << mesh_count << '\n';
+    for (size_t index = 0; index < names.size(); ++index) {
+      const unsigned long long calls =
+          calls_[index].load(memory_order_relaxed);
+      if (calls == 0)
+        continue;
+      const double milliseconds =
+          static_cast<double>(
+              nanoseconds_[index].load(memory_order_relaxed)) /
+          1.0e6;
+      output << "[visacd stages] stage=" << names[index]
+             << " calls=" << calls
+             << " items=" << items_[index].load(memory_order_relaxed)
+             << " wall_ms=" << milliseconds << '\n';
+    }
+    cerr << output.str();
+    cerr.flush();
+  }
+
+private:
+  bool enabled_ = false;
+  array<atomic<long long>, kProfileStageCount> nanoseconds_;
+  array<atomic<unsigned long long>, kProfileStageCount> calls_;
+  array<atomic<unsigned long long>, kProfileStageCount> items_;
+};
+
+class StageTimer {
+public:
+  StageTimer(StageProfiler &profiler, ProfileStage stage, size_t items)
+      : profiler_(profiler.enabled() ? &profiler : nullptr), stage_(stage),
+        items_(items) {
+    if (profiler_)
+      start_ = chrono::steady_clock::now();
+  }
+
+  ~StageTimer() {
+    if (profiler_)
+      profiler_->record(stage_, chrono::steady_clock::now() - start_, items_);
+  }
+
+  StageTimer(const StageTimer &) = delete;
+  StageTimer &operator=(const StageTimer &) = delete;
+
+private:
+  StageProfiler *profiler_;
+  ProfileStage stage_;
+  size_t items_;
+  chrono::steady_clock::time_point start_;
+};
+
 struct PartCache {
   optional<Mesh> hull;
   optional<double> selection_concavity;
@@ -779,6 +890,9 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
   if (meshes.empty())
     return {};
 
+  StageProfiler profiler;
+  const auto process_start = chrono::steady_clock::now();
+
   const size_t cpu_threads = configured_cpu_threads(meshes.size());
   const size_t gpu_host_threads =
       configured_gpu_host_threads(cpu_threads);
@@ -945,6 +1059,7 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
     for (size_t part_index : missing_hulls) {
       coordinator.submit_cpu(
           [&, work, part_index]() {
+            StageTimer timer(profiler, ProfileStage::final_hulls_cpu, 1);
             states[work->state_index].parts[part_index].compute_ch(
                 work->hulls[part_index], true);
             if (work->remaining.fetch_sub(1) == 1)
@@ -1084,7 +1199,11 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
     coordinator.submit_cpu(
         [&, work = move(work)]() mutable {
           BatchState &state = states[work->state_index];
-          separate_disjoint_prepared(work->parts, work->labels);
+          {
+            StageTimer timer(profiler, ProfileStage::components_cpu,
+                             work->parts.size());
+            separate_disjoint_prepared(work->parts, work->labels);
+          }
 
           if (work->initial) {
             state.parts = move(work->parts);
@@ -1131,9 +1250,12 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
                ++part_index) {
             coordinator.submit_cpu(
                 [&, intersections, remaining, part_index]() {
-                  manifold_preprocess(
-                      intersections->pending_parts[part_index].cage, 40,
-                      0.02);
+                  {
+                    StageTimer timer(profiler, ProfileStage::child_cage, 1);
+                    manifold_preprocess(
+                        intersections->pending_parts[part_index].cage, 40,
+                        0.02);
+                  }
                   if (remaining->fetch_sub(1) == 1)
                     coordinator.enqueue_intersections(intersections);
                 },
@@ -1146,6 +1268,7 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
   schedule_clip = [&](shared_ptr<SplitWork> split) {
     coordinator.submit_cpu(
         [&, split = move(split)]() mutable {
+          StageTimer timer(profiler, ProfileStage::clip_construct, 1);
           BatchState &state = states[split->state_index];
           int *first_map = nullptr;
           int *second_map = nullptr;
@@ -1185,8 +1308,11 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
 
   for (size_t state_index = 0; state_index < states.size(); ++state_index) {
     coordinator.submit_cpu([&, state_index]() {
-      initialize_state(move(meshes[state_index]), state_index,
-                       states[state_index]);
+      {
+        StageTimer timer(profiler, ProfileStage::preprocess, 1);
+        initialize_state(move(meshes[state_index]), state_index,
+                         states[state_index]);
+      }
       if (config.use_flat_surfaces) {
         auto surfaces = make_shared<FlatSurfaceWork>();
         surfaces->state_index = state_index;
@@ -1219,11 +1345,15 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
         }
         coordinator.submit_gpu(
             [&, inputs = move(inputs),
-             works = move(gpu_work.flat_surfaces)]() mutable {
+              works = move(gpu_work.flat_surfaces)]() mutable {
               try {
-                extract_flat_surfaces_batch(
-                    inputs, flat_surfaces, configured_batch_size(),
-                    gpu_memory_fraction, &executor);
+                {
+                  StageTimer timer(profiler, ProfileStage::flat_surfaces,
+                                   inputs.size());
+                  extract_flat_surfaces_batch(
+                      inputs, flat_surfaces, configured_batch_size(),
+                      gpu_memory_fraction, &executor);
+                }
                 for (shared_ptr<FlatSurfaceWork> &work : works) {
                   BatchState &state = states[work->state_index];
                   state.flat_surface_planes.reserve(
@@ -1269,9 +1399,13 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
             [&, inputs = move(inputs),
              works = move(gpu_work.merges)]() mutable {
               try {
-                merge_convex_hulls_batch(
-                    inputs, merges, configured_batch_size(),
-                    gpu_memory_fraction, &executor);
+                {
+                  StageTimer timer(profiler, ProfileStage::merges,
+                                   inputs.size());
+                  merge_convex_hulls_batch(
+                      inputs, merges, configured_batch_size(),
+                      gpu_memory_fraction, &executor);
+                }
                 for (shared_ptr<MergeWork> &work : works) {
                   const size_t remaining =
                       work->finalize_work->hulls.size();
@@ -1310,9 +1444,14 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
             [&, requests = move(requests),
              works = move(gpu_work.intersections)]() mutable {
               try {
-                auto edges = compute_intersection_matrices(
-                    requests, optix, configured_batch_size(),
-                    gpu_memory_fraction, &executor);
+                vector<vector<pair<unsigned int, unsigned int>>> edges;
+                {
+                  StageTimer timer(profiler, ProfileStage::intersections,
+                                   requests.size());
+                  edges = compute_intersection_matrices(
+                      requests, optix, configured_batch_size(),
+                      gpu_memory_fraction, &executor);
+                }
                 append_intersections(requests, edges, executor);
 
                 for (shared_ptr<IntersectionWork> &work : works) {
@@ -1372,9 +1511,13 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
             [&, inputs = move(inputs),
              works = move(gpu_work.hulls)]() mutable {
               try {
-                compute_convex_hulls_batch(
-                    inputs, convex_hulls, configured_batch_size(),
-                    gpu_memory_fraction);
+                {
+                  StageTimer timer(profiler, ProfileStage::selection_hulls,
+                                   inputs.size());
+                  compute_convex_hulls_batch(
+                      inputs, convex_hulls, configured_batch_size(),
+                      gpu_memory_fraction);
+                }
                 for (shared_ptr<HullWork> &work : works)
                   schedule_advance(work->state_index);
                 coordinator.complete_gpu_batch(GpuWorkKind::hulls);
@@ -1453,9 +1596,13 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
             [&, jobs = move(jobs),
              works = move(gpu_work.hausdorff)]() mutable {
               try {
-                evaluate_hausdorff_batch(
-                    jobs, hausdorff, configured_batch_size(),
-                    gpu_memory_fraction);
+                {
+                  StageTimer timer(profiler, ProfileStage::hausdorff,
+                                   jobs.size());
+                  evaluate_hausdorff_batch(
+                      jobs, hausdorff, configured_batch_size(),
+                      gpu_memory_fraction);
+                }
 
                 for (shared_ptr<HausdorffWork> &work : works) {
                   if (work->purpose == HausdorffPurpose::selection) {
@@ -1528,9 +1675,13 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
             [&, inputs = move(inputs),
              works = move(gpu_work.components)]() mutable {
               try {
-                label_components_batch(
-                    inputs, component_batch, configured_batch_size(),
-                    gpu_memory_fraction);
+                {
+                  StageTimer timer(profiler, ProfileStage::components_gpu,
+                                   inputs.size());
+                  label_components_batch(
+                      inputs, component_batch, configured_batch_size(),
+                      gpu_memory_fraction);
+                }
                 for (shared_ptr<ComponentWork> &work : works)
                   schedule_components(move(work));
                 coordinator.complete_gpu_batch(
@@ -1567,9 +1718,13 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
           [&, candidate_inputs = move(candidate_inputs),
            splits = move(gpu_work.planes)]() mutable {
             try {
-              generate_candidate_planes_batch(
-                  candidate_inputs, candidate_planes,
-                  configured_batch_size(), gpu_memory_fraction);
+              {
+                StageTimer timer(profiler, ProfileStage::candidates,
+                                 candidate_inputs.size());
+                generate_candidate_planes_batch(
+                    candidate_inputs, candidate_planes,
+                    configured_batch_size(), gpu_memory_fraction);
+              }
 
               vector<shared_ptr<SplitWork>> active_splits;
               active_splits.reserve(splits.size());
@@ -1608,32 +1763,44 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
                            split->part.intersecting_edges.size()),
                        split->part_cache.device.get()});
                 }
-                classify_and_rate_planes_batch(
-                    score_inputs, plane_scoring,
-                    configured_batch_size(), gpu_memory_fraction);
+                {
+                  StageTimer timer(profiler, ProfileStage::plane_scoring,
+                                   score_inputs.size());
+                  classify_and_rate_planes_batch(
+                      score_inputs, plane_scoring,
+                      configured_batch_size(), gpu_memory_fraction);
+                }
 
                 vector<ClipBatchInput> clip_inputs;
                 clip_inputs.reserve(active_splits.size());
-                for (shared_ptr<SplitWork> &split : active_splits) {
-                  for (size_t index = split->flat_surface_offset;
-                       index < split->scores.size(); ++index) {
-                    split->scores[index] *=
-                        static_cast<float>(config.flat_surface_k);
-                  }
-                  split->selected_plane =
-                      max_element(split->scores.begin(),
-                                  split->scores.end()) -
-                      split->scores.begin();
-                  if (split->part_cache.device) {
-                    clip_inputs.push_back(
-                        {split->part_cache.device.get(),
-                         split->planes[split->selected_plane],
-                         &split->prepared_clip});
+                {
+                  StageTimer timer(profiler, ProfileStage::plane_selection,
+                                   active_splits.size());
+                  for (shared_ptr<SplitWork> &split : active_splits) {
+                    for (size_t index = split->flat_surface_offset;
+                         index < split->scores.size(); ++index) {
+                      split->scores[index] *=
+                          static_cast<float>(config.flat_surface_k);
+                    }
+                    split->selected_plane =
+                        max_element(split->scores.begin(),
+                                    split->scores.end()) -
+                        split->scores.begin();
+                    if (split->part_cache.device) {
+                      clip_inputs.push_back(
+                          {split->part_cache.device.get(),
+                           split->planes[split->selected_plane],
+                           &split->prepared_clip});
+                    }
                   }
                 }
-                prepare_clip_batch(
-                    clip_inputs, clip_batch, configured_batch_size(),
-                    gpu_memory_fraction);
+                {
+                  StageTimer timer(profiler, ProfileStage::clip_prepare,
+                                   clip_inputs.size());
+                  prepare_clip_batch(
+                      clip_inputs, clip_batch, configured_batch_size(),
+                      gpu_memory_fraction);
+                }
                 for (shared_ptr<SplitWork> &split : active_splits)
                   schedule_clip(move(split));
               }
@@ -1650,6 +1817,8 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
     throw;
   }
 
+  profiler.report(chrono::steady_clock::now() - process_start,
+                  states.size());
   return results;
 }
 
