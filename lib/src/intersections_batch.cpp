@@ -1,7 +1,9 @@
 #include <algorithm>
 #include <cmath>
+#include <condition_variable>
 #include <core.hpp>
 #include <cuda_runtime.h>
+#include <deque>
 #include <dlfcn.h>
 #include <edge_compaction.hpp>
 #include <filesystem>
@@ -9,6 +11,7 @@
 #include <intersections.hpp>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optixUtils.hpp>
 #include <optix_function_table_definition.h>
 #include <sstream>
@@ -531,7 +534,6 @@ struct OptixJob {
   }
 
   void finish_count() {
-    wait();
     if (word_count == 0)
       return;
     accepted_count = *slot.host_accepted_count;
@@ -556,11 +558,41 @@ struct OptixJob {
                           cudaMemcpyDeviceToHost, stream));
   }
 
-  void wait() {
-    if (stream)
-      CUCHK(cudaStreamSynchronize(stream));
-  }
 };
+
+class CompletionQueue {
+public:
+  void notify(size_t index) noexcept {
+    {
+      lock_guard<mutex> lock(mutex_);
+      ready_.push_back(index);
+    }
+    condition_.notify_one();
+  }
+
+  size_t wait() {
+    unique_lock<mutex> lock(mutex_);
+    condition_.wait(lock, [this]() { return !ready_.empty(); });
+    const size_t index = ready_.front();
+    ready_.pop_front();
+    return index;
+  }
+
+private:
+  mutex mutex_;
+  condition_variable condition_;
+  deque<size_t> ready_;
+};
+
+struct CompletionPayload {
+  CompletionQueue *queue = nullptr;
+  size_t index = 0;
+};
+
+void CUDART_CB notify_completion(void *payload) {
+  auto *completion = static_cast<CompletionPayload *>(payload);
+  completion->queue->notify(completion->index);
+}
 
 vector<vector<pair<unsigned int, unsigned int>>>
 run_wave(const vector<pair<Mesh *, Mesh *>> &requests, size_t begin, size_t end,
@@ -585,20 +617,32 @@ run_wave(const vector<pair<Mesh *, Mesh *>> &requests, size_t begin, size_t end,
     job->allocate();
   for (auto &job : jobs)
     job->enqueue();
-  for (auto &job : jobs)
-    job->enqueue_count();
-  for (auto &job : jobs)
-    job->finish_count();
-  for (auto &job : jobs)
-    job->allocate_compacted_segments();
+
+  CompletionQueue count_completions;
+  CompletionQueue result_completions;
+  vector<CompletionPayload> count_payloads(jobs.size());
+  vector<CompletionPayload> result_payloads(jobs.size());
   for (size_t local_idx = 0; local_idx < jobs.size(); ++local_idx) {
+    jobs[local_idx]->enqueue_count();
+    count_payloads[local_idx] = {&count_completions, local_idx};
+    CUCHK(cudaLaunchHostFunc(jobs[local_idx]->stream, notify_completion,
+                            &count_payloads[local_idx]));
+  }
+
+  for (size_t completed = 0; completed < jobs.size(); ++completed) {
+    const size_t local_idx = count_completions.wait();
+    OptixJob &job = *jobs[local_idx];
+    job.finish_count();
+    job.allocate_compacted_segments();
     runtime.slots[local_idx]->estimated_request_capacity =
         runtime.slots[local_idx]->retained_bytes();
+    job.enqueue_compacted_segments();
+    result_payloads[local_idx] = {&result_completions, local_idx};
+    CUCHK(cudaLaunchHostFunc(job.stream, notify_completion,
+                            &result_payloads[local_idx]));
   }
-  for (auto &job : jobs)
-    job->enqueue_compacted_segments();
-  for (auto &job : jobs)
-    job->wait();
+  for (size_t completed = 0; completed < jobs.size(); ++completed)
+    result_completions.wait();
 
   vector<vector<pair<unsigned int, unsigned int>>> results(end - begin);
   const auto decode_result = [&](size_t local_idx) {
