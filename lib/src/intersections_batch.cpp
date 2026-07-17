@@ -3,6 +3,7 @@
 #include <core.hpp>
 #include <cuda_runtime.h>
 #include <dlfcn.h>
+#include <edge_compaction.hpp>
 #include <filesystem>
 #include <fstream>
 #include <intersections.hpp>
@@ -75,15 +76,17 @@ size_t estimate_geometry_bytes(const Mesh &mesh) {
 }
 
 size_t estimate_request_bytes(const Mesh &points, const Mesh &cage) {
-  const size_t pair_bytes =
-      accepted_word_count(segment_count(points.vertices.size())) *
-      sizeof(unsigned int);
+  const size_t segments = segment_count(points.vertices.size());
+  const size_t word_bytes =
+      accepted_word_count(segments) * sizeof(unsigned int);
+  const size_t compaction_bytes =
+      segments * sizeof(unsigned int) + word_bytes * 4;
   const size_t point_bytes =
       points.vertices.size() * (sizeof(float) * 3 + sizeof(unsigned int));
 
   // GAS sizes depend on OptiX and the device. Use a conservative multiplier
   // plus fixed headroom when selecting memory-aware waves.
-  return pair_bytes + point_bytes + estimate_geometry_bytes(cage) * 4 +
+  return compaction_bytes + point_bytes + estimate_geometry_bytes(cage) * 4 +
          estimate_geometry_bytes(points) * 4 + (8u << 20);
 }
 
@@ -114,6 +117,7 @@ public:
   CUdeviceptr device_ptr() const {
     return reinterpret_cast<CUdeviceptr>(data_);
   }
+  size_t capacity() const { return capacity_; }
 
 private:
   void *data_ = nullptr;
@@ -129,21 +133,40 @@ struct OptixSlot {
   DeviceBuffer indices;
   DeviceBuffer self_indices;
   DeviceBuffer accepted_words;
+  DeviceBuffer word_offsets;
+  DeviceBuffer compaction_temp;
+  DeviceBuffer accepted_count;
+  DeviceBuffer compacted_segments;
   DeviceBuffer temp;
   DeviceBuffer gas_output;
   DeviceBuffer self_temp;
   DeviceBuffer self_gas_output;
   DeviceBuffer raygen_record;
+  unsigned int *host_accepted_count = nullptr;
 
   ~OptixSlot() {
     if (stream) {
       cudaStreamSynchronize(stream);
+      if (host_accepted_count)
+        cudaFreeHost(host_accepted_count);
       cudaStreamDestroy(stream);
     }
   }
 
   void initialize() {
     CUCHK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    CUCHK(cudaMallocHost(reinterpret_cast<void **>(&host_accepted_count),
+                         sizeof(unsigned int)));
+  }
+
+  size_t retained_bytes() const {
+    return points.capacity() + new_mask.capacity() + vertices.capacity() +
+           indices.capacity() + self_indices.capacity() +
+           accepted_words.capacity() + word_offsets.capacity() +
+           compaction_temp.capacity() + accepted_count.capacity() +
+           compacted_segments.capacity() + temp.capacity() +
+           gas_output.capacity() + self_temp.capacity() +
+           self_gas_output.capacity() + raygen_record.capacity();
   }
 };
 
@@ -280,7 +303,11 @@ struct OptixJob {
   vector<float> h_vertices;
   vector<uint3> h_indices;
   vector<uint3> h_self_indices;
-  vector<unsigned int> accepted_words;
+  vector<unsigned int> accepted_segments;
+  size_t segments = 0;
+  size_t word_count = 0;
+  size_t scan_temp_bytes = 0;
+  unsigned int accepted_count = 0;
 
   cudaStream_t stream = nullptr;
   float *d_points = nullptr;
@@ -289,6 +316,10 @@ struct OptixJob {
   uint3 *d_indices = nullptr;
   uint3 *d_self_indices = nullptr;
   unsigned int *d_accepted_words = nullptr;
+  unsigned int *d_word_offsets = nullptr;
+  void *d_compaction_temp = nullptr;
+  unsigned int *d_accepted_count = nullptr;
+  unsigned int *d_compacted_segments = nullptr;
   CUdeviceptr d_temp = 0;
   CUdeviceptr d_gas_output = 0;
   CUdeviceptr d_self_temp = 0;
@@ -321,7 +352,7 @@ struct OptixJob {
       throw invalid_argument("Mesh is_new mask must match its vertices");
     }
 
-    const size_t segments = segment_count(points_mesh.vertices.size());
+    segments = segment_count(points_mesh.vertices.size());
     if (segments > numeric_limits<unsigned int>::max())
       throw overflow_error("Too many segments for one OptiX launch");
     if (target.vertices.size() > numeric_limits<unsigned int>::max() ||
@@ -347,11 +378,11 @@ struct OptixJob {
                      static_cast<unsigned>(triangle[1]),
                      static_cast<unsigned>(triangle[2])));
     }
-    accepted_words.resize(accepted_word_count(segments));
+    word_count = accepted_word_count(segments);
   }
 
   void allocate() {
-    if (accepted_words.empty())
+    if (word_count == 0)
       return;
 
     slot.points.ensure(sizeof(float) * h_points.size());
@@ -366,8 +397,15 @@ struct OptixJob {
     d_indices = slot.indices.as<uint3>();
     slot.self_indices.ensure(sizeof(uint3) * h_self_indices.size());
     d_self_indices = slot.self_indices.as<uint3>();
-    slot.accepted_words.ensure(sizeof(unsigned int) * accepted_words.size());
+    slot.accepted_words.ensure(sizeof(unsigned int) * word_count);
     d_accepted_words = slot.accepted_words.as<unsigned int>();
+    slot.word_offsets.ensure(sizeof(unsigned int) * word_count);
+    d_word_offsets = slot.word_offsets.as<unsigned int>();
+    scan_temp_bytes = edge_compaction_temp_bytes(word_count);
+    slot.compaction_temp.ensure(scan_temp_bytes);
+    d_compaction_temp = slot.compaction_temp.as<void>();
+    slot.accepted_count.ensure(sizeof(unsigned int));
+    d_accepted_count = slot.accepted_count.as<unsigned int>();
     slot.raygen_record.ensure(sizeof(SbtRecord<RayGenData>));
     d_raygen_record = slot.raygen_record.device_ptr();
 
@@ -423,7 +461,7 @@ struct OptixJob {
   }
 
   void enqueue() {
-    if (accepted_words.empty())
+    if (word_count == 0)
       return;
 
     CUCHK(cudaMemcpyAsync(d_points, h_points.data(),
@@ -444,8 +482,7 @@ struct OptixJob {
                           sizeof(uint3) * h_self_indices.size(),
                           cudaMemcpyHostToDevice, stream));
     CUCHK(cudaMemsetAsync(d_accepted_words, 0,
-                          sizeof(unsigned int) * accepted_words.size(),
-                          stream));
+                          sizeof(unsigned int) * word_count, stream));
 
     OCHK(optixAccelBuild(runtime.context, stream, &accel_options, &build_input,
                          1, d_temp, gas_sizes.tempSizeInBytes, d_gas_output,
@@ -479,16 +516,43 @@ struct OptixJob {
     sbt.hitgroupRecordCount = 1;
 
     OCHK(optixLaunch(runtime.pipeline, stream, 0, 0, &sbt,
-                     static_cast<unsigned int>(
-                         segment_count(points_mesh.vertices.size())),
-                     1, 1));
+                     static_cast<unsigned int>(segments), 1, 1));
   }
 
-  void download() {
-    if (accepted_words.empty())
+  void enqueue_count() {
+    if (word_count == 0)
       return;
-    CUCHK(cudaMemcpyAsync(accepted_words.data(), d_accepted_words,
-                          sizeof(unsigned int) * accepted_words.size(),
+    count_compacted_segments_async(
+        d_accepted_words, d_word_offsets, word_count, d_accepted_count,
+        d_compaction_temp, scan_temp_bytes, stream);
+    CUCHK(cudaMemcpyAsync(slot.host_accepted_count, d_accepted_count,
+                          sizeof(unsigned int), cudaMemcpyDeviceToHost,
+                          stream));
+  }
+
+  void finish_count() {
+    wait();
+    if (word_count == 0)
+      return;
+    accepted_count = *slot.host_accepted_count;
+    accepted_segments.resize(accepted_count);
+  }
+
+  void allocate_compacted_segments() {
+    if (accepted_count == 0)
+      return;
+    slot.compacted_segments.ensure(sizeof(unsigned int) * accepted_count);
+    d_compacted_segments = slot.compacted_segments.as<unsigned int>();
+  }
+
+  void enqueue_compacted_segments() {
+    if (accepted_count == 0)
+      return;
+    scatter_compacted_segments_async(
+        d_accepted_words, d_word_offsets, word_count, segments,
+        d_compacted_segments, stream);
+    CUCHK(cudaMemcpyAsync(accepted_segments.data(), d_compacted_segments,
+                          sizeof(unsigned int) * accepted_count,
                           cudaMemcpyDeviceToHost, stream));
   }
 
@@ -519,45 +583,38 @@ run_wave(const vector<pair<Mesh *, Mesh *>> &requests, size_t begin, size_t end,
   // and decomposition iterations reuse both these buffers and their streams.
   for (auto &job : jobs)
     job->allocate();
-  for (size_t local_idx = 0; local_idx < jobs.size(); ++local_idx) {
-    OptixSlot &slot = *runtime.slots[local_idx];
-    slot.estimated_request_capacity =
-        max(slot.estimated_request_capacity,
-            estimate_request_bytes(*requests[begin + local_idx].first,
-                                   *requests[begin + local_idx].second));
-  }
   for (auto &job : jobs)
     job->enqueue();
   for (auto &job : jobs)
-    job->download();
+    job->enqueue_count();
+  for (auto &job : jobs)
+    job->finish_count();
+  for (auto &job : jobs)
+    job->allocate_compacted_segments();
+  for (size_t local_idx = 0; local_idx < jobs.size(); ++local_idx) {
+    runtime.slots[local_idx]->estimated_request_capacity =
+        runtime.slots[local_idx]->retained_bytes();
+  }
+  for (auto &job : jobs)
+    job->enqueue_compacted_segments();
   for (auto &job : jobs)
     job->wait();
 
   vector<vector<pair<unsigned int, unsigned int>>> results(end - begin);
   const auto decode_result = [&](size_t local_idx) {
     const Mesh &mesh = *requests[begin + local_idx].first;
-    const vector<unsigned int> &accepted_words =
-        jobs[local_idx]->accepted_words;
-    const size_t segments = segment_count(mesh.vertices.size());
+    const vector<unsigned int> &accepted_segments =
+        jobs[local_idx]->accepted_segments;
     auto &edges = results[local_idx];
+    edges.reserve(accepted_segments.size());
 
-    for (size_t word_index = 0; word_index < accepted_words.size();
-         ++word_index) {
-      unsigned int word = accepted_words[word_index];
-      while (word) {
-        const unsigned int bit =
-            static_cast<unsigned int>(__builtin_ctz(word));
-        const size_t segment = word_index * 32 + bit;
-        if (segment < segments) {
-          long long first, second;
-          linear_to_pair_batched(static_cast<long long>(segment),
-                                 static_cast<long long>(mesh.vertices.size()),
-                                 first, second);
-          edges.emplace_back(static_cast<unsigned int>(first),
-                             static_cast<unsigned int>(second));
-        }
-        word &= word - 1;
-      }
+    for (unsigned int segment : accepted_segments) {
+      long long first, second;
+      linear_to_pair_batched(static_cast<long long>(segment),
+                             static_cast<long long>(mesh.vertices.size()),
+                             first, second);
+      edges.emplace_back(static_cast<unsigned int>(first),
+                         static_cast<unsigned int>(second));
     }
   };
   if (executor)
