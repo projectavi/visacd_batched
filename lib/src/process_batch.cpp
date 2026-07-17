@@ -46,6 +46,8 @@ double compute_final_concavity(MeshList &parts, MeshList &hulls,
 
 namespace {
 
+constexpr size_t kMaxAutomaticCpuThreads = 200;
+
 struct BatchState {
   Mesh cage;
   MeshList parts;
@@ -85,7 +87,8 @@ size_t configured_cpu_threads(size_t work_size) {
   size_t requested = static_cast<size_t>(config.batch_cpu_threads);
   if (requested == 0) {
     const unsigned int available = thread::hardware_concurrency();
-    requested = available == 0 ? 2 : available;
+    const size_t hardware_threads = available == 0 ? 2 : available;
+    requested = min(hardware_threads, kMaxAutomaticCpuThreads);
   }
   return max<size_t>(1, min(requested, work_size));
 }
