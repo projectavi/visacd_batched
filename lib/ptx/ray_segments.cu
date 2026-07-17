@@ -7,7 +7,7 @@ struct RayGenData
     const unsigned int *new_mask;
     long long n_points;
     unsigned int has_mask;
-    unsigned int *uM; //[n_points*(n_points-1)/2] // output adjacency matrix (upper triangular, row-major)
+    unsigned int *accepted_words;
     OptixTraversableHandle cage_gas;
     OptixTraversableHandle self_gas;
 };
@@ -79,12 +79,12 @@ extern "C" __global__ void __raygen__rg()
         // Skip if neither point is new
         if (rg->new_mask[i] == 0 && rg->new_mask[j] == 0)
         {
-            rg->uM[launch_idx] = 0u;
             return;
         }
         // //Skip if both points are new (avoids bad intersecting edges)
         // if (rg->new_mask[i] == 1 && rg->new_mask[j] == 1){
-        //     rg->uM[launch_idx] = 2u;
+        //     atomicOr(&rg->accepted_words[launch_idx >> 5],
+        //              1u << (launch_idx & 31u));
         //     return;
         // }
     }
@@ -98,7 +98,6 @@ extern "C" __global__ void __raygen__rg()
     // Diagonal (i == j): no segment length; write 0 and skip.
     if (seg_len == 0.0f)
     {
-        rg->uM[launch_idx] = 0u;
         return;
     }
 
@@ -107,12 +106,15 @@ extern "C" __global__ void __raygen__rg()
 
     if (!trace_segment(rg->cage_gas, p, dir, seg_len))
     {
-        rg->uM[launch_idx] = 0u;
         return;
     }
 
-    rg->uM[launch_idx] =
-        trace_segment(rg->self_gas, p, dir, seg_len) ? 0u : 1u;
+    if (!trace_segment(rg->self_gas, p, dir, seg_len))
+    {
+        const unsigned int word = static_cast<unsigned int>(launch_idx >> 5);
+        const unsigned int bit = static_cast<unsigned int>(launch_idx & 31u);
+        atomicOr(&rg->accepted_words[word], 1u << bit);
+    }
 }
 
 

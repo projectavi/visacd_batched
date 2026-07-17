@@ -54,6 +54,10 @@ size_t segment_count(size_t n_points) {
   return n_points < 2 ? 0 : n_points * (n_points - 1) / 2;
 }
 
+size_t accepted_word_count(size_t segments) {
+  return (segments + 31) / 32;
+}
+
 void linear_to_pair_batched(long long k, long long n, long long &i,
                             long long &j) {
   const double kd = static_cast<double>(k);
@@ -71,7 +75,8 @@ size_t estimate_geometry_bytes(const Mesh &mesh) {
 
 size_t estimate_request_bytes(const Mesh &points, const Mesh &cage) {
   const size_t pair_bytes =
-      segment_count(points.vertices.size()) * sizeof(unsigned int);
+      accepted_word_count(segment_count(points.vertices.size())) *
+      sizeof(unsigned int);
   const size_t point_bytes =
       points.vertices.size() * (sizeof(float) * 3 + sizeof(unsigned int));
 
@@ -203,7 +208,7 @@ struct OptixJob {
   vector<float> h_vertices;
   vector<uint3> h_indices;
   vector<uint3> h_self_indices;
-  vector<unsigned int> output;
+  vector<unsigned int> accepted_words;
 
   cudaStream_t stream = nullptr;
   float *d_points = nullptr;
@@ -211,7 +216,7 @@ struct OptixJob {
   float *d_vertices = nullptr;
   uint3 *d_indices = nullptr;
   uint3 *d_self_indices = nullptr;
-  unsigned int *d_output = nullptr;
+  unsigned int *d_accepted_words = nullptr;
   CUdeviceptr d_temp = 0;
   CUdeviceptr d_gas_output = 0;
   CUdeviceptr d_self_temp = 0;
@@ -248,8 +253,8 @@ struct OptixJob {
       cudaFree(d_indices);
     if (d_self_indices)
       cudaFree(d_self_indices);
-    if (d_output)
-      cudaFree(d_output);
+    if (d_accepted_words)
+      cudaFree(d_accepted_words);
     if (d_temp)
       cudaFree(reinterpret_cast<void *>(d_temp));
     if (d_gas_output)
@@ -298,11 +303,11 @@ struct OptixJob {
                      static_cast<unsigned>(triangle[1]),
                      static_cast<unsigned>(triangle[2])));
     }
-    output.resize(segments);
+    accepted_words.resize(accepted_word_count(segments));
   }
 
   void allocate() {
-    if (output.empty())
+    if (accepted_words.empty())
       return;
 
     CUCHK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
@@ -318,8 +323,8 @@ struct OptixJob {
                      sizeof(uint3) * h_indices.size()));
     CUCHK(cudaMalloc(reinterpret_cast<void **>(&d_self_indices),
                      sizeof(uint3) * h_self_indices.size()));
-    CUCHK(cudaMalloc(reinterpret_cast<void **>(&d_output),
-                     sizeof(unsigned int) * output.size()));
+    CUCHK(cudaMalloc(reinterpret_cast<void **>(&d_accepted_words),
+                     sizeof(unsigned int) * accepted_words.size()));
     CUCHK(cudaMalloc(reinterpret_cast<void **>(&d_raygen_record),
                      sizeof(SbtRecord<RayGenData>)));
 
@@ -375,7 +380,7 @@ struct OptixJob {
   }
 
   void enqueue() {
-    if (output.empty())
+    if (accepted_words.empty())
       return;
 
     CUCHK(cudaMemcpyAsync(d_points, h_points.data(),
@@ -395,8 +400,9 @@ struct OptixJob {
     CUCHK(cudaMemcpyAsync(d_self_indices, h_self_indices.data(),
                           sizeof(uint3) * h_self_indices.size(),
                           cudaMemcpyHostToDevice, stream));
-    CUCHK(cudaMemsetAsync(d_output, 0,
-                          sizeof(unsigned int) * output.size(), stream));
+    CUCHK(cudaMemsetAsync(d_accepted_words, 0,
+                          sizeof(unsigned int) * accepted_words.size(),
+                          stream));
 
     OCHK(optixAccelBuild(runtime.context, stream, &accel_options, &build_input,
                          1, d_temp, gas_sizes.tempSizeInBytes, d_gas_output,
@@ -414,7 +420,7 @@ struct OptixJob {
     raygen_record.data.n_points =
         static_cast<long long>(points_mesh.vertices.size());
     raygen_record.data.has_mask = h_new_mask.empty() ? 0u : 1u;
-    raygen_record.data.uM = d_output;
+    raygen_record.data.accepted_words = d_accepted_words;
     raygen_record.data.cage_gas = gas;
     raygen_record.data.self_gas = self_gas;
     CUCHK(cudaMemcpyAsync(reinterpret_cast<void *>(d_raygen_record),
@@ -430,14 +436,16 @@ struct OptixJob {
     sbt.hitgroupRecordCount = 1;
 
     OCHK(optixLaunch(runtime.pipeline, stream, 0, 0, &sbt,
-                     static_cast<unsigned int>(output.size()), 1, 1));
+                     static_cast<unsigned int>(
+                         segment_count(points_mesh.vertices.size())),
+                     1, 1));
   }
 
   void download() {
-    if (output.empty())
+    if (accepted_words.empty())
       return;
-    CUCHK(cudaMemcpyAsync(output.data(), d_output,
-                          sizeof(unsigned int) * output.size(),
+    CUCHK(cudaMemcpyAsync(accepted_words.data(), d_accepted_words,
+                          sizeof(unsigned int) * accepted_words.size(),
                           cudaMemcpyDeviceToHost, stream));
   }
 
@@ -471,19 +479,28 @@ run_wave(const vector<pair<Mesh *, Mesh *>> &requests, size_t begin, size_t end,
   vector<vector<pair<unsigned int, unsigned int>>> results(end - begin);
   for (size_t local_idx = 0; local_idx < end - begin; ++local_idx) {
     const Mesh &mesh = *requests[begin + local_idx].first;
-    const vector<unsigned int> &hits = jobs[local_idx]->output;
+    const vector<unsigned int> &accepted_words =
+        jobs[local_idx]->accepted_words;
+    const size_t segments = segment_count(mesh.vertices.size());
     auto &edges = results[local_idx];
 
-    for (size_t segment = 0; segment < hits.size(); ++segment) {
-      if (!hits[segment])
-        continue;
-
-      long long first, second;
-      linear_to_pair_batched(static_cast<long long>(segment),
-                             static_cast<long long>(mesh.vertices.size()),
-                             first, second);
-      edges.emplace_back(static_cast<unsigned int>(first),
-                         static_cast<unsigned int>(second));
+    for (size_t word_index = 0; word_index < accepted_words.size();
+         ++word_index) {
+      unsigned int word = accepted_words[word_index];
+      while (word) {
+        const unsigned int bit =
+            static_cast<unsigned int>(__builtin_ctz(word));
+        const size_t segment = word_index * 32 + bit;
+        if (segment < segments) {
+          long long first, second;
+          linear_to_pair_batched(static_cast<long long>(segment),
+                                 static_cast<long long>(mesh.vertices.size()),
+                                 first, second);
+          edges.emplace_back(static_cast<unsigned int>(first),
+                             static_cast<unsigned int>(second));
+        }
+        word &= word - 1;
+      }
     }
   }
   return results;

@@ -13,7 +13,7 @@ struct RayGenData {
   const unsigned int *new_mask;
   long long n_points;
   unsigned int has_mask;
-  unsigned int *uM;
+  unsigned int *accepted_words;
   OptixTraversableHandle cage_gas;
   OptixTraversableHandle self_gas;
 };
