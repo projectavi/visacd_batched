@@ -16,6 +16,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <plane_intersections.hpp>
 #include <postprocess.hpp>
 #include <preprocess.hpp>
@@ -51,9 +52,15 @@ namespace {
 
 constexpr size_t kMaxAutomaticCpuThreads = 200;
 
+struct PartCache {
+  optional<Mesh> hull;
+  optional<double> selection_concavity;
+};
+
 struct BatchState {
   Mesh cage;
   MeshList parts;
+  vector<PartCache> part_cache;
   vector<double> original_bbox;
   vector<Plane> flat_surface_planes;
   RandomEngine random_engine;
@@ -65,6 +72,7 @@ struct BatchState {
 struct SplitWork {
   size_t state_index;
   Mesh part;
+  PartCache part_cache;
   vector<Plane> planes;
   size_t flat_surface_offset;
   vector<float> host_planes;
@@ -339,14 +347,16 @@ void initialize_state(Mesh mesh, size_t mesh_index, BatchState &state) {
 
   state.parts.push_back(move(mesh));
   separate_disjoint(state.parts);
+  state.part_cache.resize(state.parts.size());
 }
 
-SplitWork make_split_work(size_t state_index, Mesh part,
+SplitWork make_split_work(size_t state_index, Mesh part, PartCache part_cache,
                           const vector<Plane> &flat_surface_planes,
                           RandomEngine &engine) {
   SplitWork work;
   work.state_index = state_index;
   work.part = move(part);
+  work.part_cache = move(part_cache);
   work.planes = get_candidate_planes(work.part.vertices,
                                       work.part.intersecting_edges, 2500,
                                       engine);
@@ -379,6 +389,31 @@ SplitWork make_split_work(size_t state_index, Mesh part,
   }
   work.scores.assign(work.planes.size(), 0.0f);
   return work;
+}
+
+int get_part_with_highest_concavity_cached(BatchState &state,
+                                            double &max_concavity) {
+  if (state.parts.size() != state.part_cache.size())
+    throw logic_error("Part cache is out of sync with batch state");
+
+  int best_index = -1;
+  for (size_t part_index = 0; part_index < state.parts.size(); ++part_index) {
+    PartCache &cache = state.part_cache[part_index];
+    if (!cache.hull) {
+      cache.hull.emplace();
+      state.parts[part_index].compute_ch(*cache.hull, true);
+    }
+    if (!cache.selection_concavity) {
+      cache.selection_concavity =
+          compute_h(state.parts[part_index], *cache.hull, 0.3, 3000, 42,
+                    false, state.random_engine);
+    }
+    if (*cache.selection_concavity > max_concavity) {
+      max_concavity = *cache.selection_concavity;
+      best_index = static_cast<int>(part_index);
+    }
+  }
+  return best_index;
 }
 
 void propagate_existing_edges(
@@ -491,16 +526,29 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
     auto work = make_shared<FinalizeWork>();
     work->state_index = state_index;
     work->hulls.resize(state.parts.size());
-    work->remaining.store(state.parts.size());
     log(state_index, "Computing convex hulls for " +
                          to_string(state.parts.size()) + " parts...");
 
-    if (state.parts.empty()) {
+    if (state.parts.size() != state.part_cache.size())
+      throw logic_error("Part cache is out of sync during finalization");
+
+    vector<size_t> missing_hulls;
+    for (size_t part_index = 0; part_index < state.parts.size(); ++part_index) {
+      if (state.part_cache[part_index].hull) {
+        work->hulls[part_index] =
+            move(*state.part_cache[part_index].hull);
+      } else {
+        missing_hulls.push_back(part_index);
+      }
+    }
+    work->remaining.store(missing_hulls.size());
+
+    if (missing_hulls.empty()) {
       finish_state(move(work));
       return;
     }
 
-    for (size_t part_index = 0; part_index < state.parts.size(); ++part_index) {
+    for (size_t part_index : missing_hulls) {
       coordinator.submit_cpu(
           [&, work, part_index]() {
             states[work->state_index].parts[part_index].compute_ch(
@@ -526,8 +574,8 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
             part_index = get_part_with_highest_score(state.parts);
           } else if (config.score_mode == "concavity") {
             double max_concavity = -1.0;
-            part_index = get_part_with_highest_concavity(
-                state.parts, max_concavity, state.random_engine);
+            part_index =
+                get_part_with_highest_concavity_cached(state, max_concavity);
             if (max_concavity < concavity) {
               log(state_index,
                   "Concavity " + to_string(max_concavity) +
@@ -551,9 +599,12 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
                   to_string(state.parts.size()) + " parts total).");
 
           Mesh part = move(state.parts[part_index]);
+          PartCache part_cache = move(state.part_cache[part_index]);
           state.parts.erase(state.parts.begin() + part_index);
+          state.part_cache.erase(state.part_cache.begin() + part_index);
           if (part.intersecting_edges.empty()) {
             state.parts.push_back(move(part));
+            state.part_cache.push_back(move(part_cache));
             state.finished = true;
             log(state_index, "No more intersecting edges; stopping early.");
             schedule_finalize(state_index);
@@ -561,10 +612,12 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
           }
 
           auto split = make_shared<SplitWork>(make_split_work(
-              state_index, move(part), state.flat_surface_planes,
+              state_index, move(part), move(part_cache),
+              state.flat_surface_planes,
               state.random_engine));
           if (split->planes.empty()) {
             state.parts.push_back(move(split->part));
+            state.part_cache.push_back(move(split->part_cache));
             state.finished = true;
             schedule_finalize(state_index);
             return;
@@ -594,6 +647,7 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
             delete[] first_map;
             delete[] second_map;
             state.parts.push_back(move(split->part));
+            state.part_cache.push_back(move(split->part_cache));
             ++state.iteration;
             schedule_advance(split->state_index);
             return;
@@ -697,8 +751,10 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
                     to_string(concavity) + ", mode=" + config.score_mode +
                     ").");
           } else {
-            for (PendingPart &pending : work->pending_parts)
+            for (PendingPart &pending : work->pending_parts) {
               state.parts.push_back(move(pending.part));
+              state.part_cache.emplace_back();
+            }
             ++state.iteration;
           }
           schedule_advance(work->state_index);

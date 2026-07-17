@@ -167,7 +167,7 @@ class BatchGpuTests(unittest.TestCase):
                     load_sample("cow.obj"),
                 ],
                 concavity=0.04,
-                num_parts=3,
+                num_parts=4,
             )
 
         automatic = run(max_batch_size=0, batch_cpu_threads=0)
