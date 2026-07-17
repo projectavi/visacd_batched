@@ -6,6 +6,7 @@ namespace neural_acd {
 constexpr double Pi = 3.14159265;
 double get_mesh_volume(Mesh &mesh);
 double compute_rv(Mesh &cvx1, Mesh &cvx2, Mesh &cvxCH, double epsilon = 0.0001);
+double compute_rv(Mesh &tmesh1, Mesh &tmesh2, double epsilon = 0.0001);
 double compute_hb(Mesh &cvx1, Mesh &cvx2, Mesh &cvxCH, unsigned int resolution);
 double compute_hb(Mesh &cvx1, Mesh &cvx2, Mesh &cvxCH,
                   unsigned int resolution, RandomEngine &engine);

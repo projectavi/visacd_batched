@@ -2,11 +2,83 @@
 #include <cost.hpp>
 #include <fstream>
 #include <hausdorff.hpp>
+#include <hausdorff_batch.hpp>
 #include <iostream>
 
 using namespace std;
 
 namespace neural_acd {
+
+namespace {
+
+PreparedHausdorffDirection prepare_hausdorff_direction(
+    const Mesh &target, const vector<Vec3D> &target_samples,
+    const vector<int> &target_triangle_ids,
+    const vector<Vec3D> &queries) {
+  PreparedHausdorffDirection direction;
+  direction.target = &target;
+  direction.queries = queries;
+  direction.candidate_triangles.resize(queries.size());
+  direction.candidate_counts.resize(queries.size());
+  direction.nearest_sample_distance_squared.resize(queries.size());
+
+  PointCloud<double> cloud;
+  vec2pc(cloud, target_samples);
+  using KdTree = KDTreeSingleIndexAdaptor<
+      L2_Simple_Adaptor<double, PointCloud<double>>, PointCloud<double>, 3>;
+  KdTree index(3, cloud, KDTreeSingleIndexAdaptorParams(10));
+  index.buildIndex();
+
+  for (size_t query_index = 0; query_index < queries.size(); ++query_index) {
+    auto &candidates = direction.candidate_triangles[query_index];
+    candidates.fill(-1);
+    size_t candidate_count = kHausdorffCandidateCount;
+    const double query[3] = {queries[query_index][0], queries[query_index][1],
+                             queries[query_index][2]};
+    array<size_t, kHausdorffCandidateCount> sample_indices{};
+    array<double, kHausdorffCandidateCount> distances_squared{};
+    candidate_count = index.knnSearch(query, candidate_count,
+                                      sample_indices.data(),
+                                      distances_squared.data());
+    direction.candidate_counts[query_index] =
+        static_cast<unsigned char>(candidate_count);
+    direction.nearest_sample_distance_squared[query_index] =
+        candidate_count == 0 ? INF : distances_squared[0];
+    for (size_t candidate_index = 0; candidate_index < candidate_count;
+         ++candidate_index) {
+      candidates[candidate_index] =
+          target_triangle_ids[sample_indices[candidate_index]];
+    }
+  }
+  return direction;
+}
+
+} // namespace
+
+PreparedHausdorffJob prepare_hausdorff_job(
+    Mesh &first, Mesh &second, unsigned int resolution, bool flag,
+    RandomEngine &engine) {
+  (void)flag;
+  vector<Vec3D> first_samples;
+  vector<Vec3D> second_samples;
+  vector<int> first_triangle_ids;
+  vector<int> second_triangle_ids;
+  first.extract_point_set(first_samples, first_triangle_ids, resolution,
+                          engine, 1);
+  second.extract_point_set(second_samples, second_triangle_ids, resolution,
+                           engine, 1);
+
+  PreparedHausdorffJob job;
+  if (first_samples.empty() || second_samples.empty())
+    return job;
+
+  job.directions[0] = prepare_hausdorff_direction(
+      first, first_samples, first_triangle_ids, second_samples);
+  job.directions[1] = prepare_hausdorff_direction(
+      second, second_samples, second_triangle_ids, first_samples);
+  job.valid = true;
+  return job;
+}
 
 void MergeMesh(Mesh &mesh1, Mesh &mesh2, Mesh &merge) {
   merge.vertices.insert(merge.vertices.end(), mesh1.vertices.begin(),

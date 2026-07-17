@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <batch_executor.hpp>
 #include <chrono>
@@ -10,6 +11,7 @@
 #include <deque>
 #include <exception>
 #include <functional>
+#include <hausdorff_batch.hpp>
 #include <iomanip>
 #include <intersections.hpp>
 #include <iostream>
@@ -45,9 +47,6 @@ int get_part_with_highest_score(MeshList &parts);
 int get_part_with_highest_concavity(MeshList &parts, double &max_concavity);
 int get_part_with_highest_concavity(MeshList &parts, double &max_concavity,
                                     RandomEngine &engine);
-double compute_final_concavity(MeshList &parts, MeshList &hulls,
-                               RandomEngine &engine);
-
 namespace {
 
 constexpr size_t kMaxAutomaticCpuThreads = 200;
@@ -100,12 +99,24 @@ struct FinalizeWork {
   atomic<size_t> remaining{0};
 };
 
-enum class GpuWorkKind { intersections, planes, complete };
+enum class HausdorffPurpose { selection, final_concavity };
+
+struct HausdorffWork {
+  HausdorffPurpose purpose;
+  size_t state_index;
+  vector<size_t> part_indices;
+  vector<PreparedHausdorffJob> jobs;
+  vector<double> relative_volume_terms;
+  shared_ptr<FinalizeWork> finalize_work;
+};
+
+enum class GpuWorkKind { intersections, planes, hausdorff, complete };
 
 struct GpuWork {
   GpuWorkKind kind;
   vector<shared_ptr<IntersectionWork>> intersections;
   vector<shared_ptr<SplitWork>> planes;
+  vector<shared_ptr<HausdorffWork>> hausdorff;
 };
 
 class PipelineCoordinator {
@@ -167,6 +178,15 @@ public:
     condition_.notify_one();
   }
 
+  void enqueue_hausdorff(shared_ptr<HausdorffWork> work) {
+    lock_guard<mutex> lock(mutex_);
+    if (error_)
+      return;
+    hausdorff_request_count_ += work->jobs.size();
+    hausdorff_queue_.push_back(move(work));
+    condition_.notify_one();
+  }
+
   void complete_state() {
     lock_guard<mutex> lock(mutex_);
     ++completed_states_;
@@ -183,7 +203,7 @@ public:
     while (true) {
       condition_.wait(lock, [this]() {
         return error_ || completed() || !intersection_queue_.empty() ||
-               !plane_queue_.empty();
+               !plane_queue_.empty() || !hausdorff_queue_.empty();
       });
 
       if (error_) {
@@ -193,7 +213,7 @@ public:
         rethrow_exception(error_);
       }
       if (completed())
-        return {GpuWorkKind::complete, {}, {}};
+        return {GpuWorkKind::complete, {}, {}, {}};
 
       if (!gpu_batch_ready() && active_cpu_tasks_ != 0) {
         condition_.wait_for(lock, chrono::milliseconds(1), [this]() {
@@ -203,19 +223,24 @@ public:
         if (error_)
           continue;
         if (completed())
-          return {GpuWorkKind::complete, {}, {}};
+          return {GpuWorkKind::complete, {}, {}, {}};
       }
 
-      const bool have_intersections = !intersection_queue_.empty();
-      const bool have_planes = !plane_queue_.empty();
-      bool take_intersections = have_intersections;
-      if (have_intersections && have_planes) {
-        take_intersections = prefer_intersections_;
-        prefer_intersections_ = !prefer_intersections_;
+      const array<bool, 3> available = {!intersection_queue_.empty(),
+                                        !plane_queue_.empty(),
+                                        !hausdorff_queue_.empty()};
+      size_t selected = 0;
+      for (; selected < available.size(); ++selected) {
+        const size_t candidate = (next_gpu_kind_ + selected) % available.size();
+        if (available[candidate]) {
+          selected = candidate;
+          break;
+        }
       }
+      next_gpu_kind_ = (selected + 1) % available.size();
 
-      if (take_intersections) {
-        GpuWork result{GpuWorkKind::intersections, {}, {}};
+      if (selected == 0) {
+        GpuWork result{GpuWorkKind::intersections, {}, {}, {}};
         result.intersections.reserve(intersection_queue_.size());
         while (!intersection_queue_.empty()) {
           shared_ptr<IntersectionWork> work =
@@ -227,11 +252,23 @@ public:
         return result;
       }
 
-      GpuWork result{GpuWorkKind::planes, {}, {}};
-      result.planes.reserve(plane_queue_.size());
-      while (!plane_queue_.empty()) {
-        result.planes.push_back(move(plane_queue_.front()));
-        plane_queue_.pop_front();
+      if (selected == 1) {
+        GpuWork result{GpuWorkKind::planes, {}, {}, {}};
+        result.planes.reserve(plane_queue_.size());
+        while (!plane_queue_.empty()) {
+          result.planes.push_back(move(plane_queue_.front()));
+          plane_queue_.pop_front();
+        }
+        return result;
+      }
+
+      GpuWork result{GpuWorkKind::hausdorff, {}, {}, {}};
+      result.hausdorff.reserve(hausdorff_queue_.size());
+      while (!hausdorff_queue_.empty()) {
+        shared_ptr<HausdorffWork> work = move(hausdorff_queue_.front());
+        hausdorff_queue_.pop_front();
+        hausdorff_request_count_ -= work->jobs.size();
+        result.hausdorff.push_back(move(work));
       }
       return result;
     }
@@ -244,7 +281,8 @@ private:
 
   bool gpu_batch_ready() const {
     return intersection_request_count_ >= gpu_batch_threshold_ ||
-           plane_queue_.size() >= gpu_batch_threshold_;
+           plane_queue_.size() >= gpu_batch_threshold_ ||
+           hausdorff_request_count_ >= gpu_batch_threshold_;
   }
 
   void record_error(exception_ptr error) {
@@ -252,7 +290,9 @@ private:
       error_ = error;
     intersection_queue_.clear();
     plane_queue_.clear();
+    hausdorff_queue_.clear();
     intersection_request_count_ = 0;
+    hausdorff_request_count_ = 0;
     condition_.notify_all();
   }
 
@@ -269,10 +309,12 @@ private:
   const size_t gpu_batch_threshold_;
   deque<shared_ptr<IntersectionWork>> intersection_queue_;
   deque<shared_ptr<SplitWork>> plane_queue_;
+  deque<shared_ptr<HausdorffWork>> hausdorff_queue_;
   size_t intersection_request_count_ = 0;
+  size_t hausdorff_request_count_ = 0;
   size_t active_cpu_tasks_ = 0;
   size_t completed_states_ = 0;
-  bool prefer_intersections_ = true;
+  size_t next_gpu_kind_ = 0;
   mutex mutex_;
   condition_variable condition_;
   exception_ptr error_;
@@ -391,23 +433,16 @@ SplitWork make_split_work(size_t state_index, Mesh part, PartCache part_cache,
   return work;
 }
 
-int get_part_with_highest_concavity_cached(BatchState &state,
-                                            double &max_concavity) {
+int get_part_with_highest_cached_concavity(const BatchState &state,
+                                           double &max_concavity) {
   if (state.parts.size() != state.part_cache.size())
     throw logic_error("Part cache is out of sync with batch state");
 
   int best_index = -1;
   for (size_t part_index = 0; part_index < state.parts.size(); ++part_index) {
-    PartCache &cache = state.part_cache[part_index];
-    if (!cache.hull) {
-      cache.hull.emplace();
-      state.parts[part_index].compute_ch(*cache.hull, true);
-    }
-    if (!cache.selection_concavity) {
-      cache.selection_concavity =
-          compute_h(state.parts[part_index], *cache.hull, 0.3, 3000, 42,
-                    false, state.random_engine);
-    }
+    const PartCache &cache = state.part_cache[part_index];
+    if (!cache.selection_concavity)
+      throw logic_error("Part concavity was not evaluated before selection");
     if (*cache.selection_concavity > max_concavity) {
       max_concavity = *cache.selection_concavity;
       best_index = static_cast<int>(part_index);
@@ -473,6 +508,7 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
       executor, states.size(), configured_gpu_batch_threshold(cpu_threads));
   OptixRuntime optix;
   PlaneScoringRuntime plane_scoring;
+  HausdorffRuntime hausdorff;
 
   const uint32_t batch_seed = random_engine();
   for (size_t i = 0; i < states.size(); ++i) {
@@ -481,17 +517,17 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
     states[i].random_engine.seed(seed);
   }
 
-  function<void(shared_ptr<FinalizeWork>)> finish_state;
+  function<void(shared_ptr<FinalizeWork>, double)> finish_state;
+  function<void(shared_ptr<FinalizeWork>)> schedule_final_concavity;
   function<void(size_t)> schedule_finalize;
+  function<void(size_t)> schedule_split;
   function<void(size_t)> schedule_advance;
   function<void(shared_ptr<SplitWork>)> schedule_clip;
 
-  finish_state = [&](shared_ptr<FinalizeWork> work) {
+  finish_state = [&](shared_ptr<FinalizeWork> work, double final_concavity) {
     coordinator.submit_cpu(
-        [&, work = move(work)]() mutable {
+        [&, work = move(work), final_concavity]() mutable {
           BatchState &state = states[work->state_index];
-          const double final_concavity = compute_final_concavity(
-              state.parts, work->hulls, state.random_engine);
           if (config.use_merging) {
             multimerge_ch(state.parts, work->hulls, final_concavity,
                           concavity);
@@ -513,6 +549,33 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
           results[work->state_index] =
               {move(output), final_concavity, output_count};
           coordinator.complete_state();
+        },
+        true);
+  };
+
+  schedule_final_concavity = [&](shared_ptr<FinalizeWork> finalize_work) {
+    coordinator.submit_cpu(
+        [&, finalize_work = move(finalize_work)]() mutable {
+          BatchState &state = states[finalize_work->state_index];
+          if (state.parts.size() != finalize_work->hulls.size())
+            throw logic_error("Final hulls are out of sync with batch state");
+          if (state.parts.empty()) {
+            finish_state(move(finalize_work), 0.0);
+            return;
+          }
+
+          auto work = make_shared<HausdorffWork>();
+          work->purpose = HausdorffPurpose::final_concavity;
+          work->state_index = finalize_work->state_index;
+          work->finalize_work = move(finalize_work);
+          work->jobs.reserve(state.parts.size());
+          for (size_t part_index = 0; part_index < state.parts.size();
+               ++part_index) {
+            work->jobs.push_back(prepare_hausdorff_job(
+                state.parts[part_index], work->finalize_work->hulls[part_index],
+                10000, true, state.random_engine));
+          }
+          coordinator.enqueue_hausdorff(move(work));
         },
         true);
   };
@@ -544,7 +607,7 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
     work->remaining.store(missing_hulls.size());
 
     if (missing_hulls.empty()) {
-      finish_state(move(work));
+      schedule_final_concavity(move(work));
       return;
     }
 
@@ -554,28 +617,23 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
             states[work->state_index].parts[part_index].compute_ch(
                 work->hulls[part_index], true);
             if (work->remaining.fetch_sub(1) == 1)
-              finish_state(work);
+              schedule_final_concavity(work);
           },
           true);
     }
   };
 
-  schedule_advance = [&](size_t state_index) {
+  schedule_split = [&](size_t state_index) {
     coordinator.submit_cpu(
         [&, state_index]() {
           BatchState &state = states[state_index];
-          if (state.finished || state.iteration >= num_parts - 1) {
-            schedule_finalize(state_index);
-            return;
-          }
-
           int part_index = -1;
           if (config.score_mode == "edge") {
             part_index = get_part_with_highest_score(state.parts);
           } else if (config.score_mode == "concavity") {
             double max_concavity = -1.0;
             part_index =
-                get_part_with_highest_concavity_cached(state, max_concavity);
+                get_part_with_highest_cached_concavity(state, max_concavity);
             if (max_concavity < concavity) {
               log(state_index,
                   "Concavity " + to_string(max_concavity) +
@@ -613,8 +671,7 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
 
           auto split = make_shared<SplitWork>(make_split_work(
               state_index, move(part), move(part_cache),
-              state.flat_surface_planes,
-              state.random_engine));
+              state.flat_surface_planes, state.random_engine));
           if (split->planes.empty()) {
             state.parts.push_back(move(split->part));
             state.part_cache.push_back(move(split->part_cache));
@@ -623,6 +680,57 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
             return;
           }
           coordinator.enqueue_planes(move(split));
+        },
+        true);
+  };
+
+  schedule_advance = [&](size_t state_index) {
+    coordinator.submit_cpu(
+        [&, state_index]() {
+          BatchState &state = states[state_index];
+          if (state.finished || state.iteration >= num_parts - 1) {
+            schedule_finalize(state_index);
+            return;
+          }
+
+          if (config.score_mode == "edge") {
+            schedule_split(state_index);
+            return;
+          }
+
+          if (config.score_mode != "concavity") {
+            schedule_split(state_index);
+            return;
+          }
+
+          if (state.parts.size() != state.part_cache.size())
+            throw logic_error("Part cache is out of sync with batch state");
+
+          auto work = make_shared<HausdorffWork>();
+          work->purpose = HausdorffPurpose::selection;
+          work->state_index = state_index;
+          for (size_t part_index = 0; part_index < state.parts.size();
+               ++part_index) {
+            PartCache &cache = state.part_cache[part_index];
+            if (!cache.hull) {
+              cache.hull.emplace();
+              state.parts[part_index].compute_ch(*cache.hull, true);
+            }
+            if (cache.selection_concavity)
+              continue;
+            work->part_indices.push_back(part_index);
+            work->relative_volume_terms.push_back(
+                compute_rv(state.parts[part_index], *cache.hull, 42) * 0.3);
+            work->jobs.push_back(prepare_hausdorff_job(
+                state.parts[part_index], *cache.hull, 3000, false,
+                state.random_engine));
+          }
+
+          if (work->jobs.empty()) {
+            schedule_split(state_index);
+            return;
+          }
+          coordinator.enqueue_hausdorff(move(work));
         },
         true);
   };
@@ -758,6 +866,49 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
             ++state.iteration;
           }
           schedule_advance(work->state_index);
+        }
+        continue;
+      }
+
+      if (gpu_work.kind == GpuWorkKind::hausdorff) {
+        size_t job_count = 0;
+        for (const shared_ptr<HausdorffWork> &work : gpu_work.hausdorff)
+          job_count += work->jobs.size();
+        vector<PreparedHausdorffJob *> jobs;
+        jobs.reserve(job_count);
+        for (shared_ptr<HausdorffWork> &work : gpu_work.hausdorff) {
+          for (PreparedHausdorffJob &job : work->jobs)
+            jobs.push_back(&job);
+        }
+        evaluate_hausdorff_batch(jobs, hausdorff, configured_batch_size(),
+                                 config.batch_memory_fraction);
+
+        for (shared_ptr<HausdorffWork> &work : gpu_work.hausdorff) {
+          if (work->purpose == HausdorffPurpose::selection) {
+            if (work->part_indices.size() != work->jobs.size() ||
+                work->relative_volume_terms.size() != work->jobs.size()) {
+              throw logic_error("Selection Hausdorff work is out of sync");
+            }
+            BatchState &state = states[work->state_index];
+            for (size_t job_index = 0; job_index < work->jobs.size();
+                 ++job_index) {
+              const size_t part_index = work->part_indices[job_index];
+              if (part_index >= state.part_cache.size())
+                throw logic_error("Selection part index is out of range");
+              state.part_cache[part_index].selection_concavity =
+                  max(work->relative_volume_terms[job_index],
+                      work->jobs[job_index].result);
+            }
+            schedule_split(work->state_index);
+            continue;
+          }
+
+          if (!work->finalize_work)
+            throw logic_error("Final Hausdorff work has no hulls");
+          double final_concavity = 0.0;
+          for (const PreparedHausdorffJob &job : work->jobs)
+            final_concavity = max(final_concavity, job.result);
+          finish_state(move(work->finalize_work), final_concavity);
         }
         continue;
       }
