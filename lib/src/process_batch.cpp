@@ -72,6 +72,7 @@ enum class ProfileStage {
   plane_scoring,
   plane_selection,
   clip_prepare,
+  split_fused,
   clip_construct,
   child_cage,
   final_hulls_cpu,
@@ -114,8 +115,9 @@ public:
         "preprocess",       "flat_surfaces",   "components_gpu",
         "components_cpu",  "intersections",   "selection_hulls",
         "hausdorff",        "candidates",      "plane_scoring",
-        "plane_selection", "clip_prepare",    "clip_construct",
-        "child_cage",       "final_hulls_cpu", "merges"};
+        "plane_selection", "clip_prepare",    "split_fused",
+        "clip_construct",  "child_cage",      "final_hulls_cpu",
+        "merges"};
 
     ostringstream output;
     output << fixed << setprecision(3)
@@ -194,15 +196,10 @@ struct SplitWork {
   size_t state_index;
   Mesh part;
   PartCache part_cache;
-  vector<Plane> planes;
-  size_t flat_surface_offset;
   vector<unsigned int> sampled_edges;
   size_t candidate_attempts = 0;
-  vector<float> host_planes;
-  vector<float> host_points;
-  vector<unsigned int> host_edges;
-  vector<float> scores;
-  size_t selected_plane = 0;
+  Plane selected_plane;
+  bool has_selected_plane = false;
   vector<ClipTriangleData> prepared_clip;
 };
 
@@ -713,9 +710,7 @@ SplitWork prepare_split_work(size_t state_index, Mesh part,
   return work;
 }
 
-void finish_split_work(SplitWork &work,
-                       const vector<Plane> &flat_surface_planes,
-                       RandomEngine &engine) {
+void finish_candidate_sampling(SplitWork &work, RandomEngine &engine) {
   if (work.candidate_attempts > work.sampled_edges.size())
     throw logic_error("Candidate kernel consumed too many samples");
   uniform_int_distribution<> distribution(
@@ -727,37 +722,6 @@ void finish_split_work(SplitWork &work,
       throw logic_error("Candidate random stream is out of sync");
   }
 
-  work.flat_surface_offset = work.planes.size();
-  work.planes.insert(work.planes.end(), flat_surface_planes.begin(),
-                     flat_surface_planes.end());
-
-  work.host_planes.resize(work.planes.size() * 4);
-  for (size_t i = 0; i < work.planes.size(); ++i) {
-    work.host_planes[i * 4] = static_cast<float>(work.planes[i].a);
-    work.host_planes[i * 4 + 1] = static_cast<float>(work.planes[i].b);
-    work.host_planes[i * 4 + 2] = static_cast<float>(work.planes[i].c);
-    work.host_planes[i * 4 + 3] = static_cast<float>(work.planes[i].d);
-  }
-
-  if (!work.part_cache.device) {
-    work.host_points.resize(work.part.vertices.size() * 3);
-    for (size_t i = 0; i < work.part.vertices.size(); ++i) {
-      work.host_points[i * 3] =
-          static_cast<float>(work.part.vertices[i][0]);
-      work.host_points[i * 3 + 1] =
-          static_cast<float>(work.part.vertices[i][1]);
-      work.host_points[i * 3 + 2] =
-          static_cast<float>(work.part.vertices[i][2]);
-    }
-
-    work.host_edges.resize(work.part.intersecting_edges.size() * 2);
-    for (size_t i = 0; i < work.part.intersecting_edges.size(); ++i) {
-      work.host_edges[i * 2] = work.part.intersecting_edges[i].first;
-      work.host_edges[i * 2 + 1] =
-          work.part.intersecting_edges[i].second;
-    }
-  }
-  work.scores.assign(work.planes.size(), 0.0f);
 }
 
 int get_part_with_highest_cached_concavity(const BatchState &state,
@@ -840,10 +804,8 @@ struct PersistentBatchResources {
   unique_ptr<OptixRuntime> optix;
   string optix_key;
   CandidatePlaneRuntime candidate_planes;
-  PlaneScoringRuntime plane_scoring;
   HausdorffRuntime hausdorff;
   DeviceMeshRuntime device_meshes;
-  ClipBatchRuntime clip_batch;
   ComponentBatchRuntime component_batch;
   ConvexHullBatchRuntime convex_hulls;
   FlatSurfaceBatchRuntime flat_surfaces;
@@ -910,10 +872,8 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
       static_cast<double>(gpu_host_threads);
   OptixRuntime &optix = resources.configured_optix();
   CandidatePlaneRuntime &candidate_planes = resources.candidate_planes;
-  PlaneScoringRuntime &plane_scoring = resources.plane_scoring;
   HausdorffRuntime &hausdorff = resources.hausdorff;
   DeviceMeshRuntime &device_meshes = resources.device_meshes;
-  ClipBatchRuntime &clip_batch = resources.clip_batch;
   ComponentBatchRuntime &component_batch = resources.component_batch;
   ConvexHullBatchRuntime &convex_hulls = resources.convex_hulls;
   FlatSurfaceBatchRuntime &flat_surfaces = resources.flat_surfaces;
@@ -1274,13 +1234,12 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
           int *second_map = nullptr;
           MeshList new_parts;
           if (split->prepared_clip.empty()) {
-            new_parts = clip(split->part,
-                             split->planes[split->selected_plane], first_map,
+            new_parts = clip(split->part, split->selected_plane, first_map,
                              second_map);
           } else {
             new_parts = clip_prepared(
-                split->part, split->planes[split->selected_plane], first_map,
-                second_map, split->prepared_clip);
+                split->part, split->selected_plane, first_map, second_map,
+                split->prepared_clip);
           }
           if (new_parts.size() < 2) {
             delete[] first_map;
@@ -1695,7 +1654,7 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
         continue;
       }
 
-      vector<CandidatePlaneInput> candidate_inputs;
+      vector<SplitPlaneInput> candidate_inputs;
       candidate_inputs.reserve(gpu_work.planes.size());
       for (shared_ptr<SplitWork> &split : gpu_work.planes) {
         if (split->part.vertices.size() >
@@ -1708,10 +1667,14 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
           split->part_cache.device = device_meshes.try_upload(
               split->part, config.batch_memory_fraction);
         }
+        BatchState &state = states[split->state_index];
         candidate_inputs.push_back(
             {&split->part, split->part_cache.device.get(),
              split->sampled_edges.data(), split->sampled_edges.size(),
-             kCandidatePlaneCount, &split->planes,
+             kCandidatePlaneCount, &state.flat_surface_planes,
+             static_cast<float>(config.flat_surface_k),
+             &split->selected_plane, &split->has_selected_plane,
+             &split->prepared_clip,
              &split->candidate_attempts});
       }
       coordinator.submit_gpu(
@@ -1719,90 +1682,24 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
            splits = move(gpu_work.planes)]() mutable {
             try {
               {
-                StageTimer timer(profiler, ProfileStage::candidates,
+                StageTimer timer(profiler, ProfileStage::split_fused,
                                  candidate_inputs.size());
-                generate_candidate_planes_batch(
+                generate_score_select_clip_batch(
                     candidate_inputs, candidate_planes,
                     configured_batch_size(), gpu_memory_fraction);
               }
 
-              vector<shared_ptr<SplitWork>> active_splits;
-              active_splits.reserve(splits.size());
               for (shared_ptr<SplitWork> &split : splits) {
                 BatchState &state = states[split->state_index];
-                finish_split_work(*split, state.flat_surface_planes,
-                                  state.random_engine);
-                if (split->planes.empty()) {
+                finish_candidate_sampling(*split, state.random_engine);
+                if (!split->has_selected_plane) {
                   state.parts.push_back(move(split->part));
                   state.part_cache.push_back(move(split->part_cache));
                   state.finished = true;
                   schedule_finalize(split->state_index);
                   continue;
                 }
-                active_splits.push_back(move(split));
-              }
-
-              if (!active_splits.empty()) {
-                vector<PlaneScoreInput> score_inputs;
-                score_inputs.reserve(active_splits.size());
-                for (shared_ptr<SplitWork> &split : active_splits) {
-                  if (split->planes.size() >
-                      static_cast<size_t>(
-                          numeric_limits<int>::max())) {
-                    throw overflow_error(
-                        "Plane scoring input is too large");
-                  }
-                  score_inputs.push_back(
-                      {split->host_planes.data(),
-                       split->host_points.data(),
-                       split->host_edges.data(),
-                       split->scores.data(),
-                       static_cast<int>(split->planes.size()),
-                       static_cast<int>(split->part.vertices.size()),
-                       static_cast<int>(
-                           split->part.intersecting_edges.size()),
-                       split->part_cache.device.get()});
-                }
-                {
-                  StageTimer timer(profiler, ProfileStage::plane_scoring,
-                                   score_inputs.size());
-                  classify_and_rate_planes_batch(
-                      score_inputs, plane_scoring,
-                      configured_batch_size(), gpu_memory_fraction);
-                }
-
-                vector<ClipBatchInput> clip_inputs;
-                clip_inputs.reserve(active_splits.size());
-                {
-                  StageTimer timer(profiler, ProfileStage::plane_selection,
-                                   active_splits.size());
-                  for (shared_ptr<SplitWork> &split : active_splits) {
-                    for (size_t index = split->flat_surface_offset;
-                         index < split->scores.size(); ++index) {
-                      split->scores[index] *=
-                          static_cast<float>(config.flat_surface_k);
-                    }
-                    split->selected_plane =
-                        max_element(split->scores.begin(),
-                                    split->scores.end()) -
-                        split->scores.begin();
-                    if (split->part_cache.device) {
-                      clip_inputs.push_back(
-                          {split->part_cache.device.get(),
-                           split->planes[split->selected_plane],
-                           &split->prepared_clip});
-                    }
-                  }
-                }
-                {
-                  StageTimer timer(profiler, ProfileStage::clip_prepare,
-                                   clip_inputs.size());
-                  prepare_clip_batch(
-                      clip_inputs, clip_batch, configured_batch_size(),
-                      gpu_memory_fraction);
-                }
-                for (shared_ptr<SplitWork> &split : active_splits)
-                  schedule_clip(move(split));
+                schedule_clip(move(split));
               }
               coordinator.complete_gpu_batch(GpuWorkKind::planes);
             } catch (...) {
