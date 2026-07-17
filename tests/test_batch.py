@@ -169,6 +169,32 @@ class BatchGpuTests(unittest.TestCase):
         self.assertLess(first_bounds[1], 0.0)
         self.assertGreater(second_bounds[0], 0.0)
 
+    def test_selection_hull_is_closed_and_convex(self):
+        visacd.config.max_batch_size = 0
+        visacd.set_seed(9876)
+        result = visacd.process_batch(
+            [load_cow()],
+            concavity=10.0,
+            num_parts=2,
+        )[0]
+
+        self.assertEqual(result.num_parts, 1)
+        hull = result.parts[0]
+        hull_mesh = trimesh.Trimesh(
+            vertices=np.asarray(list(hull.vertices), dtype=np.float64),
+            faces=np.asarray(list(hull.triangles), dtype=np.int32),
+            process=False,
+        )
+        self.assertTrue(hull_mesh.is_watertight)
+        self.assertTrue(hull_mesh.is_winding_consistent)
+        vertices = np.asarray(hull_mesh.vertices, dtype=np.float64)
+        for triangle in np.asarray(hull_mesh.faces, dtype=np.int32):
+            first, second, third = vertices[triangle]
+            normal = np.cross(second - first, third - first)
+            tolerance = 1e-8 * np.linalg.norm(normal)
+            signed_distances = (vertices - first) @ normal
+            self.assertLessEqual(signed_distances.max(), tolerance)
+
     def test_mixed_mesh_pipeline_is_repeatable(self):
         def run(
             max_batch_size,

@@ -70,6 +70,8 @@ public:
 };
 using MeshList = std::vector<Mesh>;
 
+void cvx_fix_normals(Mesh &convex);
+
 class LoadingBar {
 public:
   std::string message;

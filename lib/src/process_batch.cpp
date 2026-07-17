@@ -8,6 +8,7 @@
 #include <config.hpp>
 #include <condition_variable>
 #include <components_batch.hpp>
+#include <convex_hull_batch.hpp>
 #include <core.hpp>
 #include <cost.hpp>
 #include <deque>
@@ -118,6 +119,11 @@ struct FinalizeWork {
   atomic<size_t> remaining{0};
 };
 
+struct HullWork {
+  size_t state_index;
+  vector<size_t> part_indices;
+};
+
 enum class HausdorffPurpose { selection, final_concavity };
 
 struct HausdorffWork {
@@ -134,6 +140,7 @@ enum class GpuWorkKind {
   planes,
   hausdorff,
   components,
+  hulls,
   complete
 };
 
@@ -143,6 +150,7 @@ struct GpuWork {
   vector<shared_ptr<SplitWork>> planes;
   vector<shared_ptr<HausdorffWork>> hausdorff;
   vector<shared_ptr<ComponentWork>> components;
+  vector<shared_ptr<HullWork>> hulls;
 };
 
 class PipelineCoordinator {
@@ -222,6 +230,21 @@ public:
     condition_.notify_one();
   }
 
+  void enqueue_hulls(shared_ptr<HullWork> work) {
+    lock_guard<mutex> lock(mutex_);
+    if (error_)
+      return;
+    hull_request_count_ += work->part_indices.size();
+    hull_queue_.push_back(move(work));
+    condition_.notify_one();
+  }
+
+  void complete_hull_batch() {
+    lock_guard<mutex> lock(mutex_);
+    hull_busy_ = false;
+    condition_.notify_one();
+  }
+
   void complete_state() {
     lock_guard<mutex> lock(mutex_);
     ++completed_states_;
@@ -239,7 +262,8 @@ public:
       condition_.wait(lock, [this]() {
         return error_ || completed() || !intersection_queue_.empty() ||
                !plane_queue_.empty() || !hausdorff_queue_.empty() ||
-               !component_queue_.empty();
+               !component_queue_.empty() ||
+               (!hull_busy_ && !hull_queue_.empty());
       });
 
       if (error_) {
@@ -249,7 +273,7 @@ public:
         rethrow_exception(error_);
       }
       if (completed())
-        return {GpuWorkKind::complete, {}, {}, {}, {}};
+        return {GpuWorkKind::complete, {}, {}, {}, {}, {}};
 
       if (!gpu_batch_ready() && active_cpu_tasks_ != 0) {
         condition_.wait_for(lock, chrono::milliseconds(1), [this]() {
@@ -259,13 +283,15 @@ public:
         if (error_)
           continue;
         if (completed())
-          return {GpuWorkKind::complete, {}, {}, {}, {}};
+          return {GpuWorkKind::complete, {}, {}, {}, {}, {}};
       }
 
-      const array<bool, 4> available = {!intersection_queue_.empty(),
+      const array<bool, 5> available = {!intersection_queue_.empty(),
                                         !plane_queue_.empty(),
                                         !hausdorff_queue_.empty(),
-                                        !component_queue_.empty()};
+                                        !component_queue_.empty(),
+                                        !hull_busy_ &&
+                                            !hull_queue_.empty()};
       size_t selected = 0;
       for (; selected < available.size(); ++selected) {
         const size_t candidate = (next_gpu_kind_ + selected) % available.size();
@@ -277,7 +303,7 @@ public:
       next_gpu_kind_ = (selected + 1) % available.size();
 
       if (selected == 0) {
-        GpuWork result{GpuWorkKind::intersections, {}, {}, {}, {}};
+        GpuWork result{GpuWorkKind::intersections, {}, {}, {}, {}, {}};
         result.intersections.reserve(intersection_queue_.size());
         while (!intersection_queue_.empty()) {
           shared_ptr<IntersectionWork> work =
@@ -290,7 +316,7 @@ public:
       }
 
       if (selected == 1) {
-        GpuWork result{GpuWorkKind::planes, {}, {}, {}, {}};
+        GpuWork result{GpuWorkKind::planes, {}, {}, {}, {}, {}};
         result.planes.reserve(plane_queue_.size());
         while (!plane_queue_.empty()) {
           result.planes.push_back(move(plane_queue_.front()));
@@ -300,7 +326,7 @@ public:
       }
 
       if (selected == 2) {
-        GpuWork result{GpuWorkKind::hausdorff, {}, {}, {}, {}};
+        GpuWork result{GpuWorkKind::hausdorff, {}, {}, {}, {}, {}};
         result.hausdorff.reserve(hausdorff_queue_.size());
         while (!hausdorff_queue_.empty()) {
           shared_ptr<HausdorffWork> work = move(hausdorff_queue_.front());
@@ -311,13 +337,26 @@ public:
         return result;
       }
 
-      GpuWork result{GpuWorkKind::components, {}, {}, {}, {}};
-      result.components.reserve(component_queue_.size());
-      while (!component_queue_.empty()) {
-        shared_ptr<ComponentWork> work = move(component_queue_.front());
-        component_queue_.pop_front();
-        component_request_count_ -= work->parts.size();
-        result.components.push_back(move(work));
+      if (selected == 3) {
+        GpuWork result{GpuWorkKind::components, {}, {}, {}, {}, {}};
+        result.components.reserve(component_queue_.size());
+        while (!component_queue_.empty()) {
+          shared_ptr<ComponentWork> work = move(component_queue_.front());
+          component_queue_.pop_front();
+          component_request_count_ -= work->parts.size();
+          result.components.push_back(move(work));
+        }
+        return result;
+      }
+
+      GpuWork result{GpuWorkKind::hulls, {}, {}, {}, {}, {}};
+      hull_busy_ = true;
+      result.hulls.reserve(hull_queue_.size());
+      while (!hull_queue_.empty()) {
+        shared_ptr<HullWork> work = move(hull_queue_.front());
+        hull_queue_.pop_front();
+        hull_request_count_ -= work->part_indices.size();
+        result.hulls.push_back(move(work));
       }
       return result;
     }
@@ -332,7 +371,9 @@ private:
     return intersection_request_count_ >= gpu_batch_threshold_ ||
            plane_queue_.size() >= gpu_batch_threshold_ ||
            hausdorff_request_count_ >= gpu_batch_threshold_ ||
-           component_request_count_ >= gpu_batch_threshold_;
+           component_request_count_ >= gpu_batch_threshold_ ||
+           (!hull_busy_ &&
+            hull_request_count_ >= gpu_batch_threshold_);
   }
 
   void record_error(exception_ptr error) {
@@ -342,9 +383,12 @@ private:
     plane_queue_.clear();
     hausdorff_queue_.clear();
     component_queue_.clear();
+    hull_queue_.clear();
     intersection_request_count_ = 0;
     hausdorff_request_count_ = 0;
     component_request_count_ = 0;
+    hull_request_count_ = 0;
+    hull_busy_ = false;
     condition_.notify_all();
   }
 
@@ -363,12 +407,15 @@ private:
   deque<shared_ptr<SplitWork>> plane_queue_;
   deque<shared_ptr<HausdorffWork>> hausdorff_queue_;
   deque<shared_ptr<ComponentWork>> component_queue_;
+  deque<shared_ptr<HullWork>> hull_queue_;
   size_t intersection_request_count_ = 0;
   size_t hausdorff_request_count_ = 0;
   size_t component_request_count_ = 0;
+  size_t hull_request_count_ = 0;
   size_t active_cpu_tasks_ = 0;
   size_t completed_states_ = 0;
   size_t next_gpu_kind_ = 0;
+  bool hull_busy_ = false;
   mutex mutex_;
   condition_variable condition_;
   exception_ptr error_;
@@ -591,6 +638,7 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
   DeviceMeshRuntime device_meshes;
   ClipBatchRuntime clip_batch;
   ComponentBatchRuntime component_batch;
+  ConvexHullBatchRuntime convex_hulls;
 
   const uint32_t batch_seed = random_engine();
   for (size_t i = 0; i < states.size(); ++i) {
@@ -693,13 +741,11 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
         missing_hulls.push_back(part_index);
       }
     }
-    work->remaining.store(missing_hulls.size());
-
     if (missing_hulls.empty()) {
       schedule_final_concavity(move(work));
       return;
     }
-
+    work->remaining.store(missing_hulls.size());
     for (size_t part_index : missing_hulls) {
       coordinator.submit_cpu(
           [&, work, part_index]() {
@@ -788,16 +834,27 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
           if (state.parts.size() != state.part_cache.size())
             throw logic_error("Part cache is out of sync with batch state");
 
+          auto hull_work = make_shared<HullWork>();
+          hull_work->state_index = state_index;
+          for (size_t part_index = 0; part_index < state.parts.size();
+               ++part_index) {
+            PartCache &cache = state.part_cache[part_index];
+            if (!cache.hull) {
+              cache.hull.emplace();
+              hull_work->part_indices.push_back(part_index);
+            }
+          }
+          if (!hull_work->part_indices.empty()) {
+            coordinator.enqueue_hulls(move(hull_work));
+            return;
+          }
+
           auto work = make_shared<HausdorffWork>();
           work->purpose = HausdorffPurpose::selection;
           work->state_index = state_index;
           for (size_t part_index = 0; part_index < state.parts.size();
                ++part_index) {
             PartCache &cache = state.part_cache[part_index];
-            if (!cache.hull) {
-              cache.hull.emplace();
-              state.parts[part_index].compute_ch(*cache.hull, true);
-            }
             if (cache.selection_concavity)
               continue;
             work->part_indices.push_back(part_index);
@@ -976,6 +1033,49 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
           }
           schedule_advance(work->state_index);
         }
+        continue;
+      }
+
+      if (gpu_work.kind == GpuWorkKind::hulls) {
+        size_t input_count = 0;
+        for (const shared_ptr<HullWork> &work : gpu_work.hulls)
+          input_count += work->part_indices.size();
+        vector<ConvexHullBatchInput> inputs;
+        inputs.reserve(input_count);
+        for (shared_ptr<HullWork> &work : gpu_work.hulls) {
+          BatchState &state = states[work->state_index];
+          for (size_t part_index : work->part_indices) {
+            if (part_index >= state.parts.size() ||
+                part_index >= state.part_cache.size()) {
+              throw logic_error("Hull part index is out of range");
+            }
+            PartCache &cache = state.part_cache[part_index];
+            if (!cache.device) {
+              cache.device = device_meshes.try_upload(
+                  state.parts[part_index], config.batch_memory_fraction);
+            }
+            if (!cache.hull)
+              throw logic_error("Selection hull destination is missing");
+            inputs.push_back({&state.parts[part_index],
+                              cache.device.get(), &*cache.hull, true});
+          }
+        }
+        coordinator.submit_cpu(
+            [&, inputs = move(inputs),
+             works = move(gpu_work.hulls)]() mutable {
+              try {
+                compute_convex_hulls_batch(
+                    inputs, convex_hulls, configured_batch_size(),
+                    config.batch_memory_fraction);
+                for (shared_ptr<HullWork> &work : works)
+                  schedule_advance(work->state_index);
+                coordinator.complete_hull_batch();
+              } catch (...) {
+                coordinator.complete_hull_batch();
+                throw;
+              }
+            },
+            true);
         continue;
       }
 
