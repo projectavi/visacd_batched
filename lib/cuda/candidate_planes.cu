@@ -124,13 +124,12 @@ __global__ void generate_candidates_kernel(
     return;
   const PackedCandidateJob job = jobs[job_index];
 
-  __shared__ int accepted_count;
   __shared__ int attempts;
   __shared__ int valid;
   __shared__ int too_similar;
   __shared__ double4 candidate;
+  int accepted_count = 0;
   if (threadIdx.x == 0) {
-    accepted_count = 0;
     attempts = 0;
   }
   __syncthreads();
@@ -192,10 +191,11 @@ __global__ void generate_candidates_kernel(
     }
     __syncthreads();
 
-    if (threadIdx.x == 0 && valid && !too_similar) {
+    const bool accepted = valid && !too_similar;
+    if (threadIdx.x == 0 && accepted)
       job.planes[accepted_count] = candidate;
+    if (accepted)
       ++accepted_count;
-    }
     __syncthreads();
   }
 
