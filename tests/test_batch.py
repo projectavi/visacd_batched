@@ -269,6 +269,48 @@ class BatchGpuTests(unittest.TestCase):
         self.assertEqual(expected_digest, result_digest(one_cpu_thread))
         self.assertEqual(expected_digest, result_digest(host_packed_fallback))
 
+    def test_merge_pipeline_is_repeatable(self):
+        def run(
+            max_batch_size,
+            batch_cpu_threads=0,
+            batch_memory_fraction=0.7,
+        ):
+            visacd.config.score_mode = "edge"
+            visacd.config.use_merging = True
+            visacd.config.max_batch_size = max_batch_size
+            visacd.config.batch_cpu_threads = batch_cpu_threads
+            visacd.config.batch_memory_fraction = batch_memory_fraction
+            visacd.set_seed(31415)
+            return visacd.process_batch(
+                [load_cow(-100.0), load_cow(100.0)],
+                concavity=0.2,
+                num_parts=4,
+            )
+
+        automatic = run(max_batch_size=0)
+        repeated = run(max_batch_size=0)
+        one_request_waves = run(max_batch_size=1)
+        one_cpu_thread = run(
+            max_batch_size=0,
+            batch_cpu_threads=1,
+        )
+        host_packed_fallback = run(
+            max_batch_size=0,
+            batch_memory_fraction=1e-9,
+        )
+
+        expected_digest = result_digest(automatic)
+        self.assertEqual([result.num_parts for result in automatic], [5, 5])
+        self.assertEqual(expected_digest, result_digest(repeated))
+        self.assertEqual(expected_digest, result_digest(one_request_waves))
+        self.assertEqual(expected_digest, result_digest(one_cpu_thread))
+        self.assertEqual(
+            expected_digest,
+            result_digest(host_packed_fallback),
+        )
+        self.assertLess(result_x_bounds(automatic[0])[1], 0.0)
+        self.assertGreater(result_x_bounds(automatic[1])[0], 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

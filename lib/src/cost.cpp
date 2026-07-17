@@ -101,6 +101,29 @@ void MergeMesh(Mesh &mesh1, Mesh &mesh2, Mesh &merge) {
                                mesh2.triangles[i][2] + N});
 }
 
+PreparedHausdorffJob prepare_merge_hausdorff_job(
+    Mesh &first, Mesh &second, Mesh &merged, Mesh &combined_hull,
+    unsigned int resolution, RandomEngine &engine) {
+  vector<Vec3D> merged_samples;
+  vector<Vec3D> hull_samples;
+  vector<int> merged_triangle_ids;
+  vector<int> hull_triangle_ids;
+  extract_point_set(first, second, merged_samples, merged_triangle_ids,
+                    resolution, engine);
+  combined_hull.extract_point_set(hull_samples, hull_triangle_ids,
+                                  resolution, engine, 1);
+
+  PreparedHausdorffJob job;
+  if (merged_samples.empty() || hull_samples.empty())
+    return job;
+  job.directions[0] = prepare_hausdorff_direction(
+      merged, merged_samples, merged_triangle_ids, hull_samples);
+  job.directions[1] = prepare_hausdorff_direction(
+      combined_hull, hull_samples, hull_triangle_ids, merged_samples);
+  job.valid = true;
+  return job;
+}
+
 double get_volume(Vec3D p1, Vec3D p2, Vec3D p3) {
   double v321 = p3[0] * p2[1] * p1[2];
   double v231 = p2[0] * p3[1] * p1[2];

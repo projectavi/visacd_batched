@@ -30,6 +30,9 @@ struct PreparedHausdorffJob {
 PreparedHausdorffJob prepare_hausdorff_job(
     Mesh &first, Mesh &second, unsigned int resolution, bool flag,
     RandomEngine &engine);
+PreparedHausdorffJob prepare_merge_hausdorff_job(
+    Mesh &first, Mesh &second, Mesh &merged, Mesh &combined_hull,
+    unsigned int resolution, RandomEngine &engine);
 void attach_hausdorff_device_meshes(
     PreparedHausdorffJob &job, std::shared_ptr<DeviceMesh> first,
     std::shared_ptr<DeviceMesh> second);

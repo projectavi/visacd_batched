@@ -22,6 +22,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <merge_batch.hpp>
 #include <mutex>
 #include <optional>
 #include <plane_intersections.hpp>
@@ -117,6 +118,7 @@ struct FinalizeWork {
   size_t state_index;
   MeshList hulls;
   vector<shared_ptr<DeviceMesh>> hull_devices;
+  vector<double> part_hausdorff;
   atomic<size_t> remaining{0};
 };
 
@@ -128,6 +130,14 @@ struct HullWork {
 struct FlatSurfaceWork {
   size_t state_index;
   vector<Surface> surfaces;
+};
+
+struct MergeWork {
+  size_t state_index;
+  double final_concavity;
+  size_t initial_hull_count;
+  shared_ptr<FinalizeWork> finalize_work;
+  vector<shared_ptr<DeviceMesh>> part_devices;
 };
 
 enum class HausdorffPurpose { selection, final_concavity };
@@ -148,6 +158,7 @@ enum class GpuWorkKind {
   components,
   hulls,
   flat_surfaces,
+  merges,
   complete
 };
 
@@ -159,6 +170,7 @@ struct GpuWork {
   vector<shared_ptr<ComponentWork>> components;
   vector<shared_ptr<HullWork>> hulls;
   vector<shared_ptr<FlatSurfaceWork>> flat_surfaces;
+  vector<shared_ptr<MergeWork>> merges;
 };
 
 class PipelineCoordinator {
@@ -268,6 +280,21 @@ public:
     condition_.notify_one();
   }
 
+  void enqueue_merge(shared_ptr<MergeWork> work) {
+    lock_guard<mutex> lock(mutex_);
+    if (error_)
+      return;
+    ++merge_request_count_;
+    merge_queue_.push_back(move(work));
+    condition_.notify_one();
+  }
+
+  void complete_merge_batch() {
+    lock_guard<mutex> lock(mutex_);
+    merge_busy_ = false;
+    condition_.notify_one();
+  }
+
   void complete_state() {
     lock_guard<mutex> lock(mutex_);
     ++completed_states_;
@@ -288,7 +315,8 @@ public:
                !component_queue_.empty() ||
                (!hull_busy_ && !hull_queue_.empty()) ||
                (!flat_surface_busy_ &&
-                !flat_surface_queue_.empty());
+                !flat_surface_queue_.empty()) ||
+               (!merge_busy_ && !merge_queue_.empty());
       });
 
       if (error_) {
@@ -298,7 +326,7 @@ public:
         rethrow_exception(error_);
       }
       if (completed())
-        return {GpuWorkKind::complete, {}, {}, {}, {}, {}, {}};
+        return GpuWork{GpuWorkKind::complete};
 
       if (!gpu_batch_ready() && active_cpu_tasks_ != 0) {
         condition_.wait_for(lock, chrono::milliseconds(1), [this]() {
@@ -308,17 +336,19 @@ public:
         if (error_)
           continue;
         if (completed())
-          return {GpuWorkKind::complete, {}, {}, {}, {}, {}, {}};
+          return GpuWork{GpuWorkKind::complete};
       }
 
-      const array<bool, 6> available = {!intersection_queue_.empty(),
+      const array<bool, 7> available = {!intersection_queue_.empty(),
                                         !plane_queue_.empty(),
                                         !hausdorff_queue_.empty(),
                                         !component_queue_.empty(),
                                         !hull_busy_ &&
                                             !hull_queue_.empty(),
                                         !flat_surface_busy_ &&
-                                            !flat_surface_queue_.empty()};
+                                            !flat_surface_queue_.empty(),
+                                        !merge_busy_ &&
+                                            !merge_queue_.empty()};
       size_t selected = 0;
       for (; selected < available.size(); ++selected) {
         const size_t candidate = (next_gpu_kind_ + selected) % available.size();
@@ -330,7 +360,7 @@ public:
       next_gpu_kind_ = (selected + 1) % available.size();
 
       if (selected == 0) {
-        GpuWork result{GpuWorkKind::intersections, {}, {}, {}, {}, {}, {}};
+        GpuWork result{GpuWorkKind::intersections};
         result.intersections.reserve(intersection_queue_.size());
         while (!intersection_queue_.empty()) {
           shared_ptr<IntersectionWork> work =
@@ -343,7 +373,7 @@ public:
       }
 
       if (selected == 1) {
-        GpuWork result{GpuWorkKind::planes, {}, {}, {}, {}, {}, {}};
+        GpuWork result{GpuWorkKind::planes};
         result.planes.reserve(plane_queue_.size());
         while (!plane_queue_.empty()) {
           result.planes.push_back(move(plane_queue_.front()));
@@ -353,7 +383,7 @@ public:
       }
 
       if (selected == 2) {
-        GpuWork result{GpuWorkKind::hausdorff, {}, {}, {}, {}, {}, {}};
+        GpuWork result{GpuWorkKind::hausdorff};
         result.hausdorff.reserve(hausdorff_queue_.size());
         while (!hausdorff_queue_.empty()) {
           shared_ptr<HausdorffWork> work = move(hausdorff_queue_.front());
@@ -365,7 +395,7 @@ public:
       }
 
       if (selected == 3) {
-        GpuWork result{GpuWorkKind::components, {}, {}, {}, {}, {}, {}};
+        GpuWork result{GpuWorkKind::components};
         result.components.reserve(component_queue_.size());
         while (!component_queue_.empty()) {
           shared_ptr<ComponentWork> work = move(component_queue_.front());
@@ -377,7 +407,7 @@ public:
       }
 
       if (selected == 4) {
-        GpuWork result{GpuWorkKind::hulls, {}, {}, {}, {}, {}, {}};
+        GpuWork result{GpuWorkKind::hulls};
         hull_busy_ = true;
         result.hulls.reserve(hull_queue_.size());
         while (!hull_queue_.empty()) {
@@ -389,13 +419,25 @@ public:
         return result;
       }
 
-      GpuWork result{GpuWorkKind::flat_surfaces, {}, {}, {}, {}, {}, {}};
-      flat_surface_busy_ = true;
-      result.flat_surfaces.reserve(flat_surface_queue_.size());
-      while (!flat_surface_queue_.empty()) {
-        result.flat_surfaces.push_back(move(flat_surface_queue_.front()));
-        flat_surface_queue_.pop_front();
-        --flat_surface_request_count_;
+      if (selected == 5) {
+        GpuWork result{GpuWorkKind::flat_surfaces};
+        flat_surface_busy_ = true;
+        result.flat_surfaces.reserve(flat_surface_queue_.size());
+        while (!flat_surface_queue_.empty()) {
+          result.flat_surfaces.push_back(move(flat_surface_queue_.front()));
+          flat_surface_queue_.pop_front();
+          --flat_surface_request_count_;
+        }
+        return result;
+      }
+
+      GpuWork result{GpuWorkKind::merges};
+      merge_busy_ = true;
+      result.merges.reserve(merge_queue_.size());
+      while (!merge_queue_.empty()) {
+        result.merges.push_back(move(merge_queue_.front()));
+        merge_queue_.pop_front();
+        --merge_request_count_;
       }
       return result;
     }
@@ -414,7 +456,9 @@ private:
            (!hull_busy_ &&
             hull_request_count_ >= gpu_batch_threshold_) ||
            (!flat_surface_busy_ &&
-            flat_surface_request_count_ >= gpu_batch_threshold_);
+            flat_surface_request_count_ >= gpu_batch_threshold_) ||
+           (!merge_busy_ &&
+            merge_request_count_ >= gpu_batch_threshold_);
   }
 
   void record_error(exception_ptr error) {
@@ -426,13 +470,16 @@ private:
     component_queue_.clear();
     hull_queue_.clear();
     flat_surface_queue_.clear();
+    merge_queue_.clear();
     intersection_request_count_ = 0;
     hausdorff_request_count_ = 0;
     component_request_count_ = 0;
     hull_request_count_ = 0;
     flat_surface_request_count_ = 0;
+    merge_request_count_ = 0;
     hull_busy_ = false;
     flat_surface_busy_ = false;
+    merge_busy_ = false;
     condition_.notify_all();
   }
 
@@ -453,16 +500,19 @@ private:
   deque<shared_ptr<ComponentWork>> component_queue_;
   deque<shared_ptr<HullWork>> hull_queue_;
   deque<shared_ptr<FlatSurfaceWork>> flat_surface_queue_;
+  deque<shared_ptr<MergeWork>> merge_queue_;
   size_t intersection_request_count_ = 0;
   size_t hausdorff_request_count_ = 0;
   size_t component_request_count_ = 0;
   size_t hull_request_count_ = 0;
   size_t flat_surface_request_count_ = 0;
+  size_t merge_request_count_ = 0;
   size_t active_cpu_tasks_ = 0;
   size_t completed_states_ = 0;
   size_t next_gpu_kind_ = 0;
   bool hull_busy_ = false;
   bool flat_surface_busy_ = false;
+  bool merge_busy_ = false;
   mutex mutex_;
   condition_variable condition_;
   exception_ptr error_;
@@ -677,6 +727,7 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
   ComponentBatchRuntime component_batch;
   ConvexHullBatchRuntime convex_hulls;
   FlatSurfaceBatchRuntime flat_surfaces;
+  MergeBatchRuntime merges;
 
   const uint32_t batch_seed = random_engine();
   for (size_t i = 0; i < states.size(); ++i) {
@@ -686,6 +737,8 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
   }
 
   function<void(shared_ptr<FinalizeWork>, double)> finish_state;
+  function<void(shared_ptr<FinalizeWork>, double)>
+      schedule_merge_or_finish;
   function<void(shared_ptr<FinalizeWork>)> schedule_final_concavity;
   function<void(size_t)> schedule_finalize;
   function<void(size_t)> schedule_split;
@@ -698,11 +751,6 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
     coordinator.submit_cpu(
         [&, work = move(work), final_concavity]() mutable {
           BatchState &state = states[work->state_index];
-          if (config.use_merging) {
-            multimerge_ch(state.parts, work->hulls, final_concavity,
-                          concavity);
-          }
-
           state.part_cache.clear();
           work->hull_devices.clear();
 
@@ -725,6 +773,38 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
         },
         true);
   };
+
+  schedule_merge_or_finish =
+      [&](shared_ptr<FinalizeWork> finalize_work,
+          double final_concavity) {
+        if (!config.use_merging || finalize_work->hulls.size() < 2) {
+          finish_state(move(finalize_work), final_concavity);
+          return;
+        }
+
+        BatchState &state = states[finalize_work->state_index];
+        if (state.parts.size() != state.part_cache.size() ||
+            state.parts.size() != finalize_work->hulls.size() ||
+            state.parts.size() != finalize_work->part_hausdorff.size()) {
+          throw logic_error("Merge state is out of sync");
+        }
+        auto work = make_shared<MergeWork>();
+        work->state_index = finalize_work->state_index;
+        work->final_concavity = final_concavity;
+        work->initial_hull_count = finalize_work->hulls.size();
+        work->part_devices.reserve(state.parts.size());
+        for (size_t part_index = 0; part_index < state.parts.size();
+             ++part_index) {
+          PartCache &cache = state.part_cache[part_index];
+          if (!cache.device) {
+            cache.device = device_meshes.try_upload(
+                state.parts[part_index], config.batch_memory_fraction);
+          }
+          work->part_devices.push_back(cache.device);
+        }
+        work->finalize_work = move(finalize_work);
+        coordinator.enqueue_merge(move(work));
+      };
 
   schedule_final_concavity = [&](shared_ptr<FinalizeWork> finalize_work) {
     coordinator.submit_cpu(
@@ -763,6 +843,7 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
     work->state_index = state_index;
     work->hulls.resize(state.parts.size());
     work->hull_devices.resize(state.parts.size());
+    work->part_hausdorff.resize(state.parts.size());
     log(state_index, "Computing convex hulls for " +
                          to_string(state.parts.size()) + " parts...");
 
@@ -1089,6 +1170,52 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
         continue;
       }
 
+      if (gpu_work.kind == GpuWorkKind::merges) {
+        vector<MergeBatchInput> inputs;
+        inputs.reserve(gpu_work.merges.size());
+        for (shared_ptr<MergeWork> &work : gpu_work.merges) {
+          BatchState &state = states[work->state_index];
+          if (!work->finalize_work)
+            throw logic_error("Merge work has no final hulls");
+          log(work->state_index,
+              "Evaluating GPU merge costs for " +
+                  to_string(work->initial_hull_count) + " hulls...");
+          inputs.push_back(
+              {&state.parts, &work->finalize_work->hulls,
+               &work->part_devices,
+               &work->finalize_work->hull_devices,
+               &work->finalize_work->part_hausdorff,
+               work->final_concavity, concavity,
+               &state.random_engine});
+        }
+        coordinator.submit_cpu(
+            [&, inputs = move(inputs),
+             works = move(gpu_work.merges)]() mutable {
+              try {
+                merge_convex_hulls_batch(
+                    inputs, merges, configured_batch_size(),
+                    config.batch_memory_fraction, &executor);
+                for (shared_ptr<MergeWork> &work : works) {
+                  const size_t remaining =
+                      work->finalize_work->hulls.size();
+                  log(work->state_index,
+                      "Merged " +
+                          to_string(work->initial_hull_count - remaining) +
+                          " hull(s); " + to_string(remaining) +
+                          " remain.");
+                  finish_state(move(work->finalize_work),
+                               work->final_concavity);
+                }
+                coordinator.complete_merge_batch();
+              } catch (...) {
+                coordinator.complete_merge_batch();
+                throw;
+              }
+            },
+            true);
+        continue;
+      }
+
       if (gpu_work.kind == GpuWorkKind::intersections) {
         vector<pair<Mesh *, Mesh *>> requests;
         size_t request_count = 0;
@@ -1261,9 +1388,14 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
           if (!work->finalize_work)
             throw logic_error("Final Hausdorff work has no hulls");
           double final_concavity = 0.0;
-          for (const PreparedHausdorffJob &job : work->jobs)
-            final_concavity = max(final_concavity, job.result);
-          finish_state(move(work->finalize_work), final_concavity);
+          for (size_t job_index = 0; job_index < work->jobs.size();
+               ++job_index) {
+            const double result = work->jobs[job_index].result;
+            work->finalize_work->part_hausdorff[job_index] = result;
+            final_concavity = max(final_concavity, result);
+          }
+          schedule_merge_or_finish(move(work->finalize_work),
+                                   final_concavity);
         }
         continue;
       }
