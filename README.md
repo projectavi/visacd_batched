@@ -134,10 +134,13 @@ on independent streams and are divided into memory-aware waves:
   positive value to cap the number of work items processed in one GPU wave.
 - `visacd.config.batch_memory_fraction = 0.7` controls the fraction of currently
   free VRAM a wave may use and must be in `(0, 1]`.
+- `visacd.config.batch_cpu_threads = 0` uses a conservative automatic worker
+  count for independent CPU stages. Set a positive value to choose the count.
 
 Call `set_seed` immediately before each `process_batch` call for repeatable
-whole-batch results. A seeded batch is not required to match separate seeded
-`process` calls because random candidate generation is interleaved across meshes.
+whole-batch results. Each mesh has an independent deterministic random stream,
+so CPU scheduling does not affect the result. A seeded batch is not required to
+match separate seeded `process` calls.
 
 ## decompose.py
 

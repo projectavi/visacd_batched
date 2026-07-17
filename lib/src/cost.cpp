@@ -68,11 +68,16 @@ double compute_rv(Mesh &tmesh1, Mesh &tmesh2, double epsilon) {
 
 double compute_hb(Mesh &tmesh1, Mesh &tmesh2, unsigned int resolution,
                   bool flag) {
+  return compute_hb(tmesh1, tmesh2, resolution, flag, random_engine);
+}
+
+double compute_hb(Mesh &tmesh1, Mesh &tmesh2, unsigned int resolution,
+                  bool flag, RandomEngine &engine) {
   vector<Vec3D> samples1, samples2;
   vector<int> sample_tri_ids1, sample_tri_ids2;
 
-  tmesh1.extract_point_set(samples1, sample_tri_ids1, resolution, 1);
-  tmesh2.extract_point_set(samples2, sample_tri_ids2, resolution, 1);
+  tmesh1.extract_point_set(samples1, sample_tri_ids1, resolution, engine, 1);
+  tmesh2.extract_point_set(samples2, sample_tri_ids2, resolution, engine, 1);
 
   if (!((int)samples1.size() > 0 && (int)samples2.size() > 0))
     return INF;
@@ -86,14 +91,19 @@ double compute_hb(Mesh &tmesh1, Mesh &tmesh2, unsigned int resolution,
 
 double compute_hb(Mesh &cvx1, Mesh &cvx2, Mesh &cvxCH,
                   unsigned int resolution) {
+  return compute_hb(cvx1, cvx2, cvxCH, resolution, random_engine);
+}
+
+double compute_hb(Mesh &cvx1, Mesh &cvx2, Mesh &cvxCH,
+                  unsigned int resolution, RandomEngine &engine) {
   if (cvx1.vertices.size() + cvx2.vertices.size() == cvxCH.vertices.size())
     return 0.0;
   Mesh cvx;
   vector<Vec3D> samples1, samples2;
   vector<int> sample_tri_ids1, sample_tri_ids2;
   MergeMesh(cvx1, cvx2, cvx);
-  extract_point_set(cvx1, cvx2, samples1, sample_tri_ids1, resolution);
-  cvxCH.extract_point_set(samples2, sample_tri_ids2, resolution, 1);
+  extract_point_set(cvx1, cvx2, samples1, sample_tri_ids1, resolution, engine);
+  cvxCH.extract_point_set(samples2, sample_tri_ids2, resolution, engine, 1);
 
   if (!((int)samples1.size() > 0 && (int)samples2.size() > 0))
     return INF;
@@ -106,8 +116,14 @@ double compute_hb(Mesh &cvx1, Mesh &cvx2, Mesh &cvxCH,
 
 double compute_h(Mesh &cvx1, Mesh &cvx2, Mesh &cvxCH, double k,
                  unsigned int resolution, double epsilon) {
+  return compute_h(cvx1, cvx2, cvxCH, k, resolution, epsilon, random_engine);
+}
+
+double compute_h(Mesh &cvx1, Mesh &cvx2, Mesh &cvxCH, double k,
+                 unsigned int resolution, double epsilon,
+                 RandomEngine &engine) {
   double h1 = compute_rv(cvx1, cvx2, cvxCH, epsilon);
-  double h2 = compute_hb(cvx1, cvx2, cvxCH, resolution + 2000);
+  double h2 = compute_hb(cvx1, cvx2, cvxCH, resolution + 2000, engine);
 
 
   return max(h1 * k, h2);
@@ -115,8 +131,14 @@ double compute_h(Mesh &cvx1, Mesh &cvx2, Mesh &cvxCH, double k,
 
 double compute_h(Mesh &tmesh1, Mesh &tmesh2, double k, unsigned int resolution,
                  double epsilon, bool flag) {
+  return compute_h(tmesh1, tmesh2, k, resolution, epsilon, flag,
+                   random_engine);
+}
+
+double compute_h(Mesh &tmesh1, Mesh &tmesh2, double k, unsigned int resolution,
+                 double epsilon, bool flag, RandomEngine &engine) {
   double h1 = compute_rv(tmesh1, tmesh2, epsilon);
-  double h2 = compute_hb(tmesh1, tmesh2, resolution, flag);
+  double h2 = compute_hb(tmesh1, tmesh2, resolution, flag, engine);
 
   // cout << "rv: " << h1 << ", hb: " << h2 << endl;
   return max(h1 * k, h2);

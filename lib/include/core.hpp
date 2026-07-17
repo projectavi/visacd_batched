@@ -10,7 +10,8 @@
 
 namespace neural_acd {
 
-inline std::mt19937 random_engine(std::random_device{}());
+using RandomEngine = std::mt19937;
+inline RandomEngine random_engine(std::random_device{}());
 
 #define INF std::numeric_limits<double>::max()
 using Vec3D = std::array<double, 3>;
@@ -49,6 +50,11 @@ public:
                          std::vector<int> &sample_tri_ids, size_t resolution,
                          double base = 0.0, bool flag = false,
                          Plane plane = Plane(), bool one_per_tri = true);
+  void extract_point_set(std::vector<Vec3D> &samples,
+                         std::vector<int> &sample_tri_ids, size_t resolution,
+                         RandomEngine &engine, double base = 0.0,
+                         bool flag = false, Plane plane = Plane(),
+                         bool one_per_tri = true);
 
   void extract_point_set(std::vector<Vec3D> &samples,
                          std::vector<int> &sample_tri_ids, size_t resolution) {
@@ -215,6 +221,10 @@ void subdivide_edge(const Vec3D &v1, const Vec3D &v2,
 void extract_point_set(Mesh &convex1, Mesh &convex2,
                        std::vector<Vec3D> &samples,
                        std::vector<int> &sample_tri_id, size_t resolution);
+void extract_point_set(Mesh &convex1, Mesh &convex2,
+                       std::vector<Vec3D> &samples,
+                       std::vector<int> &sample_tri_id, size_t resolution,
+                       RandomEngine &engine);
 
 void set_seed(unsigned int seed);
 

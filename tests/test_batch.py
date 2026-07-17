@@ -53,10 +53,12 @@ class BatchValidationTests(unittest.TestCase):
     def setUp(self):
         self.max_batch_size = visacd.config.max_batch_size
         self.batch_memory_fraction = visacd.config.batch_memory_fraction
+        self.batch_cpu_threads = visacd.config.batch_cpu_threads
 
     def tearDown(self):
         visacd.config.max_batch_size = self.max_batch_size
         visacd.config.batch_memory_fraction = self.batch_memory_fraction
+        visacd.config.batch_cpu_threads = self.batch_cpu_threads
 
     def test_empty_batch(self):
         self.assertEqual(visacd.process_batch([], 0.04, 2), [])
@@ -72,6 +74,11 @@ class BatchValidationTests(unittest.TestCase):
             visacd.process_batch([visacd.Mesh()], 0.04, 2)
 
     def test_invalid_batch_controls(self):
+        visacd.config.batch_cpu_threads = -1
+        with self.assertRaisesRegex(ValueError, "batch_cpu_threads"):
+            visacd.process_batch([], 0.04, 2)
+
+        visacd.config.batch_cpu_threads = 0
         visacd.config.max_batch_size = -1
         with self.assertRaisesRegex(ValueError, "max_batch_size"):
             visacd.process_batch([], 0.04, 2)
@@ -97,19 +104,22 @@ class BatchGpuTests(unittest.TestCase):
             "use_merging": visacd.config.use_merging,
             "max_batch_size": visacd.config.max_batch_size,
             "batch_memory_fraction": visacd.config.batch_memory_fraction,
+            "batch_cpu_threads": visacd.config.batch_cpu_threads,
         }
         visacd.config.return_parts = False
         visacd.config.score_mode = "concavity"
         visacd.config.use_flat_surfaces = False
         visacd.config.use_merging = False
         visacd.config.batch_memory_fraction = 0.7
+        visacd.config.batch_cpu_threads = 0
 
     def tearDown(self):
         for name, value in self.saved_config.items():
             setattr(visacd.config, name, value)
 
-    def run_batch(self, max_batch_size):
+    def run_batch(self, max_batch_size, batch_cpu_threads=0):
         visacd.config.max_batch_size = max_batch_size
+        visacd.config.batch_cpu_threads = batch_cpu_threads
         visacd.set_seed(1234)
         return visacd.process_batch(
             [load_cow(-100.0), load_cow(100.0)],
@@ -121,12 +131,19 @@ class BatchGpuTests(unittest.TestCase):
         automatic = self.run_batch(max_batch_size=0)
         repeated = self.run_batch(max_batch_size=0)
         one_request_waves = self.run_batch(max_batch_size=1)
+        one_cpu_thread = self.run_batch(
+            max_batch_size=0, batch_cpu_threads=1
+        )
 
         self.assertEqual(len(automatic), 2)
         self.assertEqual(result_digest(automatic), result_digest(repeated))
         self.assertEqual(
             result_digest(automatic),
             result_digest(one_request_waves),
+        )
+        self.assertEqual(
+            result_digest(automatic),
+            result_digest(one_cpu_thread),
         )
 
         first_bounds = result_x_bounds(automatic[0])

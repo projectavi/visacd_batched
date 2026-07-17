@@ -39,7 +39,9 @@ PYBIND11_MODULE(visacd, m)
         .def_readwrite("max_batch_size",
                        &neural_acd::Config::max_batch_size)
         .def_readwrite("batch_memory_fraction",
-                       &neural_acd::Config::batch_memory_fraction);
+                       &neural_acd::Config::batch_memory_fraction)
+        .def_readwrite("batch_cpu_threads",
+                       &neural_acd::Config::batch_cpu_threads);
 
     m.def("make_vecarray3i", [](py::array_t<int> input)
           {

@@ -10,11 +10,27 @@ using namespace std;
 
 namespace neural_acd {
 
+vector<Plane>
+get_candidate_planes(vector<Vec3D> &vertices,
+                     vector<pair<unsigned int, unsigned int>> &edges,
+                     int num_planes, RandomEngine &engine);
+int get_part_with_highest_concavity(MeshList &parts, double &max_concavity,
+                                    RandomEngine &engine);
+double compute_final_concavity(MeshList &parts, MeshList &cvxs,
+                               RandomEngine &engine);
 
   vector<Plane>
   get_candidate_planes(vector<Vec3D> &vertices,
                        vector<pair<unsigned int, unsigned int>> &edges,
                        int num_planes)
+  {
+      return get_candidate_planes(vertices, edges, num_planes, random_engine);
+  }
+
+  vector<Plane>
+  get_candidate_planes(vector<Vec3D> &vertices,
+                       vector<pair<unsigned int, unsigned int>> &edges,
+                       int num_planes, RandomEngine &engine)
   {
       vector<Plane> planes;
 
@@ -26,7 +42,7 @@ namespace neural_acd {
       const double dist_eps = 1e-3;                      // distance tolerance
 
       for (int i = 0; i < num_planes * 5 && (int)planes.size() < num_planes; ++i) {
-          int idx = dis(random_engine);
+          int idx = dis(engine);
           Vec3D p1 = vertices[edges[idx].first];
           Vec3D p2 = vertices[edges[idx].second];
           Vec3D n = p2 - p1; // normal vector
@@ -84,6 +100,11 @@ int get_part_with_highest_score(MeshList &parts) {
 }
 
 int get_part_with_highest_concavity(MeshList &parts, double &max_concavity) {
+  return get_part_with_highest_concavity(parts, max_concavity, random_engine);
+}
+
+int get_part_with_highest_concavity(MeshList &parts, double &max_concavity,
+                                    RandomEngine &engine) {
 
   MeshList cvxs;
   for (auto &part : parts) {
@@ -94,7 +115,8 @@ int get_part_with_highest_concavity(MeshList &parts, double &max_concavity) {
 
   int best_idx = -1;
   for (int i = 0; i < parts.size(); i++) {
-    double concavity = compute_h(parts[i], cvxs[i], 0.3, 3000, 42);
+    double concavity =
+        compute_h(parts[i], cvxs[i], 0.3, 3000, 42, false, engine);
     if (concavity > max_concavity) {
       max_concavity = concavity;
       best_idx = i;
@@ -104,9 +126,14 @@ int get_part_with_highest_concavity(MeshList &parts, double &max_concavity) {
 }
 
 double compute_final_concavity(MeshList &parts, MeshList &cvxs) {
+  return compute_final_concavity(parts, cvxs, random_engine);
+}
+
+double compute_final_concavity(MeshList &parts, MeshList &cvxs,
+                               RandomEngine &engine) {
   double h = 0;
   for (int i = 0; i < parts.size(); i++) {
-    double cur_h = compute_hb(parts[i], cvxs[i], 10000, 42);
+    double cur_h = compute_hb(parts[i], cvxs[i], 10000, true, engine);
     if (cur_h > h)
       h = cur_h;
   }

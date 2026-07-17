@@ -16,6 +16,7 @@ public:
   bool use_merging;
   int max_batch_size;           // 0 selects memory-aware automatic sizing
   double batch_memory_fraction; // fraction of currently free device memory
+  int batch_cpu_threads;        // 0 selects a conservative automatic count
 
   Config() {
     return_parts = false;
@@ -28,6 +29,7 @@ public:
     use_merging = false;
     max_batch_size = 0;
     batch_memory_fraction = 0.7;
+    batch_cpu_threads = 0;
   }
 };
 

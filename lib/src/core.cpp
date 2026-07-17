@@ -145,6 +145,14 @@ void Mesh::extract_point_set(vector<Vec3D> &samples,
                              vector<int> &sample_tri_ids, size_t resolution,
                              double base, bool flag, Plane plane,
                              bool one_per_tri) {
+  extract_point_set(samples, sample_tri_ids, resolution, random_engine, base,
+                    flag, plane, one_per_tri);
+}
+
+void Mesh::extract_point_set(vector<Vec3D> &samples,
+                             vector<int> &sample_tri_ids, size_t resolution,
+                             RandomEngine &engine, double base, bool flag,
+                             Plane plane, bool one_per_tri) {
 
   if (triangles.empty() || vertices.empty()) {
     return;
@@ -175,7 +183,7 @@ void Mesh::extract_point_set(vector<Vec3D> &samples,
 
   while (sampled < resolution) {
 
-    size_t tidx = triangle_index_generator(random_engine);
+    size_t tidx = triangle_index_generator(engine);
 
     const auto &tri = triangles[tidx];
 
@@ -185,8 +193,8 @@ void Mesh::extract_point_set(vector<Vec3D> &samples,
       continue;
     }
 
-    double a = uniform_dist(random_engine);
-    double b = uniform_dist(random_engine);
+    double a = uniform_dist(engine);
+    double b = uniform_dist(engine);
 
     Vec3D v;
     v[0] = (1 - sqrt(a)) * vertices[tri[0]][0] +
@@ -210,8 +218,8 @@ void Mesh::extract_point_set(vector<Vec3D> &samples,
 
         const auto &tri = triangles[i];
 
-        double a = uniform_dist(random_engine);
-        double b = uniform_dist(random_engine);
+        double a = uniform_dist(engine);
+        double b = uniform_dist(engine);
 
         Vec3D v;
         v[0] = (1 - sqrt(a)) * vertices[tri[0]][0] +
@@ -417,6 +425,13 @@ bool compute_overlap_face(Mesh &convex1, Mesh &convex2, Plane &plane) {
 
 void extract_point_set(Mesh &convex1, Mesh &convex2, vector<Vec3D> &samples,
                        vector<int> &sample_tri_ids, size_t resolution) {
+  extract_point_set(convex1, convex2, samples, sample_tri_ids, resolution,
+                    random_engine);
+}
+
+void extract_point_set(Mesh &convex1, Mesh &convex2, vector<Vec3D> &samples,
+                       vector<int> &sample_tri_ids, size_t resolution,
+                       RandomEngine &engine) {
   vector<Vec3D> samples1, samples2;
   vector<int> sample_tri_ids1, sample_tri_ids2;
   double a1 = 0, a2 = 0;
@@ -433,11 +448,11 @@ void extract_point_set(Mesh &convex1, Mesh &convex2, vector<Vec3D> &samples,
   bool flag = compute_overlap_face(convex1, convex2, overlap_plane);
 
   convex1.extract_point_set(samples1, sample_tri_ids1,
-                            size_t(a1 / (a1 + a2) * resolution), 1, flag,
-                            overlap_plane);
+                            size_t(a1 / (a1 + a2) * resolution), engine, 1,
+                            flag, overlap_plane);
   convex2.extract_point_set(samples2, sample_tri_ids2,
-                            size_t(a2 / (a1 + a2) * resolution), 1, flag,
-                            overlap_plane);
+                            size_t(a2 / (a1 + a2) * resolution), engine, 1,
+                            flag, overlap_plane);
 
   samples.insert(samples.end(), samples1.begin(), samples1.end());
   samples.insert(samples.end(), samples2.begin(), samples2.end());
