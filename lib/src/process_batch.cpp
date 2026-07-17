@@ -1,10 +1,12 @@
 #include <algorithm>
 #include <atomic>
 #include <clip.hpp>
+#include <condition_variable>
 #include <config.hpp>
 #include <core.hpp>
 #include <cost.hpp>
 #include <exception>
+#include <functional>
 #include <iomanip>
 #include <intersections.hpp>
 #include <iostream>
@@ -83,50 +85,119 @@ size_t configured_cpu_threads(size_t work_size) {
   size_t requested = static_cast<size_t>(config.batch_cpu_threads);
   if (requested == 0) {
     const unsigned int available = thread::hardware_concurrency();
-    requested = min<size_t>(4, available == 0 ? 2 : available);
+    requested = available == 0 ? 2 : available;
   }
   return max<size_t>(1, min(requested, work_size));
 }
 
-template <typename Function>
-void parallel_for(size_t work_size, Function function) {
-  const size_t thread_count = configured_cpu_threads(work_size);
-  if (thread_count <= 1) {
-    for (size_t i = 0; i < work_size; ++i)
-      function(i);
-    return;
+class BatchExecutor {
+public:
+  explicit BatchExecutor(size_t thread_count)
+      : thread_count_(max<size_t>(1, thread_count)) {
+    workers_.reserve(thread_count_ - 1);
+    for (size_t i = 1; i < thread_count_; ++i)
+      workers_.emplace_back([this]() { worker_loop(); });
   }
 
-  atomic<size_t> next{0};
-  atomic<bool> failed{false};
-  exception_ptr exception;
-  mutex exception_mutex;
-  auto worker = [&]() {
-    while (!failed.load(memory_order_relaxed)) {
-      const size_t i = next.fetch_add(1, memory_order_relaxed);
-      if (i >= work_size)
+  ~BatchExecutor() {
+    {
+      lock_guard<mutex> lock(job_mutex_);
+      stopping_ = true;
+    }
+    start_condition_.notify_all();
+    for (thread &worker : workers_)
+      worker.join();
+  }
+
+  BatchExecutor(const BatchExecutor &) = delete;
+  BatchExecutor &operator=(const BatchExecutor &) = delete;
+
+  template <typename Function>
+  void parallel_for(size_t work_size, Function function) {
+    if (work_size == 0)
+      return;
+    if (thread_count_ <= 1) {
+      for (size_t i = 0; i < work_size; ++i)
+        function(i);
+      return;
+    }
+
+    {
+      lock_guard<mutex> lock(job_mutex_);
+      function_ = move(function);
+      work_size_ = work_size;
+      next_.store(0, memory_order_relaxed);
+      failed_.store(false, memory_order_relaxed);
+      exception_ = nullptr;
+      workers_remaining_ = workers_.size();
+      ++generation_;
+    }
+    start_condition_.notify_all();
+
+    run_job();
+
+    unique_lock<mutex> lock(job_mutex_);
+    done_condition_.wait(lock,
+                         [this]() { return workers_remaining_ == 0; });
+    exception_ptr exception = exception_;
+    function_ = nullptr;
+    lock.unlock();
+    if (exception)
+      rethrow_exception(exception);
+  }
+
+private:
+  void run_job() {
+    while (!failed_.load(memory_order_relaxed)) {
+      const size_t i = next_.fetch_add(1, memory_order_relaxed);
+      if (i >= work_size_)
         return;
       try {
-        function(i);
+        function_(i);
       } catch (...) {
-        lock_guard<mutex> lock(exception_mutex);
-        if (!exception)
-          exception = current_exception();
-        failed.store(true, memory_order_relaxed);
+        bool expected = false;
+        if (failed_.compare_exchange_strong(expected, true,
+                                            memory_order_relaxed)) {
+          lock_guard<mutex> lock(exception_mutex_);
+          exception_ = current_exception();
+        }
       }
     }
-  };
+  }
 
-  vector<thread> workers;
-  workers.reserve(thread_count - 1);
-  for (size_t i = 1; i < thread_count; ++i)
-    workers.emplace_back(worker);
-  worker();
-  for (thread &worker_thread : workers)
-    worker_thread.join();
-  if (exception)
-    rethrow_exception(exception);
-}
+  void worker_loop() {
+    size_t observed_generation = 0;
+    unique_lock<mutex> lock(job_mutex_);
+    while (true) {
+      start_condition_.wait(lock, [this, observed_generation]() {
+        return stopping_ || generation_ != observed_generation;
+      });
+      if (stopping_)
+        return;
+      observed_generation = generation_;
+      lock.unlock();
+      run_job();
+      lock.lock();
+      if (--workers_remaining_ == 0)
+        done_condition_.notify_one();
+    }
+  }
+
+  size_t thread_count_;
+  vector<thread> workers_;
+  mutex job_mutex_;
+  mutex exception_mutex_;
+  condition_variable start_condition_;
+  condition_variable done_condition_;
+  function<void(size_t)> function_;
+  size_t work_size_ = 0;
+  atomic<size_t> next_{0};
+  atomic<bool> failed_{false};
+  exception_ptr exception_;
+  size_t workers_remaining_ = 0;
+  size_t generation_ = 0;
+  bool stopping_ = false;
+};
 
 void validate_parameters(const MeshList &meshes, double concavity,
                          int num_parts) {
@@ -260,6 +331,7 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
   if (meshes.empty())
     return {};
 
+  BatchExecutor executor(configured_cpu_threads(meshes.size()));
   vector<BatchState> states(meshes.size());
   const uint32_t batch_seed = random_engine();
   for (size_t i = 0; i < states.size(); ++i) {
@@ -267,7 +339,7 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
                   static_cast<uint32_t>(i >> 32)};
     states[i].random_engine.seed(seed);
   }
-  parallel_for(meshes.size(), [&](size_t i) {
+  executor.parallel_for(meshes.size(), [&](size_t i) {
     initialize_state(move(meshes[i]), i, states[i]);
   });
 
@@ -290,7 +362,7 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
 
   for (int iteration = 0; iteration < num_parts - 1; ++iteration) {
     vector<optional<SplitWork>> split_by_state(states.size());
-    parallel_for(states.size(), [&](size_t state_index) {
+    executor.parallel_for(states.size(), [&](size_t state_index) {
       BatchState &state = states[state_index];
       if (state.finished)
         return;
@@ -371,7 +443,7 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
                                    config.batch_memory_fraction);
 
     vector<vector<PendingPart>> pending_by_work(work.size());
-    parallel_for(work.size(), [&](size_t work_index) {
+    executor.parallel_for(work.size(), [&](size_t work_index) {
       SplitWork &split = work[work_index];
       for (size_t i = split.flat_surface_offset; i < split.scores.size(); ++i)
         split.scores[i] *= static_cast<float>(config.flat_surface_k);
@@ -429,7 +501,7 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
 
   vector<MeshList> hulls_by_state(states.size());
   vector<double> final_concavities(states.size());
-  parallel_for(states.size(), [&](size_t state_index) {
+  executor.parallel_for(states.size(), [&](size_t state_index) {
     BatchState &state = states[state_index];
     log(state_index, "Computing convex hulls for " +
                          to_string(state.parts.size()) + " parts...");

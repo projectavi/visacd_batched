@@ -134,8 +134,9 @@ on independent streams and are divided into memory-aware waves:
   positive value to cap the number of work items processed in one GPU wave.
 - `visacd.config.batch_memory_fraction = 0.7` controls the fraction of currently
   free VRAM a wave may use and must be in `(0, 1]`.
-- `visacd.config.batch_cpu_threads = 0` uses a conservative automatic worker
-  count for independent CPU stages. Set a positive value to choose the count.
+- `visacd.config.batch_cpu_threads = 0` uses up to one persistent worker per
+  batch item and available hardware thread. Set a positive value to cap the
+  worker count explicitly.
 
 Call `set_seed` immediately before each `process_batch` call for repeatable
 whole-batch results. Each mesh has an independent deterministic random stream,
