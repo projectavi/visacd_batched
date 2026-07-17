@@ -81,6 +81,8 @@ struct SplitWork {
   vector<float> host_points;
   vector<unsigned int> host_edges;
   vector<float> scores;
+  size_t selected_plane = 0;
+  vector<ClipTriangleData> prepared_clip;
 };
 
 struct PendingPart {
@@ -514,6 +516,7 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
   PlaneScoringRuntime plane_scoring;
   HausdorffRuntime hausdorff;
   DeviceMeshRuntime device_meshes;
+  ClipBatchRuntime clip_batch;
 
   const uint32_t batch_seed = random_engine();
   for (size_t i = 0; i < states.size(); ++i) {
@@ -750,18 +753,18 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
     coordinator.submit_cpu(
         [&, split = move(split)]() mutable {
           BatchState &state = states[split->state_index];
-          for (size_t i = split->flat_surface_offset;
-               i < split->scores.size(); ++i) {
-            split->scores[i] *= static_cast<float>(config.flat_surface_k);
-          }
-
-          const size_t best_index =
-              max_element(split->scores.begin(), split->scores.end()) -
-              split->scores.begin();
           int *first_map = nullptr;
           int *second_map = nullptr;
-          MeshList new_parts = clip(split->part, split->planes[best_index],
-                                    first_map, second_map);
+          MeshList new_parts;
+          if (split->prepared_clip.empty()) {
+            new_parts = clip(split->part,
+                             split->planes[split->selected_plane], first_map,
+                             second_map);
+          } else {
+            new_parts = clip_prepared(
+                split->part, split->planes[split->selected_plane], first_map,
+                second_map, split->prepared_clip);
+          }
           if (new_parts.size() < 2) {
             delete[] first_map;
             delete[] second_map;
@@ -1003,6 +1006,26 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
       classify_and_rate_planes_batch(score_inputs, plane_scoring,
                                      configured_batch_size(),
                                      config.batch_memory_fraction);
+      vector<ClipBatchInput> clip_inputs;
+      clip_inputs.reserve(gpu_work.planes.size());
+      for (shared_ptr<SplitWork> &split : gpu_work.planes) {
+        for (size_t index = split->flat_surface_offset;
+             index < split->scores.size(); ++index) {
+          split->scores[index] *=
+              static_cast<float>(config.flat_surface_k);
+        }
+        split->selected_plane =
+            max_element(split->scores.begin(), split->scores.end()) -
+            split->scores.begin();
+        if (split->part_cache.device) {
+          clip_inputs.push_back(
+              {split->part_cache.device.get(),
+               split->planes[split->selected_plane],
+               &split->prepared_clip});
+        }
+      }
+      prepare_clip_batch(clip_inputs, clip_batch, configured_batch_size(),
+                         config.batch_memory_fraction);
       for (shared_ptr<SplitWork> &split : gpu_work.planes)
         schedule_clip(move(split));
     }

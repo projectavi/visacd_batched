@@ -1,5 +1,6 @@
 #pragma once
 
+#include <clip_batch.hpp>
 #include <core.hpp>
 #include <limits>
 #include <unordered_map>
@@ -7,7 +8,10 @@
 
 namespace neural_acd {
 
-MeshList clip(const Mesh mesh, Plane plane, int *&pos_proj, int *&neg_proj);
+MeshList clip(const Mesh &mesh, Plane plane, int *&pos_proj, int *&neg_proj);
+MeshList clip_prepared(const Mesh &mesh, Plane plane, int *&pos_proj,
+                       int *&neg_proj,
+                       const std::vector<ClipTriangleData> &prepared);
 MeshList multiclip(const Mesh mesh, const std::vector<Plane> &planes);
 
 inline bool same_point_detect(Vec3D p0, Vec3D p1, float eps = 1e-5) {

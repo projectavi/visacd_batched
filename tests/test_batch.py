@@ -170,9 +170,14 @@ class BatchGpuTests(unittest.TestCase):
         self.assertGreater(second_bounds[0], 0.0)
 
     def test_mixed_mesh_pipeline_is_repeatable(self):
-        def run(max_batch_size, batch_cpu_threads):
+        def run(
+            max_batch_size,
+            batch_cpu_threads,
+            batch_memory_fraction=0.7,
+        ):
             visacd.config.max_batch_size = max_batch_size
             visacd.config.batch_cpu_threads = batch_cpu_threads
+            visacd.config.batch_memory_fraction = batch_memory_fraction
             visacd.set_seed(4321)
             return visacd.process_batch(
                 [
@@ -188,11 +193,17 @@ class BatchGpuTests(unittest.TestCase):
         repeated = run(max_batch_size=0, batch_cpu_threads=0)
         one_request_waves = run(max_batch_size=1, batch_cpu_threads=0)
         one_cpu_thread = run(max_batch_size=0, batch_cpu_threads=1)
+        host_packed_fallback = run(
+            max_batch_size=0,
+            batch_cpu_threads=0,
+            batch_memory_fraction=1e-9,
+        )
 
         expected_digest = result_digest(automatic)
         self.assertEqual(expected_digest, result_digest(repeated))
         self.assertEqual(expected_digest, result_digest(one_request_waves))
         self.assertEqual(expected_digest, result_digest(one_cpu_thread))
+        self.assertEqual(expected_digest, result_digest(host_packed_fallback))
 
 
 if __name__ == "__main__":

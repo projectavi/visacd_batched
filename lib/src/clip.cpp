@@ -187,8 +187,13 @@ short Triangulation(vector<Vec3D> &border, vector<pair<int, int>> border_edges,
   return 0;
 }
 
-MeshList clip(const Mesh mesh, Plane plane, int *&pos_proj, int *&neg_proj) {
-  Mesh t = mesh;
+namespace {
+
+MeshList clip_impl(const Mesh &mesh, Plane plane, int *&pos_proj,
+                   int *&neg_proj,
+                   const vector<ClipTriangleData> *prepared) {
+  if (prepared && prepared->size() != mesh.triangles.size())
+    throw invalid_argument("Prepared clip data does not match the mesh");
   Mesh pos, neg;
   vector<Vec3D> border;
   vector<Vec3D> overlap;
@@ -215,17 +220,24 @@ MeshList clip(const Mesh mesh, Plane plane, int *&pos_proj, int *&neg_proj) {
     p0 = mesh.vertices[id0];
     p1 = mesh.vertices[id1];
     p2 = mesh.vertices[id2];
-    short s0 = plane.side(p0), s1 = plane.side(p1), s2 = plane.side(p2);
-
-    short sum = s0 + s1 + s2;
-
-    if (s0 == 0 && s1 == 0 && s2 == 0) {
-      s0 = s1 = s2 = plane.cut_side(p0, p1, p2, plane);
-      sum = s0 + s1 + s2;
-      overlap.push_back(p0);
-      overlap.push_back(p1);
-      overlap.push_back(p2);
+    short s0, s1, s2;
+    if (prepared) {
+      const ClipTriangleData &data = (*prepared)[i];
+      s0 = data.sides[0];
+      s1 = data.sides[1];
+      s2 = data.sides[2];
+    } else {
+      s0 = plane.side(p0);
+      s1 = plane.side(p1);
+      s2 = plane.side(p2);
+      if (s0 == 0 && s1 == 0 && s2 == 0) {
+        s0 = s1 = s2 = plane.cut_side(p0, p1, p2, plane);
+        overlap.push_back(p0);
+        overlap.push_back(p1);
+        overlap.push_back(p2);
+      }
     }
+    const short sum = s0 + s1 + s2;
 
     if (sum == 3 || sum == 2 ||
         (sum == 1 &&
@@ -363,9 +375,22 @@ MeshList clip(const Mesh mesh, Plane plane, int *&pos_proj, int *&neg_proj) {
     {
       bool f0, f1, f2;
       Vec3D pi0, pi1, pi2;
-      f0 = plane.intersect_segment(p0, p1, pi0);
-      f1 = plane.intersect_segment(p1, p2, pi1);
-      f2 = plane.intersect_segment(p2, p0, pi2);
+      if (prepared) {
+        const ClipTriangleData &data = (*prepared)[i];
+        f0 = (data.intersection_mask & 1u) != 0;
+        f1 = (data.intersection_mask & 2u) != 0;
+        f2 = (data.intersection_mask & 4u) != 0;
+        pi0 = {data.intersections[0], data.intersections[1],
+               data.intersections[2]};
+        pi1 = {data.intersections[3], data.intersections[4],
+               data.intersections[5]};
+        pi2 = {data.intersections[6], data.intersections[7],
+               data.intersections[8]};
+      } else {
+        f0 = plane.intersect_segment(p0, p1, pi0);
+        f1 = plane.intersect_segment(p1, p2, pi1);
+        f2 = plane.intersect_segment(p2, p0, pi2);
+      }
 
       if (f0 && f1 && !f2) {
         // record the vertices
@@ -738,6 +763,18 @@ MeshList clip(const Mesh mesh, Plane plane, int *&pos_proj, int *&neg_proj) {
   mesh_list.push_back(neg);
 
   return mesh_list;
+}
+
+} // namespace
+
+MeshList clip(const Mesh &mesh, Plane plane, int *&pos_proj, int *&neg_proj) {
+  return clip_impl(mesh, plane, pos_proj, neg_proj, nullptr);
+}
+
+MeshList clip_prepared(const Mesh &mesh, Plane plane, int *&pos_proj,
+                       int *&neg_proj,
+                       const vector<ClipTriangleData> &prepared) {
+  return clip_impl(mesh, plane, pos_proj, neg_proj, &prepared);
 }
 
 MeshList multiclip(const Mesh mesh, const vector<Plane> &planes) {
