@@ -1,4 +1,3 @@
-#include <climits>
 #include <cuda_runtime.h>
 #include <memory>
 #include <plane_intersections.hpp>
@@ -20,40 +19,50 @@ __global__ void plane_score_batch_kernel(
     const float *planes, const float *points, const unsigned int *edges,
     float *scores, int num_planes, int num_points, int num_edges,
     float eps = 1e-6f) {
-  const unsigned long long thread_id =
-      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const unsigned long long pair_count =
-      static_cast<unsigned long long>(num_planes) * num_edges;
-  if (thread_id >= pair_count)
+  const int plane_idx = blockIdx.x;
+  if (plane_idx >= num_planes)
     return;
 
-  const int plane_idx = thread_id / num_edges;
-  const int edge_idx = thread_id % num_edges;
-  const float *plane = &planes[plane_idx * 4];
-  const unsigned int first = edges[edge_idx * 2];
-  const unsigned int second = edges[edge_idx * 2 + 1];
-  if (first >= static_cast<unsigned int>(num_points) ||
-      second >= static_cast<unsigned int>(num_points)) {
-    return;
+  const float4 plane = reinterpret_cast<const float4 *>(planes)[plane_idx];
+  float thread_score = 0.0f;
+  for (int edge_idx = threadIdx.x; edge_idx < num_edges;
+       edge_idx += blockDim.x) {
+    const unsigned int first = edges[edge_idx * 2];
+    const unsigned int second = edges[edge_idx * 2 + 1];
+    if (first >= static_cast<unsigned int>(num_points) ||
+        second >= static_cast<unsigned int>(num_points)) {
+      continue;
+    }
+
+    const float3 p1 = reinterpret_cast<const float3 *>(points)[first];
+    const float3 p2 = reinterpret_cast<const float3 *>(points)[second];
+    const float value1 =
+        plane.x * p1.x + plane.y * p1.y + plane.z * p1.z + plane.w;
+    const float value2 =
+        plane.x * p2.x + plane.y * p2.y + plane.z * p2.z + plane.w;
+    const int side1 = (value1 > eps) - (value1 < -eps);
+    const int side2 = (value2 > eps) - (value2 < -eps);
+    if (side1 == 0 || side2 == 0 || side1 == side2)
+      continue;
+
+    const float dx = p2.x - p1.x;
+    const float dy = p2.y - p1.y;
+    const float dz = p2.z - p1.z;
+    thread_score += sqrtf(dx * dx + dy * dy + dz * dz);
   }
 
-  const float3 p1 = make_float3(points[first * 3], points[first * 3 + 1],
-                                points[first * 3 + 2]);
-  const float3 p2 = make_float3(points[second * 3], points[second * 3 + 1],
-                                points[second * 3 + 2]);
-  const float value1 =
-      plane[0] * p1.x + plane[1] * p1.y + plane[2] * p1.z + plane[3];
-  const float value2 =
-      plane[0] * p2.x + plane[1] * p2.y + plane[2] * p2.z + plane[3];
-  const int side1 = (value1 > eps) - (value1 < -eps);
-  const int side2 = (value2 > eps) - (value2 < -eps);
-  if (side1 == 0 || side2 == 0 || side1 == side2)
-    return;
-
-  const float dx = p2.x - p1.x;
-  const float dy = p2.y - p1.y;
-  const float dz = p2.z - p1.z;
-  atomicAdd(&scores[plane_idx], sqrtf(dx * dx + dy * dy + dz * dz));
+  __shared__ float partial_scores[256];
+  partial_scores[threadIdx.x] = thread_score;
+  __syncthreads();
+  for (int offset = blockDim.x / 2; offset > 0; offset /= 2) {
+    if (threadIdx.x < offset) {
+      partial_scores[threadIdx.x] +=
+          partial_scores[threadIdx.x + offset];
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0)
+    scores[plane_idx] = partial_scores[0];
 }
 
 size_t estimate_bytes(const PlaneScoreInput &input) {
@@ -124,20 +133,8 @@ struct PlaneScoreJob {
                                sizeof(unsigned int) * 2 * input.num_edges,
                                cudaMemcpyHostToDevice, stream),
                "copy edges");
-    check_cuda(cudaMemsetAsync(d_scores, 0,
-                               sizeof(float) * input.num_planes, stream),
-               "clear scores");
-
-    const unsigned long long pair_count =
-        static_cast<unsigned long long>(input.num_planes) * input.num_edges;
     constexpr int block_size = 256;
-    const unsigned long long grid_size =
-        (pair_count + block_size - 1) / block_size;
-    if (grid_size > INT_MAX)
-      throw std::overflow_error("Plane scoring grid is too large");
-
-    plane_score_batch_kernel<<<static_cast<int>(grid_size), block_size, 0,
-                               stream>>>(
+    plane_score_batch_kernel<<<input.num_planes, block_size, 0, stream>>>(
         d_planes, d_points, d_edges, d_scores, input.num_planes,
         input.num_points, input.num_edges);
     check_cuda(cudaGetLastError(), "plane scoring kernel launch");
