@@ -195,6 +195,44 @@ class BatchGpuTests(unittest.TestCase):
             signed_distances = (vertices - first) @ normal
             self.assertLessEqual(signed_distances.max(), tolerance)
 
+    def test_flat_surface_pipeline_is_repeatable(self):
+        def run(
+            max_batch_size,
+            batch_cpu_threads=0,
+            batch_memory_fraction=0.7,
+        ):
+            visacd.config.use_flat_surfaces = True
+            visacd.config.max_batch_size = max_batch_size
+            visacd.config.batch_cpu_threads = batch_cpu_threads
+            visacd.config.batch_memory_fraction = batch_memory_fraction
+            visacd.set_seed(2468)
+            return visacd.process_batch(
+                [
+                    load_sample("fandisk.obj"),
+                    load_sample("cow.obj"),
+                ],
+                concavity=0.04,
+                num_parts=2,
+            )
+
+        automatic = run(max_batch_size=0)
+        repeated = run(max_batch_size=0)
+        one_request_waves = run(max_batch_size=1)
+        one_cpu_thread = run(
+            max_batch_size=0,
+            batch_cpu_threads=1,
+        )
+        low_memory = run(
+            max_batch_size=0,
+            batch_memory_fraction=1e-9,
+        )
+
+        digest = result_digest(automatic)
+        self.assertEqual(digest, result_digest(repeated))
+        self.assertEqual(digest, result_digest(one_request_waves))
+        self.assertEqual(digest, result_digest(one_cpu_thread))
+        self.assertEqual(digest, result_digest(low_memory))
+
     def test_mixed_mesh_pipeline_is_repeatable(self):
         def run(
             max_batch_size,

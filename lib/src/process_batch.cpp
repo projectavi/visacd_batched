@@ -14,6 +14,7 @@
 #include <deque>
 #include <device_mesh.hpp>
 #include <exception>
+#include <flat_surfaces_batch.hpp>
 #include <functional>
 #include <hausdorff_batch.hpp>
 #include <iomanip>
@@ -124,6 +125,11 @@ struct HullWork {
   vector<size_t> part_indices;
 };
 
+struct FlatSurfaceWork {
+  size_t state_index;
+  vector<Surface> surfaces;
+};
+
 enum class HausdorffPurpose { selection, final_concavity };
 
 struct HausdorffWork {
@@ -141,6 +147,7 @@ enum class GpuWorkKind {
   hausdorff,
   components,
   hulls,
+  flat_surfaces,
   complete
 };
 
@@ -151,6 +158,7 @@ struct GpuWork {
   vector<shared_ptr<HausdorffWork>> hausdorff;
   vector<shared_ptr<ComponentWork>> components;
   vector<shared_ptr<HullWork>> hulls;
+  vector<shared_ptr<FlatSurfaceWork>> flat_surfaces;
 };
 
 class PipelineCoordinator {
@@ -245,6 +253,21 @@ public:
     condition_.notify_one();
   }
 
+  void enqueue_flat_surfaces(shared_ptr<FlatSurfaceWork> work) {
+    lock_guard<mutex> lock(mutex_);
+    if (error_)
+      return;
+    ++flat_surface_request_count_;
+    flat_surface_queue_.push_back(move(work));
+    condition_.notify_one();
+  }
+
+  void complete_flat_surface_batch() {
+    lock_guard<mutex> lock(mutex_);
+    flat_surface_busy_ = false;
+    condition_.notify_one();
+  }
+
   void complete_state() {
     lock_guard<mutex> lock(mutex_);
     ++completed_states_;
@@ -263,7 +286,9 @@ public:
         return error_ || completed() || !intersection_queue_.empty() ||
                !plane_queue_.empty() || !hausdorff_queue_.empty() ||
                !component_queue_.empty() ||
-               (!hull_busy_ && !hull_queue_.empty());
+               (!hull_busy_ && !hull_queue_.empty()) ||
+               (!flat_surface_busy_ &&
+                !flat_surface_queue_.empty());
       });
 
       if (error_) {
@@ -273,7 +298,7 @@ public:
         rethrow_exception(error_);
       }
       if (completed())
-        return {GpuWorkKind::complete, {}, {}, {}, {}, {}};
+        return {GpuWorkKind::complete, {}, {}, {}, {}, {}, {}};
 
       if (!gpu_batch_ready() && active_cpu_tasks_ != 0) {
         condition_.wait_for(lock, chrono::milliseconds(1), [this]() {
@@ -283,15 +308,17 @@ public:
         if (error_)
           continue;
         if (completed())
-          return {GpuWorkKind::complete, {}, {}, {}, {}, {}};
+          return {GpuWorkKind::complete, {}, {}, {}, {}, {}, {}};
       }
 
-      const array<bool, 5> available = {!intersection_queue_.empty(),
+      const array<bool, 6> available = {!intersection_queue_.empty(),
                                         !plane_queue_.empty(),
                                         !hausdorff_queue_.empty(),
                                         !component_queue_.empty(),
                                         !hull_busy_ &&
-                                            !hull_queue_.empty()};
+                                            !hull_queue_.empty(),
+                                        !flat_surface_busy_ &&
+                                            !flat_surface_queue_.empty()};
       size_t selected = 0;
       for (; selected < available.size(); ++selected) {
         const size_t candidate = (next_gpu_kind_ + selected) % available.size();
@@ -303,7 +330,7 @@ public:
       next_gpu_kind_ = (selected + 1) % available.size();
 
       if (selected == 0) {
-        GpuWork result{GpuWorkKind::intersections, {}, {}, {}, {}, {}};
+        GpuWork result{GpuWorkKind::intersections, {}, {}, {}, {}, {}, {}};
         result.intersections.reserve(intersection_queue_.size());
         while (!intersection_queue_.empty()) {
           shared_ptr<IntersectionWork> work =
@@ -316,7 +343,7 @@ public:
       }
 
       if (selected == 1) {
-        GpuWork result{GpuWorkKind::planes, {}, {}, {}, {}, {}};
+        GpuWork result{GpuWorkKind::planes, {}, {}, {}, {}, {}, {}};
         result.planes.reserve(plane_queue_.size());
         while (!plane_queue_.empty()) {
           result.planes.push_back(move(plane_queue_.front()));
@@ -326,7 +353,7 @@ public:
       }
 
       if (selected == 2) {
-        GpuWork result{GpuWorkKind::hausdorff, {}, {}, {}, {}, {}};
+        GpuWork result{GpuWorkKind::hausdorff, {}, {}, {}, {}, {}, {}};
         result.hausdorff.reserve(hausdorff_queue_.size());
         while (!hausdorff_queue_.empty()) {
           shared_ptr<HausdorffWork> work = move(hausdorff_queue_.front());
@@ -338,7 +365,7 @@ public:
       }
 
       if (selected == 3) {
-        GpuWork result{GpuWorkKind::components, {}, {}, {}, {}, {}};
+        GpuWork result{GpuWorkKind::components, {}, {}, {}, {}, {}, {}};
         result.components.reserve(component_queue_.size());
         while (!component_queue_.empty()) {
           shared_ptr<ComponentWork> work = move(component_queue_.front());
@@ -349,14 +376,26 @@ public:
         return result;
       }
 
-      GpuWork result{GpuWorkKind::hulls, {}, {}, {}, {}, {}};
-      hull_busy_ = true;
-      result.hulls.reserve(hull_queue_.size());
-      while (!hull_queue_.empty()) {
-        shared_ptr<HullWork> work = move(hull_queue_.front());
-        hull_queue_.pop_front();
-        hull_request_count_ -= work->part_indices.size();
-        result.hulls.push_back(move(work));
+      if (selected == 4) {
+        GpuWork result{GpuWorkKind::hulls, {}, {}, {}, {}, {}, {}};
+        hull_busy_ = true;
+        result.hulls.reserve(hull_queue_.size());
+        while (!hull_queue_.empty()) {
+          shared_ptr<HullWork> work = move(hull_queue_.front());
+          hull_queue_.pop_front();
+          hull_request_count_ -= work->part_indices.size();
+          result.hulls.push_back(move(work));
+        }
+        return result;
+      }
+
+      GpuWork result{GpuWorkKind::flat_surfaces, {}, {}, {}, {}, {}, {}};
+      flat_surface_busy_ = true;
+      result.flat_surfaces.reserve(flat_surface_queue_.size());
+      while (!flat_surface_queue_.empty()) {
+        result.flat_surfaces.push_back(move(flat_surface_queue_.front()));
+        flat_surface_queue_.pop_front();
+        --flat_surface_request_count_;
       }
       return result;
     }
@@ -373,7 +412,9 @@ private:
            hausdorff_request_count_ >= gpu_batch_threshold_ ||
            component_request_count_ >= gpu_batch_threshold_ ||
            (!hull_busy_ &&
-            hull_request_count_ >= gpu_batch_threshold_);
+            hull_request_count_ >= gpu_batch_threshold_) ||
+           (!flat_surface_busy_ &&
+            flat_surface_request_count_ >= gpu_batch_threshold_);
   }
 
   void record_error(exception_ptr error) {
@@ -384,11 +425,14 @@ private:
     hausdorff_queue_.clear();
     component_queue_.clear();
     hull_queue_.clear();
+    flat_surface_queue_.clear();
     intersection_request_count_ = 0;
     hausdorff_request_count_ = 0;
     component_request_count_ = 0;
     hull_request_count_ = 0;
+    flat_surface_request_count_ = 0;
     hull_busy_ = false;
+    flat_surface_busy_ = false;
     condition_.notify_all();
   }
 
@@ -408,14 +452,17 @@ private:
   deque<shared_ptr<HausdorffWork>> hausdorff_queue_;
   deque<shared_ptr<ComponentWork>> component_queue_;
   deque<shared_ptr<HullWork>> hull_queue_;
+  deque<shared_ptr<FlatSurfaceWork>> flat_surface_queue_;
   size_t intersection_request_count_ = 0;
   size_t hausdorff_request_count_ = 0;
   size_t component_request_count_ = 0;
   size_t hull_request_count_ = 0;
+  size_t flat_surface_request_count_ = 0;
   size_t active_cpu_tasks_ = 0;
   size_t completed_states_ = 0;
   size_t next_gpu_kind_ = 0;
   bool hull_busy_ = false;
+  bool flat_surface_busy_ = false;
   mutex mutex_;
   condition_variable condition_;
   exception_ptr error_;
@@ -477,16 +524,6 @@ void initialize_state(Mesh mesh, size_t mesh_index, BatchState &state) {
 
   state.cage = mesh.copy();
   manifold_preprocess(state.cage, 40, 0.03);
-
-  if (config.use_flat_surfaces) {
-    vector<Surface> surfaces =
-        extract_surfaces(mesh, config.flat_surface_min_area);
-    log(mesh_index,
-        "Detected " + to_string(surfaces.size()) + " flat surface(s).");
-    state.flat_surface_planes.reserve(surfaces.size());
-    for (const auto &surface : surfaces)
-      state.flat_surface_planes.push_back(surface.plane);
-  }
 
   state.parts.push_back(move(mesh));
 }
@@ -639,6 +676,7 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
   ClipBatchRuntime clip_batch;
   ComponentBatchRuntime component_batch;
   ConvexHullBatchRuntime convex_hulls;
+  FlatSurfaceBatchRuntime flat_surfaces;
 
   const uint32_t batch_seed = random_engine();
   for (size_t i = 0; i < states.size(); ++i) {
@@ -654,6 +692,7 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
   function<void(size_t)> schedule_advance;
   function<void(shared_ptr<ComponentWork>)> schedule_components;
   function<void(shared_ptr<SplitWork>)> schedule_clip;
+  function<void(size_t)> schedule_initial_components;
 
   finish_state = [&](shared_ptr<FinalizeWork> work, double final_concavity) {
     coordinator.submit_cpu(
@@ -874,6 +913,16 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
         true);
   };
 
+  schedule_initial_components = [&](size_t state_index) {
+    BatchState &state = states[state_index];
+    auto initial = make_shared<ComponentWork>();
+    initial->state_index = state_index;
+    initial->initial = true;
+    initial->parts = move(state.parts);
+    initial->labels.resize(initial->parts.size());
+    coordinator.enqueue_components(move(initial));
+  };
+
   schedule_components = [&](shared_ptr<ComponentWork> work) {
     coordinator.submit_cpu(
         [&, work = move(work)]() mutable {
@@ -981,12 +1030,13 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
     coordinator.submit_cpu([&, state_index]() {
       initialize_state(move(meshes[state_index]), state_index,
                        states[state_index]);
-      auto initial = make_shared<ComponentWork>();
-      initial->state_index = state_index;
-      initial->initial = true;
-      initial->parts = move(states[state_index].parts);
-      initial->labels.resize(initial->parts.size());
-      coordinator.enqueue_components(move(initial));
+      if (config.use_flat_surfaces) {
+        auto surfaces = make_shared<FlatSurfaceWork>();
+        surfaces->state_index = state_index;
+        coordinator.enqueue_flat_surfaces(move(surfaces));
+      } else {
+        schedule_initial_components(state_index);
+      }
     });
   }
 
@@ -995,6 +1045,49 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
       GpuWork gpu_work = coordinator.wait_for_gpu_work();
       if (gpu_work.kind == GpuWorkKind::complete)
         break;
+
+      if (gpu_work.kind == GpuWorkKind::flat_surfaces) {
+        vector<FlatSurfaceBatchInput> inputs;
+        inputs.reserve(gpu_work.flat_surfaces.size());
+        for (shared_ptr<FlatSurfaceWork> &work :
+             gpu_work.flat_surfaces) {
+          BatchState &state = states[work->state_index];
+          if (state.parts.size() != 1) {
+            throw logic_error(
+                "Flat-surface state must contain its initial mesh");
+          }
+          inputs.push_back({&state.parts.front(),
+                            config.flat_surface_min_area,
+                            &work->surfaces});
+        }
+        coordinator.submit_cpu(
+            [&, inputs = move(inputs),
+             works = move(gpu_work.flat_surfaces)]() mutable {
+              try {
+                extract_flat_surfaces_batch(
+                    inputs, flat_surfaces, configured_batch_size(),
+                    config.batch_memory_fraction, &executor);
+                for (shared_ptr<FlatSurfaceWork> &work : works) {
+                  BatchState &state = states[work->state_index];
+                  state.flat_surface_planes.reserve(
+                      work->surfaces.size());
+                  for (const Surface &surface : work->surfaces)
+                    state.flat_surface_planes.push_back(surface.plane);
+                  log(work->state_index,
+                      "Detected " +
+                          to_string(work->surfaces.size()) +
+                          " flat surface(s).");
+                  schedule_initial_components(work->state_index);
+                }
+                coordinator.complete_flat_surface_batch();
+              } catch (...) {
+                coordinator.complete_flat_surface_batch();
+                throw;
+              }
+            },
+            true);
+        continue;
+      }
 
       if (gpu_work.kind == GpuWorkKind::intersections) {
         vector<pair<Mesh *, Mesh *>> requests;
