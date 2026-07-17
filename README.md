@@ -129,8 +129,12 @@ All meshes share `concavity` and `num_parts`; their vertex counts may differ.
 
 Batching targets the current CUDA device. OptiX intersection jobs run on
 independent persistent streams, while small plane-scoring jobs are packed into
-shared GPU launches. Streams and grow-only device buffers are reused throughout
-the complete batch, and work is divided into memory-aware waves:
+shared GPU launches. Each mesh advances independently through CPU preparation,
+GPU scoring, clipping, and finalization, allowing CPU work for some meshes to
+overlap GPU work for others. Ready GPU jobs are collected briefly into efficient
+batches without imposing a batch-wide phase barrier. Streams and grow-only
+device buffers are reused throughout the complete batch, and work is divided
+into memory-aware waves:
 
 - `visacd.config.max_batch_size = 0` lets VisACD choose the wave size. Set a
   positive value to cap the number of work items processed in one GPU wave.
