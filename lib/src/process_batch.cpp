@@ -6,6 +6,7 @@
 #include <clip.hpp>
 #include <config.hpp>
 #include <condition_variable>
+#include <components_batch.hpp>
 #include <core.hpp>
 #include <cost.hpp>
 #include <deque>
@@ -98,6 +99,13 @@ struct IntersectionWork {
   vector<pair<Mesh *, Mesh *>> requests;
 };
 
+struct ComponentWork {
+  size_t state_index;
+  bool initial = false;
+  MeshList parts;
+  vector<vector<int>> labels;
+};
+
 struct FinalizeWork {
   size_t state_index;
   MeshList hulls;
@@ -116,13 +124,20 @@ struct HausdorffWork {
   shared_ptr<FinalizeWork> finalize_work;
 };
 
-enum class GpuWorkKind { intersections, planes, hausdorff, complete };
+enum class GpuWorkKind {
+  intersections,
+  planes,
+  hausdorff,
+  components,
+  complete
+};
 
 struct GpuWork {
   GpuWorkKind kind;
   vector<shared_ptr<IntersectionWork>> intersections;
   vector<shared_ptr<SplitWork>> planes;
   vector<shared_ptr<HausdorffWork>> hausdorff;
+  vector<shared_ptr<ComponentWork>> components;
 };
 
 class PipelineCoordinator {
@@ -193,6 +208,15 @@ public:
     condition_.notify_one();
   }
 
+  void enqueue_components(shared_ptr<ComponentWork> work) {
+    lock_guard<mutex> lock(mutex_);
+    if (error_)
+      return;
+    component_request_count_ += work->parts.size();
+    component_queue_.push_back(move(work));
+    condition_.notify_one();
+  }
+
   void complete_state() {
     lock_guard<mutex> lock(mutex_);
     ++completed_states_;
@@ -209,7 +233,8 @@ public:
     while (true) {
       condition_.wait(lock, [this]() {
         return error_ || completed() || !intersection_queue_.empty() ||
-               !plane_queue_.empty() || !hausdorff_queue_.empty();
+               !plane_queue_.empty() || !hausdorff_queue_.empty() ||
+               !component_queue_.empty();
       });
 
       if (error_) {
@@ -219,7 +244,7 @@ public:
         rethrow_exception(error_);
       }
       if (completed())
-        return {GpuWorkKind::complete, {}, {}, {}};
+        return {GpuWorkKind::complete, {}, {}, {}, {}};
 
       if (!gpu_batch_ready() && active_cpu_tasks_ != 0) {
         condition_.wait_for(lock, chrono::milliseconds(1), [this]() {
@@ -229,12 +254,13 @@ public:
         if (error_)
           continue;
         if (completed())
-          return {GpuWorkKind::complete, {}, {}, {}};
+          return {GpuWorkKind::complete, {}, {}, {}, {}};
       }
 
-      const array<bool, 3> available = {!intersection_queue_.empty(),
+      const array<bool, 4> available = {!intersection_queue_.empty(),
                                         !plane_queue_.empty(),
-                                        !hausdorff_queue_.empty()};
+                                        !hausdorff_queue_.empty(),
+                                        !component_queue_.empty()};
       size_t selected = 0;
       for (; selected < available.size(); ++selected) {
         const size_t candidate = (next_gpu_kind_ + selected) % available.size();
@@ -246,7 +272,7 @@ public:
       next_gpu_kind_ = (selected + 1) % available.size();
 
       if (selected == 0) {
-        GpuWork result{GpuWorkKind::intersections, {}, {}, {}};
+        GpuWork result{GpuWorkKind::intersections, {}, {}, {}, {}};
         result.intersections.reserve(intersection_queue_.size());
         while (!intersection_queue_.empty()) {
           shared_ptr<IntersectionWork> work =
@@ -259,7 +285,7 @@ public:
       }
 
       if (selected == 1) {
-        GpuWork result{GpuWorkKind::planes, {}, {}, {}};
+        GpuWork result{GpuWorkKind::planes, {}, {}, {}, {}};
         result.planes.reserve(plane_queue_.size());
         while (!plane_queue_.empty()) {
           result.planes.push_back(move(plane_queue_.front()));
@@ -268,13 +294,25 @@ public:
         return result;
       }
 
-      GpuWork result{GpuWorkKind::hausdorff, {}, {}, {}};
-      result.hausdorff.reserve(hausdorff_queue_.size());
-      while (!hausdorff_queue_.empty()) {
-        shared_ptr<HausdorffWork> work = move(hausdorff_queue_.front());
-        hausdorff_queue_.pop_front();
-        hausdorff_request_count_ -= work->jobs.size();
-        result.hausdorff.push_back(move(work));
+      if (selected == 2) {
+        GpuWork result{GpuWorkKind::hausdorff, {}, {}, {}, {}};
+        result.hausdorff.reserve(hausdorff_queue_.size());
+        while (!hausdorff_queue_.empty()) {
+          shared_ptr<HausdorffWork> work = move(hausdorff_queue_.front());
+          hausdorff_queue_.pop_front();
+          hausdorff_request_count_ -= work->jobs.size();
+          result.hausdorff.push_back(move(work));
+        }
+        return result;
+      }
+
+      GpuWork result{GpuWorkKind::components, {}, {}, {}, {}};
+      result.components.reserve(component_queue_.size());
+      while (!component_queue_.empty()) {
+        shared_ptr<ComponentWork> work = move(component_queue_.front());
+        component_queue_.pop_front();
+        component_request_count_ -= work->parts.size();
+        result.components.push_back(move(work));
       }
       return result;
     }
@@ -288,7 +326,8 @@ private:
   bool gpu_batch_ready() const {
     return intersection_request_count_ >= gpu_batch_threshold_ ||
            plane_queue_.size() >= gpu_batch_threshold_ ||
-           hausdorff_request_count_ >= gpu_batch_threshold_;
+           hausdorff_request_count_ >= gpu_batch_threshold_ ||
+           component_request_count_ >= gpu_batch_threshold_;
   }
 
   void record_error(exception_ptr error) {
@@ -297,8 +336,10 @@ private:
     intersection_queue_.clear();
     plane_queue_.clear();
     hausdorff_queue_.clear();
+    component_queue_.clear();
     intersection_request_count_ = 0;
     hausdorff_request_count_ = 0;
+    component_request_count_ = 0;
     condition_.notify_all();
   }
 
@@ -316,8 +357,10 @@ private:
   deque<shared_ptr<IntersectionWork>> intersection_queue_;
   deque<shared_ptr<SplitWork>> plane_queue_;
   deque<shared_ptr<HausdorffWork>> hausdorff_queue_;
+  deque<shared_ptr<ComponentWork>> component_queue_;
   size_t intersection_request_count_ = 0;
   size_t hausdorff_request_count_ = 0;
+  size_t component_request_count_ = 0;
   size_t active_cpu_tasks_ = 0;
   size_t completed_states_ = 0;
   size_t next_gpu_kind_ = 0;
@@ -394,8 +437,6 @@ void initialize_state(Mesh mesh, size_t mesh_index, BatchState &state) {
   }
 
   state.parts.push_back(move(mesh));
-  separate_disjoint(state.parts);
-  state.part_cache.resize(state.parts.size());
 }
 
 SplitWork make_split_work(size_t state_index, Mesh part, PartCache part_cache,
@@ -517,6 +558,7 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
   HausdorffRuntime hausdorff;
   DeviceMeshRuntime device_meshes;
   ClipBatchRuntime clip_batch;
+  ComponentBatchRuntime component_batch;
 
   const uint32_t batch_seed = random_engine();
   for (size_t i = 0; i < states.size(); ++i) {
@@ -530,6 +572,7 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
   function<void(size_t)> schedule_finalize;
   function<void(size_t)> schedule_split;
   function<void(size_t)> schedule_advance;
+  function<void(shared_ptr<ComponentWork>)> schedule_components;
   function<void(shared_ptr<SplitWork>)> schedule_clip;
 
   finish_state = [&](shared_ptr<FinalizeWork> work, double final_concavity) {
@@ -749,6 +792,69 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
         true);
   };
 
+  schedule_components = [&](shared_ptr<ComponentWork> work) {
+    coordinator.submit_cpu(
+        [&, work = move(work)]() mutable {
+          BatchState &state = states[work->state_index];
+          separate_disjoint_prepared(work->parts, work->labels);
+
+          if (work->initial) {
+            state.parts = move(work->parts);
+            state.part_cache.resize(state.parts.size());
+            auto intersections = make_shared<IntersectionWork>();
+            intersections->state_index = work->state_index;
+            intersections->initial = true;
+            intersections->requests.reserve(state.parts.size());
+            for (Mesh &part : state.parts)
+              intersections->requests.emplace_back(&part, &state.cage);
+            coordinator.enqueue_intersections(move(intersections));
+            return;
+          }
+
+          auto intersections = make_shared<IntersectionWork>();
+          intersections->state_index = work->state_index;
+          for (Mesh &part : work->parts) {
+            if (part.vertices.size() < 10)
+              continue;
+            PendingPart pending;
+            pending.state_index = work->state_index;
+            pending.part = move(part);
+            pending.cage = pending.part.copy();
+            intersections->pending_parts.push_back(move(pending));
+          }
+
+          if (intersections->pending_parts.empty()) {
+            ++state.iteration;
+            schedule_advance(work->state_index);
+            return;
+          }
+
+          intersections->requests.reserve(
+              intersections->pending_parts.size());
+          for (PendingPart &pending : intersections->pending_parts) {
+            intersections->requests.emplace_back(&pending.part,
+                                                  &pending.cage);
+          }
+
+          auto remaining = make_shared<atomic<size_t>>(
+              intersections->pending_parts.size());
+          for (size_t part_index = 0;
+               part_index < intersections->pending_parts.size();
+               ++part_index) {
+            coordinator.submit_cpu(
+                [&, intersections, remaining, part_index]() {
+                  manifold_preprocess(
+                      intersections->pending_parts[part_index].cage, 40,
+                      0.02);
+                  if (remaining->fetch_sub(1) == 1)
+                    coordinator.enqueue_intersections(intersections);
+                },
+                true);
+          }
+        },
+        true);
+  };
+
   schedule_clip = [&](shared_ptr<SplitWork> split) {
     coordinator.submit_cpu(
         [&, split = move(split)]() mutable {
@@ -779,48 +885,12 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
                                    new_parts);
           delete[] first_map;
           delete[] second_map;
-          separate_disjoint(new_parts);
 
-          auto intersections = make_shared<IntersectionWork>();
-          intersections->state_index = split->state_index;
-          for (Mesh &part : new_parts) {
-            if (part.vertices.size() < 10)
-              continue;
-            PendingPart pending;
-            pending.state_index = split->state_index;
-            pending.part = move(part);
-            pending.cage = pending.part.copy();
-            intersections->pending_parts.push_back(move(pending));
-          }
-
-          if (intersections->pending_parts.empty()) {
-            ++state.iteration;
-            schedule_advance(split->state_index);
-            return;
-          }
-
-          intersections->requests.reserve(
-              intersections->pending_parts.size());
-          for (PendingPart &pending : intersections->pending_parts) {
-            intersections->requests.emplace_back(&pending.part,
-                                                  &pending.cage);
-          }
-
-          auto remaining = make_shared<atomic<size_t>>(
-              intersections->pending_parts.size());
-          for (size_t part_index = 0;
-               part_index < intersections->pending_parts.size();
-               ++part_index) {
-            coordinator.submit_cpu(
-                [&, intersections, remaining, part_index]() {
-                  manifold_preprocess(
-                      intersections->pending_parts[part_index].cage, 40,
-                      0.02);
-                  if (remaining->fetch_sub(1) == 1)
-                    coordinator.enqueue_intersections(intersections);
-                },
-                true);
-          }
+          auto components = make_shared<ComponentWork>();
+          components->state_index = split->state_index;
+          components->parts = move(new_parts);
+          components->labels.resize(components->parts.size());
+          coordinator.enqueue_components(move(components));
         },
         true);
   };
@@ -829,12 +899,12 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
     coordinator.submit_cpu([&, state_index]() {
       initialize_state(move(meshes[state_index]), state_index,
                        states[state_index]);
-      auto initial = make_shared<IntersectionWork>();
+      auto initial = make_shared<ComponentWork>();
       initial->state_index = state_index;
       initial->initial = true;
-      for (Mesh &part : states[state_index].parts)
-        initial->requests.emplace_back(&part, &states[state_index].cage);
-      coordinator.enqueue_intersections(move(initial));
+      initial->parts = move(states[state_index].parts);
+      initial->labels.resize(initial->parts.size());
+      coordinator.enqueue_components(move(initial));
     });
   }
 
@@ -977,6 +1047,29 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
             final_concavity = max(final_concavity, job.result);
           finish_state(move(work->finalize_work), final_concavity);
         }
+        continue;
+      }
+
+      if (gpu_work.kind == GpuWorkKind::components) {
+        size_t input_count = 0;
+        for (const shared_ptr<ComponentWork> &work : gpu_work.components)
+          input_count += work->parts.size();
+        vector<ComponentBatchInput> inputs;
+        inputs.reserve(input_count);
+        for (shared_ptr<ComponentWork> &work : gpu_work.components) {
+          if (work->labels.size() != work->parts.size())
+            throw logic_error("Component work is out of sync");
+          for (size_t part_index = 0; part_index < work->parts.size();
+               ++part_index) {
+            inputs.push_back(
+                {&work->parts[part_index], &work->labels[part_index]});
+          }
+        }
+        label_components_batch(inputs, component_batch,
+                               configured_batch_size(),
+                               config.batch_memory_fraction);
+        for (shared_ptr<ComponentWork> &work : gpu_work.components)
+          schedule_components(move(work));
         continue;
       }
 

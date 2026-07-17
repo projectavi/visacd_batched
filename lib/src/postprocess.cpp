@@ -199,64 +199,24 @@ void multimerge_ch(MeshList &meshs, MeshList &cvxs, double current_concavity, do
 
 }
 
-MeshList separate_disjoint_step(Mesh &part) {
+MeshList assemble_disjoint_parts(Mesh &part, const vector<int> &labels) {
   if (part.triangles.empty()) {
     return {};
   }
+  if (labels.size() != part.triangles.size())
+    throw invalid_argument("Component labels do not match the mesh");
 
-  map<pair<int, int>, vector<int>> edge_map; // edge -> connected tris
-
-  auto make_edge = [](int a, int b) {
-    return std::pair<int, int>{std::min(a, b), std::max(a, b)};
-  };
-
-  // Build edge to triangle map
-  for (int i = 0; i < part.triangles.size(); ++i) {
-    const auto &tri = part.triangles[i];
-    pair<int, int> e1 = make_edge(tri[0], tri[1]);
-    pair<int, int> e2 = make_edge(tri[1], tri[2]);
-    pair<int, int> e3 = make_edge(tri[0], tri[2]);
-
-    edge_map[e1].push_back(i);
-    edge_map[e2].push_back(i);
-    edge_map[e3].push_back(i);
-  }
-
-  unordered_map<int, int> tri_to_part; // triangle index -> part number
+  unordered_map<int, int> label_to_part;
+  vector<int> tri_to_part(labels.size());
   int part_num = 0;
-
-  // Flood fill to find connected components
-  for (int i = 0; i < part.triangles.size(); ++i) {
-    if (tri_to_part.count(i)) {
-      continue;
-    }
-
-    queue<int> q;
-    q.push(i);
-    tri_to_part[i] = part_num;
-
-    while (!q.empty()) {
-      int cur = q.front();
-      q.pop();
-
-      const auto &tri = part.triangles[cur];
-      pair<int, int> edges[3] = {make_edge(tri[0], tri[1]),
-                                 make_edge(tri[1], tri[2]),
-                                 make_edge(tri[0], tri[2])};
-
-      for (const auto &edge : edges) {
-        for (int neighbor : edge_map[edge]) {
-          if (neighbor != cur && !tri_to_part.count(neighbor)) {
-            tri_to_part[neighbor] = part_num;
-            q.push(neighbor);
-          }
-        }
-      }
-    }
-    part_num++;
+  for (size_t triangle = 0; triangle < labels.size(); ++triangle) {
+    const int label = labels[triangle];
+    auto insertion = label_to_part.emplace(label, part_num);
+    if (insertion.second)
+      ++part_num;
+    tri_to_part[triangle] = insertion.first->second;
   }
 
-  // Create new meshes for each part
   MeshList new_parts(part_num);
   vector<unordered_map<int, int>> vertex_remap(part_num); // global v -> part v
 
@@ -279,9 +239,7 @@ MeshList separate_disjoint_step(Mesh &part) {
       }
       new_indices[k] = remap[global_v];
     }
-
     current_part.triangles.push_back(new_indices);
-
   }
 
 
@@ -311,18 +269,82 @@ MeshList separate_disjoint_step(Mesh &part) {
   return new_parts;
 }
 
+vector<int> label_disjoint_components(Mesh &part) {
+  map<pair<int, int>, vector<int>> edge_map;
+  auto make_edge = [](int first, int second) {
+    return pair<int, int>{min(first, second), max(first, second)};
+  };
+  for (int triangle_index = 0;
+       triangle_index < static_cast<int>(part.triangles.size());
+       ++triangle_index) {
+    const auto &triangle = part.triangles[triangle_index];
+    edge_map[make_edge(triangle[0], triangle[1])].push_back(triangle_index);
+    edge_map[make_edge(triangle[1], triangle[2])].push_back(triangle_index);
+    edge_map[make_edge(triangle[0], triangle[2])].push_back(triangle_index);
+  }
+
+  vector<int> labels(part.triangles.size(), -1);
+  int component = 0;
+  for (int start = 0; start < static_cast<int>(part.triangles.size());
+       ++start) {
+    if (labels[start] >= 0)
+      continue;
+    queue<int> pending;
+    pending.push(start);
+    labels[start] = component;
+    while (!pending.empty()) {
+      const int current = pending.front();
+      pending.pop();
+      const auto &triangle = part.triangles[current];
+      const pair<int, int> edges[3] = {
+          make_edge(triangle[0], triangle[1]),
+          make_edge(triangle[1], triangle[2]),
+          make_edge(triangle[0], triangle[2])};
+      for (const auto &edge : edges) {
+        for (int neighbor : edge_map[edge]) {
+          if (neighbor != current && labels[neighbor] < 0) {
+            labels[neighbor] = component;
+            pending.push(neighbor);
+          }
+        }
+      }
+    }
+    ++component;
+  }
+  return labels;
+}
+
+MeshList separate_disjoint_step(Mesh &part) {
+  if (part.triangles.empty())
+    return {};
+  return assemble_disjoint_parts(part, label_disjoint_components(part));
+}
+
+void append_non_degenerate(MeshList &destination, MeshList parts) {
+  for (Mesh &part : parts) {
+    if (abs(get_mesh_volume(part)) < 1e-6)
+      continue;
+    destination.push_back(move(part));
+  }
+}
+
 void separate_disjoint(MeshList &parts) {
   MeshList new_parts;
-  for (auto &part : parts) {
-    MeshList res = separate_disjoint_step(part);
-    for (auto &new_part : res) {
-      if (std::abs(get_mesh_volume(new_part)) < 1e-6)
-        continue; // skip degenerate parts
-      new_parts.push_back(new_part);
-    }
+  for (Mesh &part : parts)
+    append_non_degenerate(new_parts, separate_disjoint_step(part));
+  parts = move(new_parts);
+}
+
+void separate_disjoint_prepared(
+    MeshList &parts, const vector<vector<int>> &labels) {
+  if (labels.size() != parts.size())
+    throw invalid_argument("Component label batch does not match its meshes");
+  MeshList new_parts;
+  for (size_t index = 0; index < parts.size(); ++index) {
+    append_non_degenerate(
+        new_parts, assemble_disjoint_parts(parts[index], labels[index]));
   }
-  parts.clear();
-  parts.insert(parts.end(), new_parts.begin(), new_parts.end());
+  parts = move(new_parts);
 }
 
 
