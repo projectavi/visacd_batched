@@ -2,6 +2,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <core.hpp>
+#include <cstdlib>
 #include <cuda_runtime.h>
 #include <deque>
 #include <dlfcn.h>
@@ -91,6 +92,33 @@ size_t estimate_request_bytes(const Mesh &points, const Mesh &cage) {
   // plus fixed headroom when selecting memory-aware waves.
   return compaction_bytes + point_bytes + estimate_geometry_bytes(cage) * 4 +
          estimate_geometry_bytes(points) * 4 + (8u << 20);
+}
+
+OptixBuildFlags configured_build_flags() {
+  const char *preference = getenv("VISACD_OPTIX_BUILD_PREFERENCE");
+  if (!preference || string(preference) == "trace")
+    return OPTIX_BUILD_FLAG_PREFER_FAST_TRACE;
+  if (string(preference) == "build")
+    return OPTIX_BUILD_FLAG_PREFER_FAST_BUILD;
+  if (string(preference) == "none")
+    return OPTIX_BUILD_FLAG_NONE;
+  throw invalid_argument(
+      "VISACD_OPTIX_BUILD_PREFERENCE must be trace, build, or none");
+}
+
+size_t configured_max_concurrency() {
+  const char *value = getenv("VISACD_OPTIX_MAX_CONCURRENCY");
+  if (!value || !*value)
+    return 0;
+
+  char *end = nullptr;
+  const unsigned long long parsed = strtoull(value, &end, 10);
+  if (*end != '\0' || parsed == 0 ||
+      parsed > numeric_limits<size_t>::max()) {
+    throw invalid_argument(
+        "VISACD_OPTIX_MAX_CONCURRENCY must be a positive integer");
+  }
+  return static_cast<size_t>(parsed);
 }
 
 class DeviceBuffer {
@@ -184,6 +212,8 @@ struct OptixRuntime::Impl {
   OptixProgramGroup hit_pg = nullptr;
   CUdeviceptr d_miss_record = 0;
   CUdeviceptr d_hit_record = 0;
+  OptixBuildFlags build_flags = OPTIX_BUILD_FLAG_NONE;
+  size_t max_concurrency = 0;
   vector<unique_ptr<OptixSlot>> slots;
 
   ~Impl() {
@@ -217,6 +247,8 @@ struct OptixRuntime::Impl {
   }
 
   void initialize() {
+    build_flags = configured_build_flags();
+    max_concurrency = configured_max_concurrency();
     context = createContext();
     const string ptx = load_ptx(get_ptx_path());
 
@@ -446,7 +478,7 @@ struct OptixJob {
     self_build_input.triangleArray.flags = triangle_input_flags;
     self_build_input.triangleArray.numSbtRecords = 1;
 
-    accel_options.buildFlags = OPTIX_BUILD_FLAG_PREFER_FAST_TRACE;
+    accel_options.buildFlags = runtime.build_flags;
     accel_options.operation = OPTIX_BUILD_OPERATION_BUILD;
     OCHK(optixAccelComputeMemoryUsage(runtime.context, &accel_options,
                                       &build_input, 1, &gas_sizes));
@@ -694,6 +726,9 @@ compute_intersection_matrices(
     size_t additional_bytes = 0;
     while (end < requests.size()) {
       if (max_batch_size && end - begin >= max_batch_size)
+        break;
+      if (runtime.impl_->max_concurrency &&
+          end - begin >= runtime.impl_->max_concurrency)
         break;
       const Mesh &mesh = *requests[end].first;
       const size_t request_bytes =

@@ -54,6 +54,18 @@ def parse_args():
     )
     parser.add_argument("--memory-fraction", type=float, default=0.7)
     parser.add_argument(
+        "--optix-build-preference",
+        choices=("trace", "build", "none"),
+        default="trace",
+        help="OptiX acceleration-structure build preference",
+    )
+    parser.add_argument(
+        "--optix-max-concurrency",
+        type=int,
+        default=0,
+        help="maximum in-flight OptiX jobs; 0 selects automatic sizing",
+    )
+    parser.add_argument(
         "--show-visacd-output",
         action="store_true",
         help="show native per-mesh progress output",
@@ -74,6 +86,8 @@ def parse_args():
         parser.error("--max-batch-size must be non-negative")
     if not 0.0 < args.memory_fraction <= 1.0:
         parser.error("--memory-fraction must be in (0, 1]")
+    if args.optix_max_concurrency < 0:
+        parser.error("--optix-max-concurrency must be non-negative")
     return args
 
 
@@ -130,16 +144,28 @@ def main():
     visacd.config.batch_cpu_threads = args.cpu_threads
     visacd.config.max_batch_size = args.max_batch_size
     visacd.config.batch_memory_fraction = args.memory_fraction
+    os.environ["VISACD_OPTIX_BUILD_PREFERENCE"] = (
+        args.optix_build_preference
+    )
+    if args.optix_max_concurrency:
+        os.environ["VISACD_OPTIX_MAX_CONCURRENCY"] = str(
+            args.optix_max_concurrency
+        )
+    else:
+        os.environ.pop("VISACD_OPTIX_MAX_CONCURRENCY", None)
 
     print(
         "mesh={} n={} repeats={} cpu_threads={} max_batch_size={} "
-        "memory_fraction={}".format(
+        "memory_fraction={} optix_build_preference={} "
+        "optix_max_concurrency={}".format(
             args.mesh,
             args.num_meshes,
             args.repeats,
             args.cpu_threads,
             args.max_batch_size,
             args.memory_fraction,
+            args.optix_build_preference,
+            args.optix_max_concurrency,
         )
     )
 
