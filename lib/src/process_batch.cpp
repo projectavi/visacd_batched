@@ -220,7 +220,7 @@ struct ComponentWork {
   size_t state_index;
   bool initial = false;
   MeshList parts;
-  vector<vector<int>> labels;
+  vector<MeshList> separated;
 };
 
 struct FinalizeWork {
@@ -1151,7 +1151,7 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
     initial->state_index = state_index;
     initial->initial = true;
     initial->parts = move(state.parts);
-    initial->labels.resize(initial->parts.size());
+    initial->separated.resize(initial->parts.size());
     coordinator.enqueue_components(move(initial));
   };
 
@@ -1162,7 +1162,17 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
           {
             StageTimer timer(profiler, ProfileStage::components_cpu,
                              work->parts.size());
-            separate_disjoint_prepared(work->parts, work->labels);
+            size_t component_count = 0;
+            for (const MeshList &components : work->separated)
+              component_count += components.size();
+            MeshList separated;
+            separated.reserve(component_count);
+            for (MeshList &components : work->separated) {
+              for (Mesh &part : components)
+                separated.push_back(move(part));
+            }
+            work->parts = move(separated);
+            work->separated.clear();
           }
 
           if (work->initial) {
@@ -1259,7 +1269,7 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
           auto components = make_shared<ComponentWork>();
           components->state_index = split->state_index;
           components->parts = move(new_parts);
-          components->labels.resize(components->parts.size());
+          components->separated.resize(components->parts.size());
           coordinator.enqueue_components(move(components));
         },
         true);
@@ -1622,12 +1632,12 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
         vector<ComponentBatchInput> inputs;
         inputs.reserve(input_count);
         for (shared_ptr<ComponentWork> &work : gpu_work.components) {
-          if (work->labels.size() != work->parts.size())
+          if (work->separated.size() != work->parts.size())
             throw logic_error("Component work is out of sync");
           for (size_t part_index = 0; part_index < work->parts.size();
                ++part_index) {
-            inputs.push_back(
-                {&work->parts[part_index], &work->labels[part_index]});
+            inputs.push_back({&work->parts[part_index], nullptr,
+                              &work->separated[part_index]});
           }
         }
         coordinator.submit_gpu(
@@ -1637,7 +1647,7 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
                 {
                   StageTimer timer(profiler, ProfileStage::components_gpu,
                                    inputs.size());
-                  label_components_batch(
+                  separate_components_batch(
                       inputs, component_batch, configured_batch_size(),
                       gpu_memory_fraction);
                 }
