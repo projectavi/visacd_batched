@@ -8,6 +8,8 @@
 
 namespace neural_acd {
 
+class DeviceMesh;
+
 constexpr size_t kHausdorffCandidateCount = 10;
 
 struct PreparedHausdorffDirection {
@@ -16,6 +18,7 @@ struct PreparedHausdorffDirection {
   std::vector<std::array<int, kHausdorffCandidateCount>> candidate_triangles;
   std::vector<unsigned char> candidate_counts;
   std::vector<double> nearest_sample_distance_squared;
+  std::shared_ptr<DeviceMesh> target_device;
 };
 
 struct PreparedHausdorffJob {
@@ -27,6 +30,9 @@ struct PreparedHausdorffJob {
 PreparedHausdorffJob prepare_hausdorff_job(
     Mesh &first, Mesh &second, unsigned int resolution, bool flag,
     RandomEngine &engine);
+void attach_hausdorff_device_meshes(
+    PreparedHausdorffJob &job, std::shared_ptr<DeviceMesh> first,
+    std::shared_ptr<DeviceMesh> second);
 
 class HausdorffRuntime {
 public:

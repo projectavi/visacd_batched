@@ -6,6 +6,8 @@
 
 namespace neural_acd {
 
+class DeviceMesh;
+
 struct PlaneScoreInput {
   const float *planes;
   const float *points;
@@ -14,6 +16,7 @@ struct PlaneScoreInput {
   int num_planes;
   int num_points;
   int num_edges;
+  const DeviceMesh *device_mesh = nullptr;
 };
 
 class PlaneScoringRuntime {

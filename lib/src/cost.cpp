@@ -80,6 +80,13 @@ PreparedHausdorffJob prepare_hausdorff_job(
   return job;
 }
 
+void attach_hausdorff_device_meshes(
+    PreparedHausdorffJob &job, shared_ptr<DeviceMesh> first,
+    shared_ptr<DeviceMesh> second) {
+  job.directions[0].target_device = move(first);
+  job.directions[1].target_device = move(second);
+}
+
 void MergeMesh(Mesh &mesh1, Mesh &mesh2, Mesh &merge) {
   merge.vertices.insert(merge.vertices.end(), mesh1.vertices.begin(),
                         mesh1.vertices.end());

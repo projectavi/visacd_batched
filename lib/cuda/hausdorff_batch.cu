@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cuda_runtime.h>
+#include <device_mesh.hpp>
 #include <hausdorff_batch.hpp>
 #include <limits>
 #include <memory>
@@ -23,8 +24,8 @@ void check_cuda(cudaError_t result, const char *operation) {
 struct PackedHausdorffQuery {
   double3 point;
   double nearest_sample_distance_squared;
-  int target_vertex_offset;
-  int target_triangle_offset;
+  const double3 *target_vertices;
+  const int3 *target_triangles;
   int candidate_offset;
   int candidate_count;
 };
@@ -120,7 +121,6 @@ __device__ double point_triangle_distance(double3 point, double3 first,
 }
 
 __global__ void evaluate_queries_kernel(
-    const double3 *vertices, const int3 *triangles,
     const PackedHausdorffQuery *queries, const int *candidate_triangles,
     double *query_distances, int query_count) {
   const int query_index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -133,12 +133,11 @@ __global__ void evaluate_queries_kernel(
        ++candidate_index) {
     const int triangle_index =
         candidate_triangles[query.candidate_offset + candidate_index];
-    const int3 triangle =
-        triangles[query.target_triangle_offset + triangle_index];
+    const int3 triangle = query.target_triangles[triangle_index];
     const double distance = point_triangle_distance(
-        query.point, vertices[query.target_vertex_offset + triangle.x],
-        vertices[query.target_vertex_offset + triangle.y],
-        vertices[query.target_vertex_offset + triangle.z]);
+        query.point, query.target_vertices[triangle.x],
+        query.target_vertices[triangle.y],
+        query.target_vertices[triangle.z]);
     closest = fmin(closest, distance);
     if (closest < 1e-14)
       break;
@@ -245,12 +244,14 @@ size_t job_device_bytes(const PreparedHausdorffJob &job) {
   for (const PreparedHausdorffDirection &direction : job.directions) {
     if (!direction.target)
       continue;
-    bytes = checked_add(bytes,
-                        direction.target->vertices.size() * sizeof(double3),
-                        "Hausdorff vertex bytes overflow");
-    bytes = checked_add(bytes,
-                        direction.target->triangles.size() * sizeof(int3),
-                        "Hausdorff triangle bytes overflow");
+    if (!direction.target_device) {
+      bytes = checked_add(bytes,
+                          direction.target->vertices.size() * sizeof(double3),
+                          "Hausdorff vertex bytes overflow");
+      bytes = checked_add(
+          bytes, direction.target->triangles.size() * sizeof(int3),
+          "Hausdorff triangle bytes overflow");
+    }
     bytes = checked_add(
         bytes,
         direction.queries.size() *
@@ -310,6 +311,14 @@ void validate_direction(const PreparedHausdorffDirection &direction) {
       direction.nearest_sample_distance_squared.size() != query_count) {
     throw std::invalid_argument("Malformed prepared Hausdorff direction");
   }
+  if (direction.target_device) {
+    const DeviceMeshView view = device_mesh_view(*direction.target_device);
+    if (view.vertex_count != direction.target->vertices.size() ||
+        view.triangle_count != direction.target->triangles.size()) {
+      throw std::invalid_argument(
+          "Hausdorff device mesh does not match its target");
+    }
+  }
 }
 
 void run_wave(const std::vector<PreparedHausdorffJob *> &jobs, size_t begin,
@@ -326,9 +335,16 @@ void run_wave(const std::vector<PreparedHausdorffJob *> &jobs, size_t begin,
     }
     for (const PreparedHausdorffDirection &direction : job.directions) {
       validate_direction(direction);
-      vertex_count += direction.target->vertices.size();
-      triangle_count += direction.target->triangles.size();
-      query_count += direction.queries.size();
+      if (!direction.target_device) {
+        vertex_count = checked_add(vertex_count,
+                                   direction.target->vertices.size(),
+                                   "Packed Hausdorff vertices overflow");
+        triangle_count = checked_add(
+            triangle_count, direction.target->triangles.size(),
+            "Packed Hausdorff triangles overflow");
+      }
+      query_count = checked_add(query_count, direction.queries.size(),
+                                "Packed Hausdorff queries overflow");
     }
     active.push_back(&job);
   }
@@ -345,6 +361,11 @@ void run_wave(const std::vector<PreparedHausdorffJob *> &jobs, size_t begin,
     throw std::overflow_error("Hausdorff candidate count overflow");
   }
   const size_t candidate_count = query_count * kHausdorffCandidateCount;
+  if (candidate_count >
+      static_cast<size_t>(std::numeric_limits<int>::max())) {
+    throw std::overflow_error(
+        "Packed Hausdorff candidates exceed indexing limits");
+  }
   runtime.ensure_stream();
   runtime.host_vertices.ensure(vertex_count * sizeof(double3),
                                "cudaMallocHost Hausdorff vertices");
@@ -389,18 +410,31 @@ void run_wave(const std::vector<PreparedHausdorffJob *> &jobs, size_t begin,
     for (const PreparedHausdorffDirection &direction :
          active[job_index]->directions) {
       const Mesh &target = *direction.target;
-      for (const Vec3D &vertex : target.vertices) {
-        host_vertices[vertex_offset++] =
-            make_double3(vertex[0], vertex[1], vertex[2]);
+      const double3 *target_vertices = nullptr;
+      const int3 *target_triangles = nullptr;
+      if (direction.target_device) {
+        const DeviceMeshView view = device_mesh_view(*direction.target_device);
+        wait_for_device_mesh(*direction.target_device, runtime.stream);
+        target_vertices =
+            reinterpret_cast<const double3 *>(view.vertices);
+        target_triangles =
+            reinterpret_cast<const int3 *>(view.triangles);
+      } else {
+        const size_t direction_vertex_offset = vertex_offset;
+        for (const Vec3D &vertex : target.vertices) {
+          host_vertices[vertex_offset++] =
+              make_double3(vertex[0], vertex[1], vertex[2]);
+        }
+        const size_t direction_triangle_offset = triangle_offset;
+        for (const auto &triangle : target.triangles) {
+          host_triangles[triangle_offset++] =
+              make_int3(triangle[0], triangle[1], triangle[2]);
+        }
+        target_vertices = runtime.vertices.as<double3>() +
+                          direction_vertex_offset;
+        target_triangles = runtime.triangles.as<int3>() +
+                           direction_triangle_offset;
       }
-      const int direction_vertex_offset =
-          static_cast<int>(vertex_offset - target.vertices.size());
-      for (const auto &triangle : target.triangles) {
-        host_triangles[triangle_offset++] =
-            make_int3(triangle[0], triangle[1], triangle[2]);
-      }
-      const int direction_triangle_offset =
-          static_cast<int>(triangle_offset - target.triangles.size());
 
       for (size_t local_query = 0; local_query < direction.queries.size();
            ++local_query) {
@@ -411,7 +445,7 @@ void run_wave(const std::vector<PreparedHausdorffJob *> &jobs, size_t begin,
         host_queries[query_offset++] =
             {make_double3(point[0], point[1], point[2]),
              direction.nearest_sample_distance_squared[local_query],
-             direction_vertex_offset, direction_triangle_offset,
+             target_vertices, target_triangles,
              static_cast<int>(candidate_offset), count};
         for (size_t candidate = 0; candidate < kHausdorffCandidateCount;
              ++candidate) {
@@ -431,14 +465,18 @@ void run_wave(const std::vector<PreparedHausdorffJob *> &jobs, size_t begin,
          static_cast<int>(query_offset - job_query_offset)};
   }
 
-  check_cuda(cudaMemcpyAsync(runtime.vertices.as<double3>(), host_vertices,
-                             vertex_count * sizeof(double3),
-                             cudaMemcpyHostToDevice, runtime.stream),
-             "cudaMemcpyAsync Hausdorff vertices");
-  check_cuda(cudaMemcpyAsync(runtime.triangles.as<int3>(), host_triangles,
-                             triangle_count * sizeof(int3),
-                             cudaMemcpyHostToDevice, runtime.stream),
-             "cudaMemcpyAsync Hausdorff triangles");
+  if (vertex_count) {
+    check_cuda(cudaMemcpyAsync(runtime.vertices.as<double3>(), host_vertices,
+                               vertex_count * sizeof(double3),
+                               cudaMemcpyHostToDevice, runtime.stream),
+               "cudaMemcpyAsync Hausdorff vertices");
+  }
+  if (triangle_count) {
+    check_cuda(cudaMemcpyAsync(runtime.triangles.as<int3>(), host_triangles,
+                               triangle_count * sizeof(int3),
+                               cudaMemcpyHostToDevice, runtime.stream),
+               "cudaMemcpyAsync Hausdorff triangles");
+  }
   check_cuda(cudaMemcpyAsync(runtime.queries.as<PackedHausdorffQuery>(),
                              host_queries,
                              query_count * sizeof(PackedHausdorffQuery),
@@ -456,7 +494,6 @@ void run_wave(const std::vector<PreparedHausdorffJob *> &jobs, size_t begin,
   const int blocks =
       (static_cast<int>(query_count) + kThreads - 1) / kThreads;
   evaluate_queries_kernel<<<blocks, kThreads, 0, runtime.stream>>>(
-      runtime.vertices.as<double3>(), runtime.triangles.as<int3>(),
       runtime.queries.as<PackedHausdorffQuery>(), runtime.candidates.as<int>(),
       runtime.query_distances.as<double>(), static_cast<int>(query_count));
   check_cuda(cudaGetLastError(), "launch Hausdorff query kernel");

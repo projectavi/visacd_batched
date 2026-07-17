@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cstring>
 #include <cuda_runtime.h>
+#include <device_mesh.hpp>
 #include <limits>
 #include <memory>
 #include <plane_intersections.hpp>
@@ -19,16 +20,15 @@ void check_cuda(cudaError_t result, const char *operation) {
 }
 
 struct PackedPlaneJob {
-  int point_offset;
-  int edge_offset;
+  const float3 *points;
+  const uint2 *edges;
   int num_points;
   int num_edges;
 };
 
 __global__ void plane_score_packed_kernel(
-    const float4 *planes, const float3 *points, const uint2 *edges,
-    const PackedPlaneJob *jobs, const int *plane_jobs, float *scores,
-    int num_planes, float eps = 1e-6f) {
+    const float4 *planes, const PackedPlaneJob *jobs, const int *plane_jobs,
+    float *scores, int num_planes, float eps = 1e-6f) {
   const int plane_idx = static_cast<int>(blockIdx.x);
   if (plane_idx >= num_planes)
     return;
@@ -38,14 +38,14 @@ __global__ void plane_score_packed_kernel(
   float thread_score = 0.0f;
   for (int edge_idx = threadIdx.x; edge_idx < job.num_edges;
        edge_idx += blockDim.x) {
-    const uint2 edge = edges[job.edge_offset + edge_idx];
+    const uint2 edge = job.edges[edge_idx];
     if (edge.x >= static_cast<unsigned int>(job.num_points) ||
         edge.y >= static_cast<unsigned int>(job.num_points)) {
       continue;
     }
 
-    const float3 p1 = points[job.point_offset + edge.x];
-    const float3 p2 = points[job.point_offset + edge.y];
+    const float3 p1 = job.points[edge.x];
+    const float3 p2 = job.points[edge.y];
     const float value1 =
         plane.x * p1.x + plane.y * p1.y + plane.z * p1.z + plane.w;
     const float value2 =
@@ -206,9 +206,17 @@ void validate_inputs(const std::vector<PlaneScoreInput> &inputs) {
     if (input.num_planes < 0 || input.num_points < 0 || input.num_edges < 0)
       throw std::invalid_argument("Plane scoring counts cannot be negative");
     if ((input.num_planes && (!input.planes || !input.scores)) ||
-        (input.num_points && !input.points) ||
-        (input.num_edges && !input.edges)) {
+        (!input.device_mesh && input.num_points && !input.points) ||
+        (!input.device_mesh && input.num_edges && !input.edges)) {
       throw std::invalid_argument("Plane scoring input contains a null buffer");
+    }
+    if (input.device_mesh) {
+      const DeviceMeshView view = device_mesh_view(*input.device_mesh);
+      if (view.vertex_count != static_cast<size_t>(input.num_points) ||
+          view.edge_count != static_cast<size_t>(input.num_edges)) {
+        throw std::invalid_argument(
+            "Plane scoring device mesh counts do not match the input");
+      }
     }
   }
 }
@@ -235,12 +243,14 @@ void run_wave(const std::vector<PlaneScoreInput> &inputs, size_t begin,
     if (!add_count(total_planes, input.num_planes, next))
       throw std::overflow_error("Packed plane count exceeds CUDA grid limit");
     total_planes = next;
-    if (!add_count(total_points, input.num_points, next))
-      throw std::overflow_error("Packed point count exceeds indexing limit");
-    total_points = next;
-    if (!add_count(total_edges, input.num_edges, next))
-      throw std::overflow_error("Packed edge count exceeds indexing limit");
-    total_edges = next;
+    if (!input.device_mesh) {
+      if (!add_count(total_points, input.num_points, next))
+        throw std::overflow_error("Packed point count exceeds indexing limit");
+      total_points = next;
+      if (!add_count(total_edges, input.num_edges, next))
+        throw std::overflow_error("Packed edge count exceeds indexing limit");
+      total_edges = next;
+    }
     ++total_jobs;
   }
   if (total_planes == 0)
@@ -260,6 +270,19 @@ void run_wave(const std::vector<PlaneScoreInput> &inputs, size_t begin,
   runtime.host_scores.ensure(sizeof(float) * total_planes,
                              "cudaMallocHost packed scores");
 
+  runtime.planes.ensure(sizeof(float4) * total_planes,
+                        "cudaMalloc packed planes");
+  runtime.points.ensure(sizeof(float3) * total_points,
+                        "cudaMalloc packed points");
+  runtime.edges.ensure(sizeof(uint2) * total_edges,
+                       "cudaMalloc packed edges");
+  runtime.jobs.ensure(sizeof(PackedPlaneJob) * total_jobs,
+                      "cudaMalloc packed jobs");
+  runtime.plane_jobs.ensure(sizeof(int) * total_planes,
+                            "cudaMalloc plane job map");
+  runtime.scores.ensure(sizeof(float) * total_planes,
+                        "cudaMalloc packed scores");
+
   float *host_planes = runtime.host_planes.as<float>();
   float *host_points = runtime.host_points.as<float>();
   unsigned int *host_edges = runtime.host_edges.as<unsigned int>();
@@ -277,17 +300,29 @@ void run_wave(const std::vector<PlaneScoreInput> &inputs, size_t begin,
     if (!is_active(input))
       continue;
 
-    host_jobs[job_index] = {
-        static_cast<int>(point_offset), static_cast<int>(edge_offset),
-        input.num_points, input.num_edges};
+    const float3 *job_points = nullptr;
+    const uint2 *job_edges = nullptr;
+    if (input.device_mesh) {
+      const DeviceMeshView view = device_mesh_view(*input.device_mesh);
+      wait_for_device_mesh(*input.device_mesh, runtime.stream);
+      job_points = reinterpret_cast<const float3 *>(view.float_vertices);
+      job_edges = reinterpret_cast<const uint2 *>(view.edges);
+    } else {
+      job_points = runtime.points.as<float3>() + point_offset;
+      job_edges = runtime.edges.as<uint2>() + edge_offset;
+    }
+    host_jobs[job_index] = {job_points, job_edges, input.num_points,
+                            input.num_edges};
     std::memcpy(host_planes + plane_offset * 4, input.planes,
                 sizeof(float4) * static_cast<size_t>(input.num_planes));
-    if (input.num_points) {
+    if (!input.device_mesh && input.num_points) {
       std::memcpy(host_points + point_offset * 3, input.points,
                   sizeof(float3) * static_cast<size_t>(input.num_points));
     }
-    std::memcpy(host_edges + edge_offset * 2, input.edges,
-                sizeof(uint2) * static_cast<size_t>(input.num_edges));
+    if (!input.device_mesh) {
+      std::memcpy(host_edges + edge_offset * 2, input.edges,
+                  sizeof(uint2) * static_cast<size_t>(input.num_edges));
+    }
     std::fill(host_plane_jobs + plane_offset,
               host_plane_jobs + plane_offset + input.num_planes,
               static_cast<int>(job_index));
@@ -295,23 +330,12 @@ void run_wave(const std::vector<PlaneScoreInput> &inputs, size_t begin,
         {input.scores, plane_offset, static_cast<size_t>(input.num_planes)});
 
     plane_offset += static_cast<size_t>(input.num_planes);
-    point_offset += static_cast<size_t>(input.num_points);
-    edge_offset += static_cast<size_t>(input.num_edges);
+    if (!input.device_mesh) {
+      point_offset += static_cast<size_t>(input.num_points);
+      edge_offset += static_cast<size_t>(input.num_edges);
+    }
     ++job_index;
   }
-
-  runtime.planes.ensure(sizeof(float4) * total_planes,
-                        "cudaMalloc packed planes");
-  runtime.points.ensure(sizeof(float3) * total_points,
-                        "cudaMalloc packed points");
-  runtime.edges.ensure(sizeof(uint2) * total_edges,
-                       "cudaMalloc packed edges");
-  runtime.jobs.ensure(sizeof(PackedPlaneJob) * total_jobs,
-                      "cudaMalloc packed jobs");
-  runtime.plane_jobs.ensure(sizeof(int) * total_planes,
-                            "cudaMalloc plane job map");
-  runtime.scores.ensure(sizeof(float) * total_planes,
-                        "cudaMalloc packed scores");
 
   check_cuda(cudaMemcpyAsync(runtime.planes.as<float4>(), host_planes,
                              sizeof(float4) * total_planes,
@@ -339,8 +363,7 @@ void run_wave(const std::vector<PlaneScoreInput> &inputs, size_t begin,
   constexpr int block_size = 256;
   plane_score_packed_kernel<<<static_cast<unsigned int>(total_planes),
                               block_size, 0, runtime.stream>>>(
-      runtime.planes.as<float4>(), runtime.points.as<float3>(),
-      runtime.edges.as<uint2>(), runtime.jobs.as<PackedPlaneJob>(),
+      runtime.planes.as<float4>(), runtime.jobs.as<PackedPlaneJob>(),
       runtime.plane_jobs.as<int>(), runtime.scores.as<float>(),
       static_cast<int>(total_planes));
   check_cuda(cudaGetLastError(), "packed plane scoring kernel launch");
@@ -389,9 +412,12 @@ void classify_and_rate_planes_batch(
       size_t next_edges = total_edges;
       size_t next_jobs = total_jobs;
       if (is_active(inputs[end])) {
-        if (!add_count(total_planes, inputs[end].num_planes, next_planes) ||
-            !add_count(total_points, inputs[end].num_points, next_points) ||
-            !add_count(total_edges, inputs[end].num_edges, next_edges)) {
+        if (!add_count(total_planes, inputs[end].num_planes, next_planes)) {
+          break;
+        }
+        if (!inputs[end].device_mesh &&
+            (!add_count(total_points, inputs[end].num_points, next_points) ||
+             !add_count(total_edges, inputs[end].num_edges, next_edges))) {
           break;
         }
         ++next_jobs;

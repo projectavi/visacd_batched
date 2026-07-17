@@ -121,9 +121,15 @@ class BatchGpuTests(unittest.TestCase):
         for name, value in self.saved_config.items():
             setattr(visacd.config, name, value)
 
-    def run_batch(self, max_batch_size, batch_cpu_threads=0):
+    def run_batch(
+        self,
+        max_batch_size,
+        batch_cpu_threads=0,
+        batch_memory_fraction=0.7,
+    ):
         visacd.config.max_batch_size = max_batch_size
         visacd.config.batch_cpu_threads = batch_cpu_threads
+        visacd.config.batch_memory_fraction = batch_memory_fraction
         visacd.set_seed(1234)
         return visacd.process_batch(
             [load_cow(-100.0), load_cow(100.0)],
@@ -138,6 +144,10 @@ class BatchGpuTests(unittest.TestCase):
         one_cpu_thread = self.run_batch(
             max_batch_size=0, batch_cpu_threads=1
         )
+        host_packed_fallback = self.run_batch(
+            max_batch_size=0,
+            batch_memory_fraction=1e-9,
+        )
 
         self.assertEqual(len(automatic), 2)
         self.assertEqual(result_digest(automatic), result_digest(repeated))
@@ -148,6 +158,10 @@ class BatchGpuTests(unittest.TestCase):
         self.assertEqual(
             result_digest(automatic),
             result_digest(one_cpu_thread),
+        )
+        self.assertEqual(
+            result_digest(automatic),
+            result_digest(host_packed_fallback),
         )
 
         first_bounds = result_x_bounds(automatic[0])

@@ -9,6 +9,7 @@
 #include <core.hpp>
 #include <cost.hpp>
 #include <deque>
+#include <device_mesh.hpp>
 #include <exception>
 #include <functional>
 #include <hausdorff_batch.hpp>
@@ -54,6 +55,8 @@ constexpr size_t kMaxAutomaticCpuThreads = 200;
 struct PartCache {
   optional<Mesh> hull;
   optional<double> selection_concavity;
+  shared_ptr<DeviceMesh> device;
+  shared_ptr<DeviceMesh> hull_device;
 };
 
 struct BatchState {
@@ -96,6 +99,7 @@ struct IntersectionWork {
 struct FinalizeWork {
   size_t state_index;
   MeshList hulls;
+  vector<shared_ptr<DeviceMesh>> hull_devices;
   atomic<size_t> remaining{0};
 };
 
@@ -509,6 +513,7 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
   OptixRuntime optix;
   PlaneScoringRuntime plane_scoring;
   HausdorffRuntime hausdorff;
+  DeviceMeshRuntime device_meshes;
 
   const uint32_t batch_seed = random_engine();
   for (size_t i = 0; i < states.size(); ++i) {
@@ -532,6 +537,9 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
             multimerge_ch(state.parts, work->hulls, final_concavity,
                           concavity);
           }
+
+          state.part_cache.clear();
+          work->hull_devices.clear();
 
           for (Mesh &hull : work->hulls)
             hull.unnormalize(state.original_bbox);
@@ -589,6 +597,7 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
     auto work = make_shared<FinalizeWork>();
     work->state_index = state_index;
     work->hulls.resize(state.parts.size());
+    work->hull_devices.resize(state.parts.size());
     log(state_index, "Computing convex hulls for " +
                          to_string(state.parts.size()) + " parts...");
 
@@ -600,6 +609,8 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
       if (state.part_cache[part_index].hull) {
         work->hulls[part_index] =
             move(*state.part_cache[part_index].hull);
+        work->hull_devices[part_index] =
+            move(state.part_cache[part_index].hull_device);
       } else {
         missing_hulls.push_back(part_index);
       }
@@ -871,6 +882,59 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
       }
 
       if (gpu_work.kind == GpuWorkKind::hausdorff) {
+        for (shared_ptr<HausdorffWork> &work : gpu_work.hausdorff) {
+          BatchState &state = states[work->state_index];
+          if (work->purpose == HausdorffPurpose::selection) {
+            if (work->part_indices.size() != work->jobs.size())
+              throw logic_error("Selection Hausdorff work is out of sync");
+            for (size_t job_index = 0; job_index < work->jobs.size();
+                 ++job_index) {
+              const size_t part_index = work->part_indices[job_index];
+              if (part_index >= state.parts.size() ||
+                  part_index >= state.part_cache.size()) {
+                throw logic_error("Selection part index is out of range");
+              }
+              PartCache &cache = state.part_cache[part_index];
+              if (!cache.device) {
+                cache.device = device_meshes.try_upload(
+                    state.parts[part_index], config.batch_memory_fraction);
+              }
+              if (!cache.hull_device) {
+                cache.hull_device = device_meshes.try_upload(
+                    *cache.hull, config.batch_memory_fraction);
+              }
+              attach_hausdorff_device_meshes(
+                  work->jobs[job_index], cache.device, cache.hull_device);
+            }
+            continue;
+          }
+
+          if (!work->finalize_work ||
+              work->jobs.size() != state.parts.size() ||
+              work->finalize_work->hulls.size() != state.parts.size() ||
+              work->finalize_work->hull_devices.size() !=
+                  state.parts.size()) {
+            throw logic_error("Final Hausdorff work is out of sync");
+          }
+          for (size_t part_index = 0; part_index < state.parts.size();
+               ++part_index) {
+            PartCache &cache = state.part_cache[part_index];
+            if (!cache.device) {
+              cache.device = device_meshes.try_upload(
+                  state.parts[part_index], config.batch_memory_fraction);
+            }
+            shared_ptr<DeviceMesh> &hull_device =
+                work->finalize_work->hull_devices[part_index];
+            if (!hull_device) {
+              hull_device = device_meshes.try_upload(
+                  work->finalize_work->hulls[part_index],
+                  config.batch_memory_fraction);
+            }
+            attach_hausdorff_device_meshes(work->jobs[part_index],
+                                            cache.device, hull_device);
+          }
+        }
+
         size_t job_count = 0;
         for (const shared_ptr<HausdorffWork> &work : gpu_work.hausdorff)
           job_count += work->jobs.size();
@@ -924,12 +988,17 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
                 static_cast<size_t>(numeric_limits<int>::max())) {
           throw overflow_error("Plane scoring input is too large");
         }
+        if (!split->part_cache.device) {
+          split->part_cache.device = device_meshes.try_upload(
+              split->part, config.batch_memory_fraction);
+        }
         score_inputs.push_back(
             {split->host_planes.data(), split->host_points.data(),
              split->host_edges.data(), split->scores.data(),
              static_cast<int>(split->planes.size()),
              static_cast<int>(split->part.vertices.size()),
-             static_cast<int>(split->part.intersecting_edges.size())});
+             static_cast<int>(split->part.intersecting_edges.size()),
+             split->part_cache.device.get()});
       }
       classify_and_rate_planes_batch(score_inputs, plane_scoring,
                                      configured_batch_size(),
