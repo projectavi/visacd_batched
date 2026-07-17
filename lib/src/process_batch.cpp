@@ -1,12 +1,9 @@
 #include <algorithm>
-#include <atomic>
+#include <batch_executor.hpp>
 #include <clip.hpp>
-#include <condition_variable>
 #include <config.hpp>
 #include <core.hpp>
 #include <cost.hpp>
-#include <exception>
-#include <functional>
 #include <iomanip>
 #include <intersections.hpp>
 #include <iostream>
@@ -92,115 +89,6 @@ size_t configured_cpu_threads(size_t work_size) {
   }
   return max<size_t>(1, min(requested, work_size));
 }
-
-class BatchExecutor {
-public:
-  explicit BatchExecutor(size_t thread_count)
-      : thread_count_(max<size_t>(1, thread_count)) {
-    workers_.reserve(thread_count_ - 1);
-    for (size_t i = 1; i < thread_count_; ++i)
-      workers_.emplace_back([this]() { worker_loop(); });
-  }
-
-  ~BatchExecutor() {
-    {
-      lock_guard<mutex> lock(job_mutex_);
-      stopping_ = true;
-    }
-    start_condition_.notify_all();
-    for (thread &worker : workers_)
-      worker.join();
-  }
-
-  BatchExecutor(const BatchExecutor &) = delete;
-  BatchExecutor &operator=(const BatchExecutor &) = delete;
-
-  template <typename Function>
-  void parallel_for(size_t work_size, Function function) {
-    if (work_size == 0)
-      return;
-    if (thread_count_ <= 1) {
-      for (size_t i = 0; i < work_size; ++i)
-        function(i);
-      return;
-    }
-
-    {
-      lock_guard<mutex> lock(job_mutex_);
-      function_ = move(function);
-      work_size_ = work_size;
-      next_.store(0, memory_order_relaxed);
-      failed_.store(false, memory_order_relaxed);
-      exception_ = nullptr;
-      workers_remaining_ = workers_.size();
-      ++generation_;
-    }
-    start_condition_.notify_all();
-
-    run_job();
-
-    unique_lock<mutex> lock(job_mutex_);
-    done_condition_.wait(lock,
-                         [this]() { return workers_remaining_ == 0; });
-    exception_ptr exception = exception_;
-    function_ = nullptr;
-    lock.unlock();
-    if (exception)
-      rethrow_exception(exception);
-  }
-
-private:
-  void run_job() {
-    while (!failed_.load(memory_order_relaxed)) {
-      const size_t i = next_.fetch_add(1, memory_order_relaxed);
-      if (i >= work_size_)
-        return;
-      try {
-        function_(i);
-      } catch (...) {
-        bool expected = false;
-        if (failed_.compare_exchange_strong(expected, true,
-                                            memory_order_relaxed)) {
-          lock_guard<mutex> lock(exception_mutex_);
-          exception_ = current_exception();
-        }
-      }
-    }
-  }
-
-  void worker_loop() {
-    size_t observed_generation = 0;
-    unique_lock<mutex> lock(job_mutex_);
-    while (true) {
-      start_condition_.wait(lock, [this, observed_generation]() {
-        return stopping_ || generation_ != observed_generation;
-      });
-      if (stopping_)
-        return;
-      observed_generation = generation_;
-      lock.unlock();
-      run_job();
-      lock.lock();
-      if (--workers_remaining_ == 0)
-        done_condition_.notify_one();
-    }
-  }
-
-  size_t thread_count_;
-  vector<thread> workers_;
-  mutex job_mutex_;
-  mutex exception_mutex_;
-  condition_variable start_condition_;
-  condition_variable done_condition_;
-  function<void(size_t)> function_;
-  size_t work_size_ = 0;
-  atomic<size_t> next_{0};
-  atomic<bool> failed_{false};
-  exception_ptr exception_;
-  size_t workers_remaining_ = 0;
-  size_t generation_ = 0;
-  bool stopping_ = false;
-};
 
 void validate_parameters(const MeshList &meshes, double concavity,
                          int num_parts) {
@@ -313,11 +201,12 @@ void propagate_existing_edges(
 
 void append_intersections(
     const vector<pair<Mesh *, Mesh *>> &requests,
-    const vector<vector<pair<unsigned int, unsigned int>>> &edges) {
-  for (size_t i = 0; i < requests.size(); ++i) {
+    const vector<vector<pair<unsigned int, unsigned int>>> &edges,
+    BatchExecutor &executor) {
+  executor.parallel_for(requests.size(), [&](size_t i) {
     auto &destination = requests[i].first->intersecting_edges;
     destination.insert(destination.end(), edges[i].begin(), edges[i].end());
-  }
+  });
 }
 
 size_t configured_batch_size() {
@@ -355,8 +244,8 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
   }
   auto initial_edges = compute_intersection_matrices(
       initial_requests, optix, configured_batch_size(),
-      config.batch_memory_fraction);
-  append_intersections(initial_requests, initial_edges);
+      config.batch_memory_fraction, &executor);
+  append_intersections(initial_requests, initial_edges, executor);
 
   for (size_t i = 0; i < states.size(); ++i) {
     log(i, "Starting decomposition (max parts=" + to_string(num_parts) +
@@ -497,8 +386,8 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
 
     auto new_edges = compute_intersection_matrices(
         requests, optix, configured_batch_size(),
-        config.batch_memory_fraction);
-    append_intersections(requests, new_edges);
+        config.batch_memory_fraction, &executor);
+    append_intersections(requests, new_edges, executor);
     for (PendingPart &pending : pending_parts) {
       states[pending.state_index].parts.push_back(move(pending.part));
     }

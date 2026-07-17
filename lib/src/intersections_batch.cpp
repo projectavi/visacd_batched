@@ -500,15 +500,20 @@ struct OptixJob {
 
 vector<vector<pair<unsigned int, unsigned int>>>
 run_wave(const vector<pair<Mesh *, Mesh *>> &requests, size_t begin, size_t end,
-         OptixRuntime::Impl &runtime) {
+         OptixRuntime::Impl &runtime, BatchExecutor *executor) {
   runtime.ensure_slots(end - begin);
-  vector<unique_ptr<OptixJob>> jobs;
-  jobs.reserve(end - begin);
-  for (size_t i = begin; i < end; ++i) {
-    jobs.push_back(make_unique<OptixJob>(
-        *requests[i].first, *requests[i].second, runtime,
-        *runtime.slots[i - begin]));
-  }
+  vector<unique_ptr<OptixJob>> jobs(end - begin);
+  const auto prepare_job = [&](size_t local_idx) {
+    const size_t request_idx = begin + local_idx;
+    jobs[local_idx] = make_unique<OptixJob>(
+        *requests[request_idx].first, *requests[request_idx].second, runtime,
+        *runtime.slots[local_idx]);
+  };
+  if (executor)
+    executor->parallel_for(jobs.size(), prepare_job);
+  else
+    for (size_t local_idx = 0; local_idx < jobs.size(); ++local_idx)
+      prepare_job(local_idx);
 
   // Grow runtime-owned buffers before submitting the first job. Later waves
   // and decomposition iterations reuse both these buffers and their streams.
@@ -529,7 +534,7 @@ run_wave(const vector<pair<Mesh *, Mesh *>> &requests, size_t begin, size_t end,
     job->wait();
 
   vector<vector<pair<unsigned int, unsigned int>>> results(end - begin);
-  for (size_t local_idx = 0; local_idx < end - begin; ++local_idx) {
+  const auto decode_result = [&](size_t local_idx) {
     const Mesh &mesh = *requests[begin + local_idx].first;
     const vector<unsigned int> &accepted_words =
         jobs[local_idx]->accepted_words;
@@ -554,7 +559,12 @@ run_wave(const vector<pair<Mesh *, Mesh *>> &requests, size_t begin, size_t end,
         word &= word - 1;
       }
     }
-  }
+  };
+  if (executor)
+    executor->parallel_for(results.size(), decode_result);
+  else
+    for (size_t local_idx = 0; local_idx < results.size(); ++local_idx)
+      decode_result(local_idx);
   return results;
 }
 
@@ -563,7 +573,7 @@ run_wave(const vector<pair<Mesh *, Mesh *>> &requests, size_t begin, size_t end,
 vector<vector<pair<unsigned int, unsigned int>>>
 compute_intersection_matrices(
     const vector<pair<Mesh *, Mesh *>> &requests, OptixRuntime &runtime,
-    size_t max_batch_size, double memory_fraction) {
+    size_t max_batch_size, double memory_fraction, BatchExecutor *executor) {
   if (memory_fraction <= 0.0 || memory_fraction > 1.0)
     throw invalid_argument("batch_memory_fraction must be in (0, 1]");
   for (const auto &request : requests) {
@@ -602,7 +612,8 @@ compute_intersection_matrices(
     if (end == begin)
       ++end;
 
-    auto wave_results = run_wave(requests, begin, end, *runtime.impl_);
+    auto wave_results =
+        run_wave(requests, begin, end, *runtime.impl_, executor);
     for (size_t i = 0; i < wave_results.size(); ++i)
       results[begin + i] = move(wave_results[i]);
     begin = end;

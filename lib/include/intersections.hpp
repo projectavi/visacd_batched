@@ -1,5 +1,6 @@
 #pragma once
 
+#include <batch_executor.hpp>
 #include <core.hpp>
 #include <memory>
 #include <optixUtils.hpp>
@@ -41,7 +42,7 @@ private:
   friend std::vector<std::vector<std::pair<unsigned int, unsigned int>>>
   compute_intersection_matrices(
       const std::vector<std::pair<Mesh *, Mesh *>> &, OptixRuntime &, size_t,
-      double);
+      double, BatchExecutor *);
 };
 
 // Each request contains the point mesh and the cage to test it against. The
@@ -51,6 +52,6 @@ std::vector<std::vector<std::pair<unsigned int, unsigned int>>>
 compute_intersection_matrices(
     const std::vector<std::pair<Mesh *, Mesh *>> &requests,
     OptixRuntime &runtime, size_t max_batch_size = 0,
-    double memory_fraction = 0.7);
+    double memory_fraction = 0.7, BatchExecutor *executor = nullptr);
 
 } // namespace neural_acd
