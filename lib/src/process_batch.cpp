@@ -368,9 +368,17 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
         pending.state_index = split.state_index;
         pending.part = move(part);
         pending.cage = pending.part.copy();
-        manifold_preprocess(pending.cage, 40, 0.02);
         pending_by_work[work_index].push_back(move(pending));
       }
+    });
+
+    vector<PendingPart *> cage_jobs;
+    for (vector<PendingPart> &pending_group : pending_by_work) {
+      for (PendingPart &pending : pending_group)
+        cage_jobs.push_back(&pending);
+    }
+    executor.parallel_for(cage_jobs.size(), [&](size_t cage_index) {
+      manifold_preprocess(cage_jobs[cage_index]->cage, 40, 0.02);
     });
 
     vector<PendingPart> pending_parts;
@@ -395,21 +403,29 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
 
   vector<MeshList> hulls_by_state(states.size());
   vector<double> final_concavities(states.size());
-  executor.parallel_for(states.size(), [&](size_t state_index) {
+  struct HullJob {
+    size_t state_index;
+    size_t part_index;
+  };
+  vector<HullJob> hull_jobs;
+  for (size_t state_index = 0; state_index < states.size(); ++state_index) {
     BatchState &state = states[state_index];
     log(state_index, "Computing convex hulls for " +
                          to_string(state.parts.size()) + " parts...");
-
     MeshList &hulls = hulls_by_state[state_index];
-    hulls.reserve(state.parts.size());
-    for (Mesh &part : state.parts) {
-      Mesh hull;
-      part.compute_ch(hull, true);
-      hulls.push_back(move(hull));
-    }
-
+    hulls.resize(state.parts.size());
+    for (size_t part_index = 0; part_index < state.parts.size(); ++part_index)
+      hull_jobs.push_back({state_index, part_index});
+  }
+  executor.parallel_for(hull_jobs.size(), [&](size_t job_index) {
+    const HullJob job = hull_jobs[job_index];
+    states[job.state_index].parts[job.part_index].compute_ch(
+        hulls_by_state[job.state_index][job.part_index], true);
+  });
+  executor.parallel_for(states.size(), [&](size_t state_index) {
+    BatchState &state = states[state_index];
     final_concavities[state_index] = compute_final_concavity(
-        state.parts, hulls, state.random_engine);
+        state.parts, hulls_by_state[state_index], state.random_engine);
   });
 
   vector<ProcessResult> results;
