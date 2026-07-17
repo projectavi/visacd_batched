@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cmath>
 #include <core.hpp>
 #include <cuda_runtime.h>
@@ -80,11 +81,71 @@ size_t estimate_request_bytes(const Mesh &points, const Mesh &cage) {
   const size_t point_bytes =
       points.vertices.size() * (sizeof(float) * 3 + sizeof(unsigned int));
 
-  // GAS sizes depend on OptiX and the device. This conservative allowance
-  // keeps the quadratic result array as the dominant part of the estimate.
+  // GAS sizes depend on OptiX and the device. Use a conservative multiplier
+  // plus fixed headroom when selecting memory-aware waves.
   return pair_bytes + point_bytes + estimate_geometry_bytes(cage) * 4 +
          estimate_geometry_bytes(points) * 4 + (8u << 20);
 }
+
+class DeviceBuffer {
+public:
+  DeviceBuffer() = default;
+  ~DeviceBuffer() {
+    if (data_)
+      cudaFree(data_);
+  }
+
+  DeviceBuffer(const DeviceBuffer &) = delete;
+  DeviceBuffer &operator=(const DeviceBuffer &) = delete;
+
+  void ensure(size_t bytes) {
+    if (bytes <= capacity_)
+      return;
+    if (data_) {
+      CUCHK(cudaFree(data_));
+      data_ = nullptr;
+      capacity_ = 0;
+    }
+    CUCHK(cudaMalloc(&data_, bytes));
+    capacity_ = bytes;
+  }
+
+  template <typename T> T *as() const { return static_cast<T *>(data_); }
+  CUdeviceptr device_ptr() const {
+    return reinterpret_cast<CUdeviceptr>(data_);
+  }
+
+private:
+  void *data_ = nullptr;
+  size_t capacity_ = 0;
+};
+
+struct OptixSlot {
+  cudaStream_t stream = nullptr;
+  size_t estimated_request_capacity = 0;
+  DeviceBuffer points;
+  DeviceBuffer new_mask;
+  DeviceBuffer vertices;
+  DeviceBuffer indices;
+  DeviceBuffer self_indices;
+  DeviceBuffer accepted_words;
+  DeviceBuffer temp;
+  DeviceBuffer gas_output;
+  DeviceBuffer self_temp;
+  DeviceBuffer self_gas_output;
+  DeviceBuffer raygen_record;
+
+  ~OptixSlot() {
+    if (stream) {
+      cudaStreamSynchronize(stream);
+      cudaStreamDestroy(stream);
+    }
+  }
+
+  void initialize() {
+    CUCHK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+  }
+};
 
 } // namespace
 
@@ -97,10 +158,12 @@ struct OptixRuntime::Impl {
   OptixProgramGroup hit_pg = nullptr;
   CUdeviceptr d_miss_record = 0;
   CUdeviceptr d_hit_record = 0;
+  vector<unique_ptr<OptixSlot>> slots;
 
   ~Impl() {
     if (context)
       cudaDeviceSynchronize();
+    slots.clear();
     if (d_miss_record)
       cudaFree(reinterpret_cast<void *>(d_miss_record));
     if (d_hit_record)
@@ -117,6 +180,14 @@ struct OptixRuntime::Impl {
       optixModuleDestroy(module);
     if (context)
       optixDeviceContextDestroy(context);
+  }
+
+  void ensure_slots(size_t count) {
+    while (slots.size() < count) {
+      auto slot = make_unique<OptixSlot>();
+      slot->initialize();
+      slots.push_back(move(slot));
+    }
   }
 
   void initialize() {
@@ -202,6 +273,7 @@ struct OptixJob {
   const Mesh &points_mesh;
   const Mesh &target;
   OptixRuntime::Impl &runtime;
+  OptixSlot &slot;
 
   vector<float> h_points;
   vector<unsigned int> h_new_mask;
@@ -235,38 +307,10 @@ struct OptixJob {
   unsigned int triangle_input_flags[1] = {0};
 
   OptixJob(const Mesh &points_mesh_, const Mesh &target_,
-           OptixRuntime::Impl &runtime_)
-      : points_mesh(points_mesh_), target(target_), runtime(runtime_) {
+           OptixRuntime::Impl &runtime_, OptixSlot &slot_)
+      : points_mesh(points_mesh_), target(target_), runtime(runtime_),
+        slot(slot_), stream(slot_.stream) {
     prepare_host_data();
-  }
-
-  ~OptixJob() {
-    if (stream)
-      cudaStreamSynchronize(stream);
-    if (d_points)
-      cudaFree(d_points);
-    if (d_new_mask)
-      cudaFree(d_new_mask);
-    if (d_vertices)
-      cudaFree(d_vertices);
-    if (d_indices)
-      cudaFree(d_indices);
-    if (d_self_indices)
-      cudaFree(d_self_indices);
-    if (d_accepted_words)
-      cudaFree(d_accepted_words);
-    if (d_temp)
-      cudaFree(reinterpret_cast<void *>(d_temp));
-    if (d_gas_output)
-      cudaFree(reinterpret_cast<void *>(d_gas_output));
-    if (d_self_temp)
-      cudaFree(reinterpret_cast<void *>(d_self_temp));
-    if (d_self_gas_output)
-      cudaFree(reinterpret_cast<void *>(d_self_gas_output));
-    if (d_raygen_record)
-      cudaFree(reinterpret_cast<void *>(d_raygen_record));
-    if (stream)
-      cudaStreamDestroy(stream);
   }
 
   void prepare_host_data() {
@@ -310,23 +354,22 @@ struct OptixJob {
     if (accepted_words.empty())
       return;
 
-    CUCHK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-    CUCHK(cudaMalloc(reinterpret_cast<void **>(&d_points),
-                     sizeof(float) * h_points.size()));
+    slot.points.ensure(sizeof(float) * h_points.size());
+    d_points = slot.points.as<float>();
     if (!h_new_mask.empty()) {
-      CUCHK(cudaMalloc(reinterpret_cast<void **>(&d_new_mask),
-                       sizeof(unsigned int) * h_new_mask.size()));
+      slot.new_mask.ensure(sizeof(unsigned int) * h_new_mask.size());
+      d_new_mask = slot.new_mask.as<unsigned int>();
     }
-    CUCHK(cudaMalloc(reinterpret_cast<void **>(&d_vertices),
-                     sizeof(float) * h_vertices.size()));
-    CUCHK(cudaMalloc(reinterpret_cast<void **>(&d_indices),
-                     sizeof(uint3) * h_indices.size()));
-    CUCHK(cudaMalloc(reinterpret_cast<void **>(&d_self_indices),
-                     sizeof(uint3) * h_self_indices.size()));
-    CUCHK(cudaMalloc(reinterpret_cast<void **>(&d_accepted_words),
-                     sizeof(unsigned int) * accepted_words.size()));
-    CUCHK(cudaMalloc(reinterpret_cast<void **>(&d_raygen_record),
-                     sizeof(SbtRecord<RayGenData>)));
+    slot.vertices.ensure(sizeof(float) * h_vertices.size());
+    d_vertices = slot.vertices.as<float>();
+    slot.indices.ensure(sizeof(uint3) * h_indices.size());
+    d_indices = slot.indices.as<uint3>();
+    slot.self_indices.ensure(sizeof(uint3) * h_self_indices.size());
+    d_self_indices = slot.self_indices.as<uint3>();
+    slot.accepted_words.ensure(sizeof(unsigned int) * accepted_words.size());
+    d_accepted_words = slot.accepted_words.as<unsigned int>();
+    slot.raygen_record.ensure(sizeof(SbtRecord<RayGenData>));
+    d_raygen_record = slot.raygen_record.device_ptr();
 
     build_input.type = OPTIX_BUILD_INPUT_TYPE_TRIANGLES;
     d_vertices_ptr = reinterpret_cast<CUdeviceptr>(d_vertices);
@@ -369,14 +412,14 @@ struct OptixJob {
     OCHK(optixAccelComputeMemoryUsage(runtime.context, &accel_options,
                                       &self_build_input, 1,
                                       &self_gas_sizes));
-    CUCHK(cudaMalloc(reinterpret_cast<void **>(&d_temp),
-                     gas_sizes.tempSizeInBytes));
-    CUCHK(cudaMalloc(reinterpret_cast<void **>(&d_gas_output),
-                     gas_sizes.outputSizeInBytes));
-    CUCHK(cudaMalloc(reinterpret_cast<void **>(&d_self_temp),
-                     self_gas_sizes.tempSizeInBytes));
-    CUCHK(cudaMalloc(reinterpret_cast<void **>(&d_self_gas_output),
-                     self_gas_sizes.outputSizeInBytes));
+    slot.temp.ensure(gas_sizes.tempSizeInBytes);
+    d_temp = slot.temp.device_ptr();
+    slot.gas_output.ensure(gas_sizes.outputSizeInBytes);
+    d_gas_output = slot.gas_output.device_ptr();
+    slot.self_temp.ensure(self_gas_sizes.tempSizeInBytes);
+    d_self_temp = slot.self_temp.device_ptr();
+    slot.self_gas_output.ensure(self_gas_sizes.outputSizeInBytes);
+    d_self_gas_output = slot.self_gas_output.device_ptr();
   }
 
   void enqueue() {
@@ -458,17 +501,26 @@ struct OptixJob {
 vector<vector<pair<unsigned int, unsigned int>>>
 run_wave(const vector<pair<Mesh *, Mesh *>> &requests, size_t begin, size_t end,
          OptixRuntime::Impl &runtime) {
+  runtime.ensure_slots(end - begin);
   vector<unique_ptr<OptixJob>> jobs;
   jobs.reserve(end - begin);
   for (size_t i = begin; i < end; ++i) {
-    jobs.push_back(
-        make_unique<OptixJob>(*requests[i].first, *requests[i].second, runtime));
+    jobs.push_back(make_unique<OptixJob>(
+        *requests[i].first, *requests[i].second, runtime,
+        *runtime.slots[i - begin]));
   }
 
-  // cudaMalloc may synchronize the device, so finish every allocation before
-  // submitting the first job in a wave.
+  // Grow runtime-owned buffers before submitting the first job. Later waves
+  // and decomposition iterations reuse both these buffers and their streams.
   for (auto &job : jobs)
     job->allocate();
+  for (size_t local_idx = 0; local_idx < jobs.size(); ++local_idx) {
+    OptixSlot &slot = *runtime.slots[local_idx];
+    slot.estimated_request_capacity =
+        max(slot.estimated_request_capacity,
+            estimate_request_bytes(*requests[begin + local_idx].first,
+                                   *requests[begin + local_idx].second));
+  }
   for (auto &job : jobs)
     job->enqueue();
   for (auto &job : jobs)
@@ -528,16 +580,23 @@ compute_intersection_matrices(
         static_cast<size_t>(static_cast<double>(free_bytes) * memory_fraction);
 
     size_t end = begin;
-    size_t estimated_bytes = 0;
+    size_t additional_bytes = 0;
     while (end < requests.size()) {
       if (max_batch_size && end - begin >= max_batch_size)
         break;
       const Mesh &mesh = *requests[end].first;
       const size_t request_bytes =
           estimate_request_bytes(mesh, *requests[end].second);
-      if (end > begin && estimated_bytes + request_bytes > budget)
+      const size_t slot_index = end - begin;
+      const size_t retained_bytes =
+          slot_index < runtime.impl_->slots.size()
+              ? runtime.impl_->slots[slot_index]->estimated_request_capacity
+              : 0;
+      const size_t request_growth =
+          request_bytes > retained_bytes ? request_bytes - retained_bytes : 0;
+      if (end > begin && additional_bytes + request_growth > budget)
         break;
-      estimated_bytes += request_bytes;
+      additional_bytes += request_growth;
       ++end;
     }
     if (end == begin)
