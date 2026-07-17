@@ -574,7 +574,7 @@ run_wave(const vector<pair<Mesh *, Mesh *>> &requests, size_t begin, size_t end,
         *runtime.slots[local_idx]);
   };
   if (executor)
-    executor->parallel_for(jobs.size(), prepare_job);
+    executor->parallel_for_priority(jobs.size(), prepare_job);
   else
     for (size_t local_idx = 0; local_idx < jobs.size(); ++local_idx)
       prepare_job(local_idx);
@@ -618,7 +618,7 @@ run_wave(const vector<pair<Mesh *, Mesh *>> &requests, size_t begin, size_t end,
     }
   };
   if (executor)
-    executor->parallel_for(results.size(), decode_result);
+    executor->parallel_for_priority(results.size(), decode_result);
   else
     for (size_t local_idx = 0; local_idx < results.size(); ++local_idx)
       decode_result(local_idx);

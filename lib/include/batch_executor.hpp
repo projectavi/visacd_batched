@@ -40,18 +40,38 @@ public:
 
   size_t thread_count() const { return thread_count_; }
 
-  void submit(std::function<void()> task) {
+  void submit(std::function<void()> task) { enqueue(std::move(task), false); }
+
+  void submit_priority(std::function<void()> task) {
+    enqueue(std::move(task), true);
+  }
+
+  template <typename Function>
+  void parallel_for(size_t work_size, Function function) {
+    parallel_for_impl(work_size, std::move(function), false);
+  }
+
+  template <typename Function>
+  void parallel_for_priority(size_t work_size, Function function) {
+    parallel_for_impl(work_size, std::move(function), true);
+  }
+
+private:
+  void enqueue(std::function<void()> task, bool priority) {
     {
       std::lock_guard<std::mutex> lock(queue_mutex_);
       if (stopping_)
         throw std::runtime_error("Cannot submit work to a stopped executor");
-      tasks_.push_back(std::move(task));
+      if (priority)
+        tasks_.push_front(std::move(task));
+      else
+        tasks_.push_back(std::move(task));
     }
     task_condition_.notify_one();
   }
 
   template <typename Function>
-  void parallel_for(size_t work_size, Function function) {
+  void parallel_for_impl(size_t work_size, Function function, bool priority) {
     if (work_size == 0)
       return;
 
@@ -59,7 +79,7 @@ public:
     auto shared_function =
         std::make_shared<std::decay_t<Function>>(std::move(function));
     for (size_t i = 0; i < work_size; ++i) {
-      submit([group, shared_function, i]() {
+      enqueue([group, shared_function, i]() {
         std::exception_ptr error;
         try {
           (*shared_function)(i);
@@ -67,12 +87,11 @@ public:
           error = std::current_exception();
         }
         group->complete(error);
-      });
+      }, priority);
     }
     group->wait();
   }
 
-private:
   class TaskGroup {
   public:
     explicit TaskGroup(size_t task_count) : remaining_(task_count) {}
