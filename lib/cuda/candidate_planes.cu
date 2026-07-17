@@ -485,11 +485,6 @@ void run_wave(const std::vector<CandidatePlaneInput> &inputs, size_t begin,
       runtime.plane_counts.as<int>(), runtime.attempt_counts.as<int>(),
       static_cast<int>(job_count), normal_epsilon, 1e-3);
   check_cuda(cudaGetLastError(), "launch candidate generation");
-  check_cuda(cudaMemcpyAsync(runtime.host_planes.as<double4>(),
-                             runtime.planes.as<double4>(),
-                             plane_count * sizeof(double4),
-                             cudaMemcpyDeviceToHost, runtime.stream),
-             "copy candidate planes");
   check_cuda(cudaMemcpyAsync(runtime.host_plane_counts.as<int>(),
                              runtime.plane_counts.as<int>(),
                              job_count * sizeof(int), cudaMemcpyDeviceToHost,
@@ -501,11 +496,12 @@ void run_wave(const std::vector<CandidatePlaneInput> &inputs, size_t begin,
                              runtime.stream),
              "copy candidate attempts");
   check_cuda(cudaStreamSynchronize(runtime.stream),
-             "cudaStreamSynchronize candidates");
+             "cudaStreamSynchronize candidate counts");
 
-  const double4 *host_planes = runtime.host_planes.as<double4>();
+  double4 *host_planes = runtime.host_planes.as<double4>();
   const int *host_counts = runtime.host_plane_counts.as<int>();
   const int *host_attempts = runtime.host_attempt_counts.as<int>();
+  bool copied_planes = false;
   for (const OutputRange &output : outputs) {
     const int count = host_counts[output.job_index];
     const int attempts = host_attempts[output.job_index];
@@ -516,6 +512,26 @@ void run_wave(const std::vector<CandidatePlaneInput> &inputs, size_t begin,
       throw std::runtime_error(
           "Candidate kernel returned an invalid output count");
     }
+    if (count > 0) {
+      check_cuda(
+          cudaMemcpyAsync(
+              host_planes + output.plane_offset,
+              runtime.planes.as<double4>() + output.plane_offset,
+              checked_multiply(static_cast<size_t>(count), sizeof(double4),
+                               "Candidate plane copy overflow"),
+              cudaMemcpyDeviceToHost, runtime.stream),
+          "copy accepted candidate planes");
+      copied_planes = true;
+    }
+  }
+  if (copied_planes) {
+    check_cuda(cudaStreamSynchronize(runtime.stream),
+               "cudaStreamSynchronize candidate planes");
+  }
+
+  for (const OutputRange &output : outputs) {
+    const int count = host_counts[output.job_index];
+    const int attempts = host_attempts[output.job_index];
     output.input.planes->clear();
     output.input.planes->reserve(static_cast<size_t>(count));
     for (int plane_index = 0; plane_index < count; ++plane_index) {
