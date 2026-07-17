@@ -64,18 +64,21 @@ void linear_to_pair_batched(long long k, long long n, long long &i,
                              (n - i) * ((n - i) - 1) / 2);
 }
 
-size_t estimate_job_bytes(const Mesh &points, const Mesh &target) {
+size_t estimate_geometry_bytes(const Mesh &mesh) {
+  return mesh.vertices.size() * sizeof(float) * 3 +
+         mesh.triangles.size() * sizeof(uint3);
+}
+
+size_t estimate_request_bytes(const Mesh &points, const Mesh &cage) {
   const size_t pair_bytes =
       segment_count(points.vertices.size()) * sizeof(unsigned int);
   const size_t point_bytes =
       points.vertices.size() * (sizeof(float) * 3 + sizeof(unsigned int));
-  const size_t geometry_bytes =
-      target.vertices.size() * sizeof(float) * 3 +
-      target.triangles.size() * sizeof(uint3);
 
   // GAS sizes depend on OptiX and the device. This conservative allowance
   // keeps the quadratic result array as the dominant part of the estimate.
-  return pair_bytes + point_bytes + geometry_bytes * 4 + (4u << 20);
+  return pair_bytes + point_bytes + estimate_geometry_bytes(cage) * 4 +
+         estimate_geometry_bytes(points) * 4 + (8u << 20);
 }
 
 } // namespace
@@ -199,6 +202,7 @@ struct OptixJob {
   vector<unsigned int> h_new_mask;
   vector<float> h_vertices;
   vector<uint3> h_indices;
+  vector<uint3> h_self_indices;
   vector<unsigned int> output;
 
   cudaStream_t stream = nullptr;
@@ -206,16 +210,23 @@ struct OptixJob {
   unsigned int *d_new_mask = nullptr;
   float *d_vertices = nullptr;
   uint3 *d_indices = nullptr;
+  uint3 *d_self_indices = nullptr;
   unsigned int *d_output = nullptr;
   CUdeviceptr d_temp = 0;
   CUdeviceptr d_gas_output = 0;
+  CUdeviceptr d_self_temp = 0;
+  CUdeviceptr d_self_gas_output = 0;
   CUdeviceptr d_raygen_record = 0;
   OptixTraversableHandle gas = 0;
+  OptixTraversableHandle self_gas = 0;
   OptixShaderBindingTable sbt = {};
   OptixAccelBufferSizes gas_sizes = {};
+  OptixAccelBufferSizes self_gas_sizes = {};
   OptixBuildInput build_input = {};
+  OptixBuildInput self_build_input = {};
   OptixAccelBuildOptions accel_options = {};
   CUdeviceptr d_vertices_ptr = 0;
+  CUdeviceptr d_self_vertices_ptr = 0;
   unsigned int triangle_input_flags[1] = {0};
 
   OptixJob(const Mesh &points_mesh_, const Mesh &target_,
@@ -235,12 +246,18 @@ struct OptixJob {
       cudaFree(d_vertices);
     if (d_indices)
       cudaFree(d_indices);
+    if (d_self_indices)
+      cudaFree(d_self_indices);
     if (d_output)
       cudaFree(d_output);
     if (d_temp)
       cudaFree(reinterpret_cast<void *>(d_temp));
     if (d_gas_output)
       cudaFree(reinterpret_cast<void *>(d_gas_output));
+    if (d_self_temp)
+      cudaFree(reinterpret_cast<void *>(d_self_temp));
+    if (d_self_gas_output)
+      cudaFree(reinterpret_cast<void *>(d_self_gas_output));
     if (d_raygen_record)
       cudaFree(reinterpret_cast<void *>(d_raygen_record));
     if (stream)
@@ -274,6 +291,13 @@ struct OptixJob {
                                      static_cast<unsigned>(triangle[1]),
                                      static_cast<unsigned>(triangle[2])));
     }
+    h_self_indices.reserve(points_mesh.triangles.size());
+    for (const auto &triangle : points_mesh.triangles) {
+      h_self_indices.push_back(
+          make_uint3(static_cast<unsigned>(triangle[0]),
+                     static_cast<unsigned>(triangle[1]),
+                     static_cast<unsigned>(triangle[2])));
+    }
     output.resize(segments);
   }
 
@@ -292,6 +316,8 @@ struct OptixJob {
                      sizeof(float) * h_vertices.size()));
     CUCHK(cudaMalloc(reinterpret_cast<void **>(&d_indices),
                      sizeof(uint3) * h_indices.size()));
+    CUCHK(cudaMalloc(reinterpret_cast<void **>(&d_self_indices),
+                     sizeof(uint3) * h_self_indices.size()));
     CUCHK(cudaMalloc(reinterpret_cast<void **>(&d_output),
                      sizeof(unsigned int) * output.size()));
     CUCHK(cudaMalloc(reinterpret_cast<void **>(&d_raygen_record),
@@ -314,14 +340,38 @@ struct OptixJob {
     build_input.triangleArray.flags = triangle_input_flags;
     build_input.triangleArray.numSbtRecords = 1;
 
+    self_build_input.type = OPTIX_BUILD_INPUT_TYPE_TRIANGLES;
+    d_self_vertices_ptr = reinterpret_cast<CUdeviceptr>(d_points);
+    self_build_input.triangleArray.vertexFormat = OPTIX_VERTEX_FORMAT_FLOAT3;
+    self_build_input.triangleArray.vertexStrideInBytes = sizeof(float) * 3;
+    self_build_input.triangleArray.numVertices =
+        static_cast<unsigned int>(points_mesh.vertices.size());
+    self_build_input.triangleArray.vertexBuffers = &d_self_vertices_ptr;
+    self_build_input.triangleArray.indexFormat =
+        OPTIX_INDICES_FORMAT_UNSIGNED_INT3;
+    self_build_input.triangleArray.indexStrideInBytes = sizeof(uint3);
+    self_build_input.triangleArray.numIndexTriplets =
+        static_cast<unsigned int>(points_mesh.triangles.size());
+    self_build_input.triangleArray.indexBuffer =
+        reinterpret_cast<CUdeviceptr>(d_self_indices);
+    self_build_input.triangleArray.flags = triangle_input_flags;
+    self_build_input.triangleArray.numSbtRecords = 1;
+
     accel_options.buildFlags = OPTIX_BUILD_FLAG_PREFER_FAST_TRACE;
     accel_options.operation = OPTIX_BUILD_OPERATION_BUILD;
     OCHK(optixAccelComputeMemoryUsage(runtime.context, &accel_options,
                                       &build_input, 1, &gas_sizes));
+    OCHK(optixAccelComputeMemoryUsage(runtime.context, &accel_options,
+                                      &self_build_input, 1,
+                                      &self_gas_sizes));
     CUCHK(cudaMalloc(reinterpret_cast<void **>(&d_temp),
                      gas_sizes.tempSizeInBytes));
     CUCHK(cudaMalloc(reinterpret_cast<void **>(&d_gas_output),
                      gas_sizes.outputSizeInBytes));
+    CUCHK(cudaMalloc(reinterpret_cast<void **>(&d_self_temp),
+                     self_gas_sizes.tempSizeInBytes));
+    CUCHK(cudaMalloc(reinterpret_cast<void **>(&d_self_gas_output),
+                     self_gas_sizes.outputSizeInBytes));
   }
 
   void enqueue() {
@@ -342,12 +392,20 @@ struct OptixJob {
     CUCHK(cudaMemcpyAsync(d_indices, h_indices.data(),
                           sizeof(uint3) * h_indices.size(),
                           cudaMemcpyHostToDevice, stream));
+    CUCHK(cudaMemcpyAsync(d_self_indices, h_self_indices.data(),
+                          sizeof(uint3) * h_self_indices.size(),
+                          cudaMemcpyHostToDevice, stream));
     CUCHK(cudaMemsetAsync(d_output, 0,
                           sizeof(unsigned int) * output.size(), stream));
 
     OCHK(optixAccelBuild(runtime.context, stream, &accel_options, &build_input,
                          1, d_temp, gas_sizes.tempSizeInBytes, d_gas_output,
                          gas_sizes.outputSizeInBytes, &gas, nullptr, 0));
+    OCHK(optixAccelBuild(runtime.context, stream, &accel_options,
+                         &self_build_input, 1, d_self_temp,
+                         self_gas_sizes.tempSizeInBytes, d_self_gas_output,
+                         self_gas_sizes.outputSizeInBytes, &self_gas, nullptr,
+                         0));
 
     SbtRecord<RayGenData> raygen_record = {};
     OCHK(optixSbtRecordPackHeader(runtime.raygen_pg, &raygen_record));
@@ -357,7 +415,8 @@ struct OptixJob {
         static_cast<long long>(points_mesh.vertices.size());
     raygen_record.data.has_mask = h_new_mask.empty() ? 0u : 1u;
     raygen_record.data.uM = d_output;
-    raygen_record.data.gas = gas;
+    raygen_record.data.cage_gas = gas;
+    raygen_record.data.self_gas = self_gas;
     CUCHK(cudaMemcpyAsync(reinterpret_cast<void *>(d_raygen_record),
                           &raygen_record, sizeof(raygen_record),
                           cudaMemcpyHostToDevice, stream));
@@ -392,12 +451,10 @@ vector<vector<pair<unsigned int, unsigned int>>>
 run_wave(const vector<pair<Mesh *, Mesh *>> &requests, size_t begin, size_t end,
          OptixRuntime::Impl &runtime) {
   vector<unique_ptr<OptixJob>> jobs;
-  jobs.reserve((end - begin) * 2);
+  jobs.reserve(end - begin);
   for (size_t i = begin; i < end; ++i) {
     jobs.push_back(
         make_unique<OptixJob>(*requests[i].first, *requests[i].second, runtime));
-    jobs.push_back(
-        make_unique<OptixJob>(*requests[i].first, *requests[i].first, runtime));
   }
 
   // cudaMalloc may synchronize the device, so finish every allocation before
@@ -414,14 +471,11 @@ run_wave(const vector<pair<Mesh *, Mesh *>> &requests, size_t begin, size_t end,
   vector<vector<pair<unsigned int, unsigned int>>> results(end - begin);
   for (size_t local_idx = 0; local_idx < end - begin; ++local_idx) {
     const Mesh &mesh = *requests[begin + local_idx].first;
-    const vector<unsigned int> &cage_hits = jobs[local_idx * 2]->output;
-    const vector<unsigned int> &self_hits = jobs[local_idx * 2 + 1]->output;
+    const vector<unsigned int> &hits = jobs[local_idx]->output;
     auto &edges = results[local_idx];
 
-    for (size_t segment = 0; segment < cage_hits.size(); ++segment) {
-      if (cage_hits[segment] == 2 || self_hits[segment] == 2)
-        continue;
-      if (self_hits[segment] || !cage_hits[segment])
+    for (size_t segment = 0; segment < hits.size(); ++segment) {
+      if (!hits[segment])
         continue;
 
       long long first, second;
@@ -463,8 +517,7 @@ compute_intersection_matrices(
         break;
       const Mesh &mesh = *requests[end].first;
       const size_t request_bytes =
-          estimate_job_bytes(mesh, *requests[end].second) +
-          estimate_job_bytes(mesh, mesh);
+          estimate_request_bytes(mesh, *requests[end].second);
       if (end > begin && estimated_bytes + request_bytes > budget)
         break;
       estimated_bytes += request_bytes;

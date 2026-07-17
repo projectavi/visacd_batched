@@ -14,7 +14,8 @@ struct RayGenData {
   long long n_points;
   unsigned int has_mask;
   unsigned int *uM;
-  OptixTraversableHandle gas;
+  OptixTraversableHandle cage_gas;
+  OptixTraversableHandle self_gas;
 };
 struct MissData {};
 struct HitgroupData {

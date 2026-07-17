@@ -8,7 +8,8 @@ struct RayGenData
     long long n_points;
     unsigned int has_mask;
     unsigned int *uM; //[n_points*(n_points-1)/2] // output adjacency matrix (upper triangular, row-major)
-    OptixTraversableHandle gas;
+    OptixTraversableHandle cage_gas;
+    OptixTraversableHandle self_gas;
 };
 
 struct HitgroupData
@@ -45,6 +46,20 @@ static __forceinline__ __device__ void linear_to_pair(long long k, long long n, 
     j = static_cast<long long>(k + i + 1 - n * (n - 1) / 2 + (n - i) * ((n - i) - 1) / 2);
 }
 
+static __forceinline__ __device__ unsigned int trace_segment(
+    OptixTraversableHandle gas, const float3 &p, const float3 &dir,
+    float seg_len)
+{
+    unsigned int payload = 0u;
+    optixTrace(
+        gas, p, dir,
+        0.001f, seg_len, 0.0f, 0xFF,
+        OPTIX_RAY_FLAG_DISABLE_CLOSESTHIT |
+            OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT,
+        0, 1, 0, payload);
+    return payload;
+}
+
 // --------------- Raygen ---------------
 extern "C" __global__ void __raygen__rg()
 {
@@ -64,7 +79,7 @@ extern "C" __global__ void __raygen__rg()
         // Skip if neither point is new
         if (rg->new_mask[i] == 0 && rg->new_mask[j] == 0)
         {
-            rg->uM[launch_idx] = 2u;
+            rg->uM[launch_idx] = 0u;
             return;
         }
         // //Skip if both points are new (avoids bad intersecting edges)
@@ -90,24 +105,14 @@ extern "C" __global__ void __raygen__rg()
     const float inv_len = 1.0f / seg_len;
     const float3 dir = make_float3(dir_raw.x * inv_len, dir_raw.y * inv_len, dir_raw.z * inv_len);
 
-    unsigned int payload = 0u; // 0 = no hit, 1 = hit
-    unsigned int p0 = payload;
+    if (!trace_segment(rg->cage_gas, p, dir, seg_len))
+    {
+        rg->uM[launch_idx] = 0u;
+        return;
+    }
 
-    optixTrace(
-        rg->gas,
-        p, dir,
-        0.001f,  // tmin - avoid self-intersection
-        seg_len, // tmax: limit to segment
-        0.0f,    // rayTime
-        0xFF,    // visibility mask
-        OPTIX_RAY_FLAG_DISABLE_CLOSESTHIT |
-            OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT, // we only need first hit
-        0,                                         // SBT offset
-        1,                                         // SBT stride
-        0,                                         // missSBTIndex
-        p0);
-
-    rg->uM[launch_idx] = p0;
+    rg->uM[launch_idx] =
+        trace_segment(rg->self_gas, p, dir, seg_len) ? 0u : 1u;
 }
 
 
