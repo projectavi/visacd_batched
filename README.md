@@ -127,8 +127,10 @@ results = visacd.process_batch(
 The returned list has one `ProcessResult` per input mesh in the same order.
 All meshes share `concavity` and `num_parts`; their vertex counts may differ.
 
-Batching targets the current CUDA device. Intersection and plane-scoring jobs run
-on independent streams and are divided into memory-aware waves:
+Batching targets the current CUDA device. OptiX intersection jobs run on
+independent persistent streams, while small plane-scoring jobs are packed into
+shared GPU launches. Streams and grow-only device buffers are reused throughout
+the complete batch, and work is divided into memory-aware waves:
 
 - `visacd.config.max_batch_size = 0` lets VisACD choose the wave size. Set a
   positive value to cap the number of work items processed in one GPU wave.

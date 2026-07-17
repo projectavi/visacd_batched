@@ -347,6 +347,7 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
   });
 
   OptixRuntime optix;
+  PlaneScoringRuntime plane_scoring;
   vector<pair<Mesh *, Mesh *>> initial_requests;
   for (BatchState &state : states) {
     for (Mesh &part : state.parts)
@@ -442,7 +443,8 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
            static_cast<int>(split.part.vertices.size()),
            static_cast<int>(split.part.intersecting_edges.size())});
     }
-    classify_and_rate_planes_batch(score_inputs, configured_batch_size(),
+    classify_and_rate_planes_batch(score_inputs, plane_scoring,
+                                   configured_batch_size(),
                                    config.batch_memory_fraction);
 
     vector<vector<PendingPart>> pending_by_work(work.size());
