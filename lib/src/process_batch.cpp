@@ -11,6 +11,7 @@
 #include <convex_hull_batch.hpp>
 #include <core.hpp>
 #include <cost.hpp>
+#include <cstdlib>
 #include <deque>
 #include <device_mesh.hpp>
 #include <exception>
@@ -712,28 +713,21 @@ size_t configured_gpu_host_threads(size_t cpu_threads) {
       1, min(cpu_threads, kGpuWorkKindCount));
 }
 
-} // namespace
+string optix_configuration_key() {
+  const char *preference = getenv("VISACD_OPTIX_BUILD_PREFERENCE");
+  const char *concurrency = getenv("VISACD_OPTIX_MAX_CONCURRENCY");
+  return string(preference && *preference ? preference : "trace") + ":" +
+         string(concurrency && *concurrency ? concurrency : "automatic");
+}
 
-vector<ProcessResult> process_batch(MeshList meshes, double concavity,
-                                    int num_parts) {
-  validate_parameters(meshes, concavity, num_parts);
-  if (meshes.empty())
-    return {};
+struct PersistentBatchResources {
+  unique_ptr<BatchExecutor> executor;
+  unique_ptr<BatchExecutor> gpu_executor;
+  size_t executor_threads = 0;
+  size_t gpu_executor_threads = 0;
 
-  const size_t cpu_threads = configured_cpu_threads(meshes.size());
-  BatchExecutor executor(cpu_threads);
-  const size_t gpu_host_threads =
-      configured_gpu_host_threads(cpu_threads);
-  BatchExecutor gpu_executor(gpu_host_threads);
-  vector<BatchState> states(meshes.size());
-  vector<ProcessResult> results(meshes.size());
-  PipelineCoordinator coordinator(
-      executor, gpu_executor, states.size(),
-      configured_gpu_batch_threshold(cpu_threads));
-  const double gpu_memory_fraction =
-      config.batch_memory_fraction /
-      static_cast<double>(gpu_host_threads);
-  OptixRuntime optix;
+  unique_ptr<OptixRuntime> optix;
+  string optix_key;
   CandidatePlaneRuntime candidate_planes;
   PlaneScoringRuntime plane_scoring;
   HausdorffRuntime hausdorff;
@@ -743,6 +737,73 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
   ConvexHullBatchRuntime convex_hulls;
   FlatSurfaceBatchRuntime flat_surfaces;
   MergeBatchRuntime merges;
+
+  void configure_executors(size_t cpu_threads, size_t gpu_threads) {
+    if (!executor || executor_threads != cpu_threads) {
+      auto replacement = make_unique<BatchExecutor>(cpu_threads);
+      executor = move(replacement);
+      executor_threads = cpu_threads;
+    }
+    if (!gpu_executor || gpu_executor_threads != gpu_threads) {
+      auto replacement = make_unique<BatchExecutor>(gpu_threads);
+      gpu_executor = move(replacement);
+      gpu_executor_threads = gpu_threads;
+    }
+  }
+
+  OptixRuntime &configured_optix() {
+    const string requested_key = optix_configuration_key();
+    if (!optix || optix_key != requested_key) {
+      auto replacement = make_unique<OptixRuntime>();
+      optix = move(replacement);
+      optix_key = requested_key;
+    }
+    return *optix;
+  }
+};
+
+PersistentBatchResources &persistent_batch_resources() {
+  // Runtime state is local to the calling thread so C++ callers can invoke
+  // independent batches concurrently without sharing streams or scratch
+  // buffers. Repeated calls on a thread retain executors, CUDA streams,
+  // pinned buffers, and device allocation capacity.
+  thread_local PersistentBatchResources resources;
+  return resources;
+}
+
+} // namespace
+
+vector<ProcessResult> process_batch(MeshList meshes, double concavity,
+                                    int num_parts) {
+  validate_parameters(meshes, concavity, num_parts);
+  if (meshes.empty())
+    return {};
+
+  const size_t cpu_threads = configured_cpu_threads(meshes.size());
+  const size_t gpu_host_threads =
+      configured_gpu_host_threads(cpu_threads);
+  PersistentBatchResources &resources = persistent_batch_resources();
+  resources.configure_executors(cpu_threads, gpu_host_threads);
+  BatchExecutor &executor = *resources.executor;
+  BatchExecutor &gpu_executor = *resources.gpu_executor;
+  vector<BatchState> states(meshes.size());
+  vector<ProcessResult> results(meshes.size());
+  PipelineCoordinator coordinator(
+      executor, gpu_executor, states.size(),
+      configured_gpu_batch_threshold(cpu_threads));
+  const double gpu_memory_fraction =
+      config.batch_memory_fraction /
+      static_cast<double>(gpu_host_threads);
+  OptixRuntime &optix = resources.configured_optix();
+  CandidatePlaneRuntime &candidate_planes = resources.candidate_planes;
+  PlaneScoringRuntime &plane_scoring = resources.plane_scoring;
+  HausdorffRuntime &hausdorff = resources.hausdorff;
+  DeviceMeshRuntime &device_meshes = resources.device_meshes;
+  ClipBatchRuntime &clip_batch = resources.clip_batch;
+  ComponentBatchRuntime &component_batch = resources.component_batch;
+  ConvexHullBatchRuntime &convex_hulls = resources.convex_hulls;
+  FlatSurfaceBatchRuntime &flat_surfaces = resources.flat_surfaces;
+  MergeBatchRuntime &merges = resources.merges;
 
   const uint32_t batch_seed = random_engine();
   for (size_t i = 0; i < states.size(); ++i) {
