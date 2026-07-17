@@ -14,8 +14,8 @@ ROOT = Path(__file__).resolve().parents[1]
 RUN_GPU_TESTS = os.environ.get("VISACD_RUN_GPU_TESTS") == "1"
 
 
-def load_cow(x_offset=0.0):
-    tm = trimesh.load(ROOT / "data" / "samples" / "cow.obj", force="mesh")
+def load_sample(name, x_offset=0.0):
+    tm = trimesh.load(ROOT / "data" / "samples" / name, force="mesh")
     vertices = np.asarray(tm.vertices, dtype=np.float64).copy()
     vertices[:, 0] += x_offset
 
@@ -25,6 +25,10 @@ def load_cow(x_offset=0.0):
         np.asarray(tm.faces, dtype=np.int32)
     )
     return mesh
+
+
+def load_cow(x_offset=0.0):
+    return load_sample("cow.obj", x_offset)
 
 
 def result_digest(results):
@@ -150,6 +154,31 @@ class BatchGpuTests(unittest.TestCase):
         second_bounds = result_x_bounds(automatic[1])
         self.assertLess(first_bounds[1], 0.0)
         self.assertGreater(second_bounds[0], 0.0)
+
+    def test_mixed_mesh_pipeline_is_repeatable(self):
+        def run(max_batch_size, batch_cpu_threads):
+            visacd.config.max_batch_size = max_batch_size
+            visacd.config.batch_cpu_threads = batch_cpu_threads
+            visacd.set_seed(4321)
+            return visacd.process_batch(
+                [
+                    load_sample("Bottle.obj"),
+                    load_sample("teapot.obj"),
+                    load_sample("cow.obj"),
+                ],
+                concavity=0.04,
+                num_parts=3,
+            )
+
+        automatic = run(max_batch_size=0, batch_cpu_threads=0)
+        repeated = run(max_batch_size=0, batch_cpu_threads=0)
+        one_request_waves = run(max_batch_size=1, batch_cpu_threads=0)
+        one_cpu_thread = run(max_batch_size=0, batch_cpu_threads=1)
+
+        expected_digest = result_digest(automatic)
+        self.assertEqual(expected_digest, result_digest(repeated))
+        self.assertEqual(expected_digest, result_digest(one_request_waves))
+        self.assertEqual(expected_digest, result_digest(one_cpu_thread))
 
 
 if __name__ == "__main__":
