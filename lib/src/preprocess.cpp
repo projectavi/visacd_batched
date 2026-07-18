@@ -18,6 +18,7 @@
 #include <preprocess_cuda.hpp>
 #include <preprocess_expand_cuda.hpp>
 #include <preprocess_renormalize_cuda.hpp>
+#include <preprocess_surface_post_cuda.hpp>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -685,6 +686,199 @@ bool renormalize_sparse_cuda(
   return true;
 }
 
+struct SparseSurfacePostBatchRequest {
+  SparseSurfacePostGrid *grid = nullptr;
+  bool done = false;
+  exception_ptr error;
+};
+
+class SparseSurfacePostCudaBatcher {
+public:
+  void process(SparseSurfacePostGrid &grid) {
+    auto request = make_shared<SparseSurfacePostBatchRequest>();
+    request->grid = &grid;
+    bool leader = false;
+    {
+      lock_guard<mutex> lock(mutex_);
+      queue_.push_back(request);
+      if (!processing_) {
+        processing_ = true;
+        leader = true;
+      }
+      condition_.notify_all();
+    }
+    if (!leader) {
+      unique_lock<mutex> lock(mutex_);
+      condition_.wait(lock, [&]() { return request->done; });
+      if (request->error)
+        rethrow_exception(request->error);
+      return;
+    }
+    while (true) {
+      vector<shared_ptr<SparseSurfacePostBatchRequest>> batch;
+      {
+        unique_lock<mutex> lock(mutex_);
+        condition_.wait_for(lock, chrono::microseconds(250), [&]() {
+          return queue_.size() >= 32;
+        });
+        const size_t count = min<size_t>(200, queue_.size());
+        batch.reserve(count);
+        for (size_t index = 0; index < count; ++index) {
+          batch.push_back(move(queue_.front()));
+          queue_.pop_front();
+        }
+      }
+      exception_ptr error;
+      try {
+        vector<SparseSurfacePostGrid *> grids;
+        grids.reserve(batch.size());
+        size_t leaf_count = 0;
+        for (const auto &pending : batch) {
+          grids.push_back(pending->grid);
+          leaf_count += pending->grid->active.size() /
+                        NarrowbandLeaf::SIZE;
+        }
+        if (environment_enabled("VISACD_PREPROCESS_SIGN_TRACE")) {
+          cerr << "[visacd surface post] meshes=" << batch.size()
+               << " leaves=" << leaf_count << '\n';
+        }
+        postprocess_sparse_surface_cuda_batch(grids);
+      } catch (...) {
+        error = current_exception();
+      }
+      bool finished = false;
+      {
+        lock_guard<mutex> lock(mutex_);
+        for (const auto &pending : batch) {
+          pending->error = error;
+          pending->done = true;
+        }
+        if (queue_.empty()) {
+          processing_ = false;
+          finished = true;
+        }
+        condition_.notify_all();
+      }
+      if (finished)
+        break;
+    }
+    if (request->error)
+      rethrow_exception(request->error);
+  }
+
+private:
+  mutex mutex_;
+  condition_variable condition_;
+  deque<shared_ptr<SparseSurfacePostBatchRequest>> queue_;
+  bool processing_ = false;
+};
+
+SparseSurfacePostCudaBatcher &sparse_surface_post_cuda_batcher() {
+  static SparseSurfacePostCudaBatcher batcher;
+  return batcher;
+}
+
+bool postprocess_sparse_surface_cuda(
+    NarrowbandTree &distance_tree, NarrowbandIndexTree &index_tree,
+    const vector<NarrowbandLeaf *> &nodes, const Mesh &source_mesh,
+    double scale) {
+  if (nodes.empty())
+    return true;
+  if (nodes.size() >
+      static_cast<size_t>(numeric_limits<int>::max()))
+    return false;
+  SparseSurfacePostGrid grid;
+  grid.mesh = &source_mesh;
+  grid.scale = scale;
+  const size_t cell_count =
+      nodes.size() * static_cast<size_t>(NarrowbandLeaf::SIZE);
+  grid.leaf_origins.resize(nodes.size() * 3);
+  grid.active.resize(cell_count);
+  grid.values.resize(cell_count);
+  grid.triangle_indices.resize(
+      cell_count, Int32(util::INVALID_IDX));
+  grid.neighbour_indices.resize(nodes.size() * 27, -1);
+  grid.neighbour_values.resize(nodes.size() * 27);
+
+  unordered_map<const NarrowbandLeaf *, int> leaf_indices;
+  leaf_indices.reserve(nodes.size());
+  for (size_t leaf = 0; leaf < nodes.size(); ++leaf)
+    leaf_indices.emplace(nodes[leaf], static_cast<int>(leaf));
+  tree::ValueAccessor<NarrowbandTree> distance_accessor(distance_tree);
+  tree::ValueAccessor<NarrowbandIndexTree> index_accessor(index_tree);
+  for (size_t leaf = 0; leaf < nodes.size(); ++leaf) {
+    const NarrowbandLeaf &distance_leaf = *nodes[leaf];
+    const auto *index_leaf =
+        index_accessor.probeConstLeaf(distance_leaf.origin());
+    if (!index_leaf)
+      throw logic_error(
+          "Sparse surface distance and index trees diverged");
+    const Coord origin = distance_leaf.origin();
+    for (int axis = 0; axis < 3; ++axis)
+      grid.leaf_origins[leaf * 3 + axis] = origin[axis];
+    const size_t cell_offset =
+        leaf * static_cast<size_t>(NarrowbandLeaf::SIZE);
+    copy_n(distance_leaf.buffer().data(), NarrowbandLeaf::SIZE,
+           grid.values.begin() + cell_offset);
+    copy_n(index_leaf->buffer().data(), NarrowbandLeaf::SIZE,
+           grid.triangle_indices.begin() + cell_offset);
+    const auto &mask = distance_leaf.getValueMask();
+    for (Index position = 0; position < NarrowbandLeaf::SIZE;
+         ++position) {
+      grid.active[cell_offset + position] =
+          mask.isOn(position) ? 1 : 0;
+    }
+    size_t slot = 0;
+    for (int dx = -1; dx <= 1; ++dx) {
+      for (int dy = -1; dy <= 1; ++dy) {
+        for (int dz = -1; dz <= 1; ++dz, ++slot) {
+          Coord adjacent_origin = origin;
+          adjacent_origin[0] += dx * NarrowbandLeaf::DIM;
+          adjacent_origin[1] += dy * NarrowbandLeaf::DIM;
+          adjacent_origin[2] += dz * NarrowbandLeaf::DIM;
+          const NarrowbandLeaf *adjacent =
+              distance_accessor.probeConstLeaf(adjacent_origin);
+          const size_t packed = leaf * 27 + slot;
+          if (adjacent) {
+            const auto found = leaf_indices.find(adjacent);
+            if (found == leaf_indices.end())
+              throw logic_error(
+                  "Sparse surface leaf topology diverged");
+            grid.neighbour_indices[packed] = found->second;
+          } else {
+            grid.neighbour_values[packed] =
+                distance_accessor.getValue(adjacent_origin);
+          }
+        }
+      }
+    }
+  }
+
+  sparse_surface_post_cuda_batcher().process(grid);
+  for (size_t leaf = 0; leaf < nodes.size(); ++leaf) {
+    NarrowbandLeaf &distance_leaf = *nodes[leaf];
+    auto *index_leaf =
+        index_accessor.probeLeaf(distance_leaf.origin());
+    if (!index_leaf)
+      throw logic_error(
+          "Sparse surface distance and index trees diverged");
+    double *values = distance_leaf.buffer().data();
+    const size_t cell_offset =
+        leaf * static_cast<size_t>(NarrowbandLeaf::SIZE);
+    for (Index position = 0; position < NarrowbandLeaf::SIZE;
+         ++position) {
+      if (!distance_leaf.getValueMask().isOn(position))
+        continue;
+      values[position] = grid.values[cell_offset + position];
+      if (!grid.active[cell_offset + position]) {
+        distance_leaf.setValueOff(position);
+        index_leaf->setValueOff(position);
+      }
+    }
+  }
+  return true;
+}
+
 bool expand_narrowband_dense(
     NarrowbandTree &distance_tree, NarrowbandIndexTree &index_tree,
     const Mesh &source_mesh, double scale, double exterior_width,
@@ -910,26 +1104,54 @@ DoubleGrid::Ptr signed_distance_field_from_surface(
   nodes.reserve(distance_tree.leafCount());
   distance_tree.getNodes(nodes);
   const tbb::blocked_range<size_t> node_range(0, nodes.size());
-  using SignOperation =
-      tools::mesh_to_volume_internal::ComputeIntersectingVoxelSign<
-          TreeType, Adapter>;
   const auto sign_start = PreprocessClock::now();
-  tbb::parallel_for(node_range,
-                    SignOperation(nodes, distance_tree, index_tree, mesh));
-  if (metrics)
-    metrics->sdf_sign_ns = elapsed_ns(sign_start);
-  const auto validate_start = PreprocessClock::now();
-  tbb::parallel_for(
-      node_range,
-      tools::mesh_to_volume_internal::ValidateIntersectingVoxels<TreeType>(
-          distance_tree, nodes));
-  if (metrics)
-    metrics->sdf_validate_ns = elapsed_ns(validate_start);
-  const auto cleanup_start = PreprocessClock::now();
-  tbb::parallel_for(
-      node_range,
-      tools::mesh_to_volume_internal::RemoveSelfIntersectingSurface<TreeType>(
-          nodes, distance_tree, index_tree));
+  auto cleanup_start = sign_start;
+  bool cuda_surface_postprocessed = false;
+  if (environment_enabled("VISACD_ENABLE_CUDA_PREPROCESS_SIGN")) {
+    try {
+      cuda_surface_postprocessed = postprocess_sparse_surface_cuda(
+          distance_tree, index_tree, nodes, source_mesh, scale);
+    } catch (const exception &error) {
+      if (environment_enabled("VISACD_PREPROCESS_SIGN_TRACE"))
+        cerr << "[visacd surface post] fallback=" << error.what()
+             << '\n';
+      cuda_surface_postprocessed = false;
+    } catch (...) {
+      if (environment_enabled("VISACD_PREPROCESS_SIGN_TRACE"))
+        cerr << "[visacd surface post] fallback=unknown exception\n";
+      cuda_surface_postprocessed = false;
+    }
+  }
+  if (cuda_surface_postprocessed) {
+    if (metrics) {
+      metrics->sdf_sign_ns = elapsed_ns(sign_start);
+      metrics->sdf_validate_ns = 0;
+    }
+    cleanup_start = PreprocessClock::now();
+  } else {
+    using SignOperation =
+        tools::mesh_to_volume_internal::ComputeIntersectingVoxelSign<
+            TreeType, Adapter>;
+    tbb::parallel_for(
+        node_range,
+        SignOperation(nodes, distance_tree, index_tree, mesh));
+    if (metrics)
+      metrics->sdf_sign_ns = elapsed_ns(sign_start);
+    const auto validate_start = PreprocessClock::now();
+    tbb::parallel_for(
+        node_range,
+        tools::mesh_to_volume_internal::
+            ValidateIntersectingVoxels<TreeType>(
+                distance_tree, nodes));
+    if (metrics)
+      metrics->sdf_validate_ns = elapsed_ns(validate_start);
+    cleanup_start = PreprocessClock::now();
+    tbb::parallel_for(
+        node_range,
+        tools::mesh_to_volume_internal::
+            RemoveSelfIntersectingSurface<TreeType>(
+                nodes, distance_tree, index_tree));
+  }
   tools::pruneInactive(distance_tree, true);
   tools::pruneInactive(index_tree, true);
   if (metrics)
