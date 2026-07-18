@@ -43,7 +43,7 @@ DoubleGrid::Ptr signed_distance_field_from_surface(
     const vector<Vec3s> &points, const vector<Vec3I> &triangles,
     const math::Transform &transform,
     const vector<SurfaceVoxelRecord> &surface, float exterior_band_width,
-    float interior_band_width) {
+    float interior_band_width, ManifoldPreprocessMetrics *metrics) {
   using GridType = DoubleGrid;
   using TreeType = GridType::TreeType;
   using LeafNodeType = TreeType::LeafNodeType;
@@ -53,6 +53,7 @@ DoubleGrid::Ptr signed_distance_field_from_surface(
   using BoolTreeType = TreeType::ValueConverter<bool>::Type;
   using Adapter = tools::QuadAndTriangleDataAdapter<Vec3s, Vec3I>;
 
+  const auto seed_grid_start = PreprocessClock::now();
   GridType::Ptr distance_grid(
       new GridType(numeric_limits<ValueType>::max()));
   distance_grid->setTransform(transform.copy());
@@ -76,8 +77,13 @@ DoubleGrid::Ptr signed_distance_field_from_surface(
   if (interior_width < numeric_limits<ValueType>::max())
     interior_width *= voxel_size;
   Adapter mesh(points, triangles);
+  if (metrics)
+    metrics->sdf_seed_grid_ns = elapsed_ns(seed_grid_start);
 
+  const auto trace_start = PreprocessClock::now();
   tools::traceExteriorBoundaries(distance_tree);
+  if (metrics)
+    metrics->sdf_trace_ns = elapsed_ns(trace_start);
   vector<LeafNodeType *> nodes;
   nodes.reserve(distance_tree.leafCount());
   distance_tree.getNodes(nodes);
@@ -85,18 +91,27 @@ DoubleGrid::Ptr signed_distance_field_from_surface(
   using SignOperation =
       tools::mesh_to_volume_internal::ComputeIntersectingVoxelSign<
           TreeType, Adapter>;
+  const auto sign_start = PreprocessClock::now();
   tbb::parallel_for(node_range,
                     SignOperation(nodes, distance_tree, index_tree, mesh));
+  if (metrics)
+    metrics->sdf_sign_ns = elapsed_ns(sign_start);
+  const auto validate_start = PreprocessClock::now();
   tbb::parallel_for(
       node_range,
       tools::mesh_to_volume_internal::ValidateIntersectingVoxels<TreeType>(
           distance_tree, nodes));
+  if (metrics)
+    metrics->sdf_validate_ns = elapsed_ns(validate_start);
+  const auto cleanup_start = PreprocessClock::now();
   tbb::parallel_for(
       node_range,
       tools::mesh_to_volume_internal::RemoveSelfIntersectingSurface<TreeType>(
           nodes, distance_tree, index_tree));
   tools::pruneInactive(distance_tree, true);
   tools::pruneInactive(index_tree, true);
+  if (metrics)
+    metrics->sdf_cleanup_ns = elapsed_ns(cleanup_start);
 
   if (distance_tree.activeVoxelCount() == 0) {
     distance_tree.clear();
@@ -107,6 +122,7 @@ DoubleGrid::Ptr signed_distance_field_from_surface(
   nodes.clear();
   nodes.reserve(distance_tree.leafCount());
   distance_tree.getNodes(nodes);
+  const auto transform_flood_start = PreprocessClock::now();
   tbb::parallel_for(
       tbb::blocked_range<size_t>(0, nodes.size()),
       tools::mesh_to_volume_internal::TransformValues<TreeType>(nodes,
@@ -115,8 +131,12 @@ DoubleGrid::Ptr signed_distance_field_from_surface(
   distance_tree.root().setBackground(exterior_width, false);
   tools::signedFloodFillWithValues(distance_tree, exterior_width,
                                    -interior_width);
+  if (metrics)
+    metrics->sdf_transform_flood_ns =
+        elapsed_ns(transform_flood_start);
 
   const ValueType minimum_band_width = voxel_size * ValueType(2.0);
+  const auto expand_start = PreprocessClock::now();
   if (interior_width > minimum_band_width ||
       exterior_width > minimum_band_width) {
     BoolTreeType mask_tree(false);
@@ -157,7 +177,10 @@ DoubleGrid::Ptr signed_distance_field_from_surface(
         break;
     }
   }
+  if (metrics)
+    metrics->sdf_expand_ns = elapsed_ns(expand_start);
 
+  const auto renormalize_start = PreprocessClock::now();
   index_grid.clear();
   nodes.clear();
   nodes.reserve(distance_tree.leafCount());
@@ -193,6 +216,8 @@ DoubleGrid::Ptr signed_distance_field_from_surface(
             nodes, exterior_width, interior_width));
     tools::pruneLevelSet(distance_tree, exterior_width, -interior_width);
   }
+  if (metrics)
+    metrics->sdf_renormalize_ns = elapsed_ns(renormalize_start);
   return distance_grid;
 }
 
@@ -310,7 +335,7 @@ bool sdf_manifold(Mesh &input, Mesh &output, double scale, double level_set,
   if (provided_surface) {
     sgrid = signed_distance_field_from_surface(
         points, tris, *xform, *provided_surface,
-        static_cast<float>(level_set * scale + 1.0), 3.0f);
+        static_cast<float>(level_set * scale + 1.0), 3.0f, metrics);
   } else if (use_cuda) {
     try {
       static thread_local ManifoldCudaRuntime runtime;
@@ -323,7 +348,7 @@ bool sdf_manifold(Mesh &input, Mesh &output, double scale, double level_set,
       }
       sgrid = signed_distance_field_from_surface(
           points, tris, *xform, surface.records,
-          static_cast<float>(level_set * scale + 1.0), 3.0f);
+          static_cast<float>(level_set * scale + 1.0), 3.0f, metrics);
     } catch (const exception &error) {
       if (fallback_reason)
         *fallback_reason = error.what();

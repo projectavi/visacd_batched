@@ -68,6 +68,14 @@ enum class ProfileStage {
   preprocess_copy,
   preprocess_marshal,
   preprocess_sdf,
+  preprocess_sdf_seed,
+  preprocess_sdf_trace,
+  preprocess_sdf_sign,
+  preprocess_sdf_validate,
+  preprocess_sdf_cleanup,
+  preprocess_sdf_transform_flood,
+  preprocess_sdf_expand,
+  preprocess_sdf_renormalize,
   preprocess_gpu,
   preprocess_surface,
   preprocess_output,
@@ -123,6 +131,14 @@ public:
     static const array<const char *, kProfileStageCount> names = {
         "preprocess",         "preprocess_copy",
         "preprocess_marshal", "preprocess_sdf",
+        "preprocess_sdf_seed",
+        "preprocess_sdf_trace",
+        "preprocess_sdf_sign",
+        "preprocess_sdf_validate",
+        "preprocess_sdf_cleanup",
+        "preprocess_sdf_transform_flood",
+        "preprocess_sdf_expand",
+        "preprocess_sdf_renormalize",
         "preprocess_gpu",
         "preprocess_surface", "preprocess_output",
         "flat_surfaces",      "components_gpu",
@@ -250,6 +266,31 @@ void profiled_manifold_preprocess(Mesh &mesh, double scale,
                     metrics.input_triangles);
     profiler.record(ProfileStage::preprocess_sdf,
                     chrono::nanoseconds(metrics.mesh_to_sdf_ns),
+                    metrics.active_voxels);
+    profiler.record(ProfileStage::preprocess_sdf_seed,
+                    chrono::nanoseconds(metrics.sdf_seed_grid_ns),
+                    metrics.active_voxels);
+    profiler.record(ProfileStage::preprocess_sdf_trace,
+                    chrono::nanoseconds(metrics.sdf_trace_ns),
+                    metrics.active_voxels);
+    profiler.record(ProfileStage::preprocess_sdf_sign,
+                    chrono::nanoseconds(metrics.sdf_sign_ns),
+                    metrics.active_voxels);
+    profiler.record(ProfileStage::preprocess_sdf_validate,
+                    chrono::nanoseconds(metrics.sdf_validate_ns),
+                    metrics.active_voxels);
+    profiler.record(ProfileStage::preprocess_sdf_cleanup,
+                    chrono::nanoseconds(metrics.sdf_cleanup_ns),
+                    metrics.active_voxels);
+    profiler.record(
+        ProfileStage::preprocess_sdf_transform_flood,
+        chrono::nanoseconds(metrics.sdf_transform_flood_ns),
+        metrics.active_voxels);
+    profiler.record(ProfileStage::preprocess_sdf_expand,
+                    chrono::nanoseconds(metrics.sdf_expand_ns),
+                    metrics.active_voxels);
+    profiler.record(ProfileStage::preprocess_sdf_renormalize,
+                    chrono::nanoseconds(metrics.sdf_renormalize_ns),
                     metrics.active_voxels);
     profiler.record(ProfileStage::preprocess_surface,
                     chrono::nanoseconds(metrics.volume_to_mesh_ns),

@@ -13,6 +13,14 @@ struct ManifoldPreprocessMetrics {
   long long copy_input_ns = 0;
   long long marshal_input_ns = 0;
   long long mesh_to_sdf_ns = 0;
+  long long sdf_seed_grid_ns = 0;
+  long long sdf_trace_ns = 0;
+  long long sdf_sign_ns = 0;
+  long long sdf_validate_ns = 0;
+  long long sdf_cleanup_ns = 0;
+  long long sdf_transform_flood_ns = 0;
+  long long sdf_expand_ns = 0;
+  long long sdf_renormalize_ns = 0;
   long long volume_to_mesh_ns = 0;
   long long marshal_output_ns = 0;
   size_t input_vertices = 0;
