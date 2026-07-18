@@ -10,6 +10,8 @@
 #include <components_batch.hpp>
 #include <convex_hull_batch.hpp>
 #include <core.hpp>
+#include <cstdint>
+#include <cstring>
 #include <cost.hpp>
 #include <cstdlib>
 #include <deque>
@@ -183,31 +185,80 @@ private:
   chrono::steady_clock::time_point start_;
 };
 
+uint64_t manifold_output_hash(const Mesh &mesh) {
+  uint64_t hash = 1469598103934665603ULL;
+  auto mix = [&](uint64_t value) {
+    hash ^= value;
+    hash *= 1099511628211ULL;
+  };
+  mix(mesh.vertices.size());
+  mix(mesh.triangles.size());
+  for (const Vec3D &vertex : mesh.vertices) {
+    for (double coordinate : vertex) {
+      uint64_t bits = 0;
+      memcpy(&bits, &coordinate, sizeof(bits));
+      mix(bits);
+    }
+  }
+  for (const array<int, 3> &triangle : mesh.triangles) {
+    mix(static_cast<uint32_t>(triangle[0]));
+    mix(static_cast<uint32_t>(triangle[1]));
+    mix(static_cast<uint32_t>(triangle[2]));
+  }
+  return hash;
+}
+
 void profiled_manifold_preprocess(Mesh &mesh, double scale,
-                                  double level_set,
+                                  double level_set, const char *kind,
                                   StageProfiler &profiler) {
-  if (!profiler.enabled()) {
+  const char *trace_value = getenv("VISACD_PREPROCESS_TRACE");
+  const bool trace = trace_value && *trace_value &&
+                     string(trace_value) != "0";
+  if (!profiler.enabled() && !trace) {
     manifold_preprocess(mesh, scale, level_set);
     return;
   }
 
   ManifoldPreprocessMetrics metrics;
   manifold_preprocess(mesh, scale, level_set, &metrics);
-  profiler.record(ProfileStage::preprocess_copy,
-                  chrono::nanoseconds(metrics.copy_input_ns),
-                  metrics.input_triangles);
-  profiler.record(ProfileStage::preprocess_marshal,
-                  chrono::nanoseconds(metrics.marshal_input_ns),
-                  metrics.input_triangles);
-  profiler.record(ProfileStage::preprocess_sdf,
-                  chrono::nanoseconds(metrics.mesh_to_sdf_ns),
-                  metrics.active_voxels);
-  profiler.record(ProfileStage::preprocess_surface,
-                  chrono::nanoseconds(metrics.volume_to_mesh_ns),
-                  metrics.active_voxels);
-  profiler.record(ProfileStage::preprocess_output,
-                  chrono::nanoseconds(metrics.marshal_output_ns),
-                  metrics.output_triangles);
+  if (profiler.enabled()) {
+    profiler.record(ProfileStage::preprocess_copy,
+                    chrono::nanoseconds(metrics.copy_input_ns),
+                    metrics.input_triangles);
+    profiler.record(ProfileStage::preprocess_marshal,
+                    chrono::nanoseconds(metrics.marshal_input_ns),
+                    metrics.input_triangles);
+    profiler.record(ProfileStage::preprocess_sdf,
+                    chrono::nanoseconds(metrics.mesh_to_sdf_ns),
+                    metrics.active_voxels);
+    profiler.record(ProfileStage::preprocess_surface,
+                    chrono::nanoseconds(metrics.volume_to_mesh_ns),
+                    metrics.active_voxels);
+    profiler.record(ProfileStage::preprocess_output,
+                    chrono::nanoseconds(metrics.marshal_output_ns),
+                    metrics.output_triangles);
+  }
+
+  if (trace) {
+    static mutex trace_mutex;
+    ostringstream output;
+    output << fixed << setprecision(9)
+           << "[visacd preprocess] kind=" << kind
+           << " scale=" << scale << " level_set=" << level_set
+           << " input_vertices=" << metrics.input_vertices
+           << " input_triangles=" << metrics.input_triangles
+           << " active_voxels=" << metrics.active_voxels
+           << " output_vertices=" << metrics.output_vertices
+           << " output_triangles=" << metrics.output_triangles
+           << " sdf_ms="
+           << static_cast<double>(metrics.mesh_to_sdf_ns) / 1.0e6
+           << " surface_ms="
+           << static_cast<double>(metrics.volume_to_mesh_ns) / 1.0e6
+           << " hash=" << hex << manifold_output_hash(mesh) << "\n";
+    lock_guard<mutex> lock(trace_mutex);
+    cerr << output.str();
+    cerr.flush();
+  }
 }
 
 struct PartCache {
@@ -955,16 +1006,18 @@ void initialize_state(Mesh mesh, size_t mesh_index, BatchState &state,
                       " verts)...");
 
   Mesh original_mesh = mesh.copy();
-  profiled_manifold_preprocess(mesh, 30, 0.55 / 30, profiler);
+  profiled_manifold_preprocess(mesh, 30, 0.55 / 30, "initial", profiler);
   if (mesh.vertices.size() > 15000) {
     mesh = original_mesh.copy();
-    profiled_manifold_preprocess(mesh, 20, 0.55 / 20, profiler);
+    profiled_manifold_preprocess(mesh, 20, 0.55 / 20, "initial_retry",
+                                profiler);
   }
   log(mesh_index,
       "Remeshed to " + to_string(mesh.vertices.size()) + " verts.");
 
   state.cage = mesh.copy();
-  profiled_manifold_preprocess(state.cage, 40, 0.03, profiler);
+  profiled_manifold_preprocess(state.cage, 40, 0.03, "initial_cage",
+                              profiler);
 
   state.parts.push_back(move(mesh));
 }
@@ -1511,7 +1564,7 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
                     StageTimer timer(profiler, ProfileStage::child_cage, 1);
                     profiled_manifold_preprocess(
                         intersections->pending_parts[part_index].cage, 40,
-                        0.02, profiler);
+                        0.02, "child_cage", profiler);
                   }
                   if (remaining->fetch_sub(1) == 1)
                     coordinator.enqueue_intersections(intersections);

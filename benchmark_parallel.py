@@ -75,6 +75,13 @@ def parse_args():
         action="store_true",
         help="print native cumulative stage timings to stderr",
     )
+    parser.add_argument(
+        "--preprocess-trace",
+        action="store_true",
+        help=(
+            "print per-call manifold topology, timing, and exact output hash"
+        ),
+    )
     args = parser.parse_args()
 
     if args.num_meshes < 1:
@@ -156,6 +163,10 @@ def main():
         os.environ["VISACD_STAGE_TIMING"] = "1"
     else:
         os.environ.pop("VISACD_STAGE_TIMING", None)
+    if args.preprocess_trace:
+        os.environ["VISACD_PREPROCESS_TRACE"] = "1"
+    else:
+        os.environ.pop("VISACD_PREPROCESS_TRACE", None)
 
     print(
         "mesh={} n={} repeats={} cpu_threads={} max_batch_size={} "
