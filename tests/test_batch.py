@@ -250,6 +250,29 @@ class BatchGpuTests(unittest.TestCase):
         self.assertFalse(fallback["supported"])
         self.assertIn("memory budget", fallback["fallback_reason"])
 
+    def test_cuda_batched_surface_voxelization_matches_openvdb(self):
+        meshes = [
+            load_sample(name)
+            for name in ("cow.obj", "KitchenPot.obj", "armadillo.obj")
+        ]
+        for max_batch_size in (1, 3, 200):
+            for scale in (20.0, 30.0, 40.0):
+                with self.subTest(
+                    max_batch_size=max_batch_size, scale=scale
+                ):
+                    comparison = (
+                        visacd._verify_preprocess_voxelization_batch(
+                            meshes, scale, max_batch_size
+                        )
+                    )
+                    self.assertEqual(len(comparison["cases"]), len(meshes))
+                    for case in comparison["cases"]:
+                        self.assertTrue(case["supported"])
+                        self.assertTrue(case["exact"])
+                        self.assertEqual(case["coordinate_mismatches"], 0)
+                        self.assertEqual(case["distance_mismatches"], 0)
+                        self.assertEqual(case["triangle_mismatches"], 0)
+
     def test_cuda_manifold_preprocessing_matches_openvdb(self):
         configurations = (
             (20.0, 0.55 / 20.0),

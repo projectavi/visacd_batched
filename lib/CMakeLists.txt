@@ -61,6 +61,7 @@ file(GLOB visacd_CUDA "cuda/*.cu")
 # exact distance and closest-primitive ties can be reproduced.
 set_source_files_properties(
     ${CMAKE_CURRENT_SOURCE_DIR}/cuda/preprocess_cuda.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/cuda/preprocess_cuda_batch.cu
     PROPERTIES COMPILE_OPTIONS "--fmad=false"
 )
 

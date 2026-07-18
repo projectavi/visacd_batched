@@ -197,6 +197,93 @@ PYBIND11_MODULE(visacd, m)
           py::arg("mesh"), py::arg("scale"),
           py::arg("memory_fraction") = 0.7);
 
+    m.def("_verify_preprocess_voxelization_batch",
+          [](neural_acd::MeshList meshes, double scale,
+             size_t max_batch_size, double memory_fraction) {
+              std::vector<std::vector<neural_acd::SurfaceVoxelRecord>>
+                  references(meshes.size());
+              std::vector<neural_acd::SurfaceVoxelizationResult>
+                  candidates(meshes.size());
+              std::vector<neural_acd::SurfaceVoxelizationInput> inputs;
+              inputs.reserve(meshes.size());
+              for (size_t index = 0; index < meshes.size(); ++index) {
+                  meshes[index].normalize();
+                  references[index] =
+                      neural_acd::reference_surface_voxelization(
+                          meshes[index], scale);
+                  inputs.push_back(
+                      {&meshes[index], scale, &candidates[index]});
+              }
+              static thread_local
+                  neural_acd::ManifoldCudaBatchRuntime runtime;
+              const auto started = std::chrono::steady_clock::now();
+              neural_acd::voxelize_surfaces_batch(
+                  inputs, runtime, max_batch_size, memory_fraction);
+              const double elapsed_ms =
+                  std::chrono::duration<double, std::milli>(
+                      std::chrono::steady_clock::now() - started)
+                      .count();
+
+              py::list cases;
+              for (size_t input_index = 0;
+                   input_index < meshes.size(); ++input_index) {
+                  const auto &reference = references[input_index];
+                  const auto &candidate = candidates[input_index];
+                  size_t coordinate_mismatches = 0;
+                  size_t distance_mismatches = 0;
+                  size_t triangle_mismatches = 0;
+                  const size_t common = std::min(
+                      reference.size(), candidate.records.size());
+                  for (size_t index = 0; index < common; ++index) {
+                      const auto &expected = reference[index];
+                      const auto &actual = candidate.records[index];
+                      if (expected.x != actual.x ||
+                          expected.y != actual.y ||
+                          expected.z != actual.z) {
+                          ++coordinate_mismatches;
+                          continue;
+                      }
+                      if (std::memcmp(&expected.squared_distance,
+                                      &actual.squared_distance,
+                                      sizeof(double)) != 0) {
+                          ++distance_mismatches;
+                      }
+                      if (expected.triangle_index !=
+                          actual.triangle_index) {
+                          ++triangle_mismatches;
+                      }
+                  }
+                  coordinate_mismatches +=
+                      reference.size() > common
+                          ? reference.size() - common
+                          : candidate.records.size() - common;
+                  py::dict item;
+                  item["supported"] = candidate.supported;
+                  item["fallback_reason"] = candidate.fallback_reason;
+                  item["reference_voxels"] = reference.size();
+                  item["candidate_voxels"] =
+                      candidate.records.size();
+                  item["coordinate_mismatches"] =
+                      coordinate_mismatches;
+                  item["distance_mismatches"] = distance_mismatches;
+                  item["triangle_mismatches"] = triangle_mismatches;
+                  item["exact"] =
+                      candidate.supported &&
+                      coordinate_mismatches == 0 &&
+                      distance_mismatches == 0 &&
+                      triangle_mismatches == 0;
+                  item["cuda_wave_ms"] = candidate.elapsed_ms;
+                  cases.append(std::move(item));
+              }
+              py::dict result;
+              result["cases"] = std::move(cases);
+              result["elapsed_ms"] = elapsed_ms;
+              return result;
+          },
+          py::arg("meshes"), py::arg("scale"),
+          py::arg("max_batch_size") = 0,
+          py::arg("memory_fraction") = 0.7);
+
     m.def("_verify_manifold_preprocessing",
           [](neural_acd::Mesh mesh, double scale, double level_set) {
               mesh.normalize();
