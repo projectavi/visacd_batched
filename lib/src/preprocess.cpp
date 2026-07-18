@@ -935,7 +935,8 @@ bool expand_narrowband_dense(
     NarrowbandTree &distance_tree, NarrowbandIndexTree &index_tree,
     const Mesh &source_mesh, double scale, double exterior_width,
     double interior_width, double voxel_size,
-    unsigned int maximum_iterations) {
+    unsigned int maximum_iterations, bool &renormalized) {
+  renormalized = false;
   CoordBBox active_bounds;
   if (!distance_tree.evalActiveVoxelBoundingBox(active_bounds))
     return true;
@@ -971,6 +972,8 @@ bool expand_narrowband_dense(
   grid.interior_width = interior_width;
   grid.voxel_size = voxel_size;
   grid.iterations = maximum_iterations;
+  grid.renormalize = environment_enabled(
+      "VISACD_ENABLE_CUDA_PREPROCESS_RENORMALIZE");
   grid.active.resize(cell_count);
   grid.inside.resize(cell_count);
   grid.distances.resize(cell_count);
@@ -1061,15 +1064,28 @@ bool expand_narrowband_dense(
     for (int y = minimum[1]; y <= maximum[1]; ++y) {
       coordinate[1] = y;
       for (int z = minimum[2]; z <= maximum[2]; ++z, ++offset) {
-        if (!grid.active[offset] || original_active[offset])
+        const bool existed = original_active[offset] != 0;
+        const bool expanded =
+            grid.triangle_indices[offset] != Int32(util::INVALID_IDX);
+        if ((!existed && !expanded) ||
+            (existed && !grid.renormalize))
           continue;
         coordinate[2] = z;
-        distance_accessor.setValue(coordinate, grid.distances[offset]);
-        index_accessor.setValue(coordinate,
-                                grid.triangle_indices[offset]);
+        if (grid.active[offset]) {
+          distance_accessor.setValue(coordinate,
+                                     grid.distances[offset]);
+          if (!existed)
+            index_accessor.setValue(
+                coordinate, grid.triangle_indices[offset]);
+        } else {
+          distance_accessor.setValueOff(coordinate,
+                                        grid.distances[offset]);
+          index_accessor.setValueOff(coordinate);
+        }
       }
     }
   }
+  renormalized = grid.renormalize;
   return true;
 }
 
@@ -1239,6 +1255,7 @@ DoubleGrid::Ptr signed_distance_field_from_surface(
 
   const ValueType minimum_band_width = voxel_size * ValueType(2.0);
   const auto expand_start = PreprocessClock::now();
+  bool dense_renormalized = false;
   if (interior_width > minimum_band_width ||
       exterior_width > minimum_band_width) {
     BoolTreeType mask_tree(false);
@@ -1265,7 +1282,7 @@ DoubleGrid::Ptr signed_distance_field_from_surface(
         dense_expanded = expand_narrowband_dense(
             distance_tree, index_tree, source_mesh, scale,
             exterior_width, interior_width, voxel_size,
-            maximum_iterations);
+            maximum_iterations, dense_renormalized);
       } catch (const exception &error) {
         if (environment_enabled("VISACD_PREPROCESS_EXPAND_TRACE"))
           cerr << "[visacd expand dense] fallback=" << error.what()
@@ -1321,9 +1338,10 @@ DoubleGrid::Ptr signed_distance_field_from_surface(
   const bool trim_narrow_band =
       min(interior_width, exterior_width) <
       voxel_size * ValueType(4.0);
-  bool cuda_renormalized = false;
+  bool cuda_renormalized = dense_renormalized;
   if (environment_enabled(
-          "VISACD_ENABLE_CUDA_PREPROCESS_RENORMALIZE")) {
+          "VISACD_ENABLE_CUDA_PREPROCESS_RENORMALIZE") &&
+      !cuda_renormalized) {
     try {
       cuda_renormalized = renormalize_sparse_cuda(
           distance_tree, nodes, voxel_size, exterior_width,

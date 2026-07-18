@@ -43,6 +43,7 @@ struct DenseNarrowbandGrid {
   double interior_width = 0.0;
   double voxel_size = 1.0;
   unsigned int iterations = 0;
+  bool renormalize = false;
   std::vector<unsigned char> active;
   std::vector<unsigned char> inside;
   std::vector<double> distances;

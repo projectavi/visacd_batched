@@ -39,6 +39,7 @@ struct PackedDenseGrid {
   double interior_width;
   double voxel_size;
   unsigned int iterations;
+  int renormalize;
 };
 
 __device__ double3 subtract(double3 first, double3 second) {
@@ -381,6 +382,127 @@ __global__ void expand_dense_second_layer_kernel(
   }
 }
 
+__device__ double dense_maximum(double first, double second) {
+  return first < second ? second : first;
+}
+
+__device__ double dense_minimum(double first, double second) {
+  return second < first ? second : first;
+}
+
+__device__ double dense_square(double value) { return value * value; }
+
+__device__ double dense_offset_value(
+    size_t cell, const unsigned char *active, const double *values,
+    double offset) {
+  return active[cell] ? values[cell] - offset : values[cell];
+}
+
+__device__ double dense_renormalize_neighbour(
+    const PackedDenseGrid &grid, int3 coordinate,
+    const unsigned char *active, const double *values,
+    double offset) {
+  size_t neighbour = 0;
+  if (!dense_cell_offset(grid, coordinate, neighbour))
+    return grid.exterior_width;
+  return dense_offset_value(neighbour, active, values, offset);
+}
+
+__global__ void renormalize_dense_kernel(
+    const PackedDenseGrid *grids, const int *cell_mesh_indices,
+    size_t cell_count, const unsigned char *active,
+    const double *values, unsigned char *output_active,
+    double *output_values) {
+  const size_t cell =
+      static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (cell >= cell_count)
+    return;
+  const PackedDenseGrid grid = grids[cell_mesh_indices[cell]];
+  if (!grid.renormalize || !active[cell]) {
+    output_active[cell] = active[cell];
+    output_values[cell] = values[cell];
+    return;
+  }
+  const int3 coordinate = dense_coordinate(grid, cell);
+  const double dx = grid.voxel_size;
+  const double offset = 0.8 * dx;
+  const double phi0 = values[cell] - offset;
+  const double down_x =
+      phi0 - dense_renormalize_neighbour(
+                 grid, make_int3(coordinate.x - 1, coordinate.y,
+                                 coordinate.z),
+                 active, values, offset);
+  const double up_x =
+      dense_renormalize_neighbour(
+          grid, make_int3(coordinate.x + 1, coordinate.y,
+                          coordinate.z),
+          active, values, offset) -
+      phi0;
+  const double down_y =
+      phi0 - dense_renormalize_neighbour(
+                 grid, make_int3(coordinate.x, coordinate.y - 1,
+                                 coordinate.z),
+                 active, values, offset);
+  const double up_y =
+      dense_renormalize_neighbour(
+          grid, make_int3(coordinate.x, coordinate.y + 1,
+                          coordinate.z),
+          active, values, offset) -
+      phi0;
+  const double down_z =
+      phi0 - dense_renormalize_neighbour(
+                 grid, make_int3(coordinate.x, coordinate.y,
+                                 coordinate.z - 1),
+                 active, values, offset);
+  const double up_z =
+      dense_renormalize_neighbour(
+          grid, make_int3(coordinate.x, coordinate.y,
+                          coordinate.z + 1),
+          active, values, offset) -
+      phi0;
+  const double zero = 0.0;
+  double norm_squared;
+  if (phi0 > 0.0) {
+    norm_squared = dense_maximum(
+        dense_square(dense_maximum(down_x, zero)),
+        dense_square(dense_minimum(up_x, zero)));
+    norm_squared += dense_maximum(
+        dense_square(dense_maximum(down_y, zero)),
+        dense_square(dense_minimum(up_y, zero)));
+    norm_squared += dense_maximum(
+        dense_square(dense_maximum(down_z, zero)),
+        dense_square(dense_minimum(up_z, zero)));
+  } else {
+    norm_squared = dense_maximum(
+        dense_square(dense_minimum(down_x, zero)),
+        dense_square(dense_maximum(up_x, zero)));
+    norm_squared += dense_maximum(
+        dense_square(dense_minimum(down_y, zero)),
+        dense_square(dense_maximum(up_y, zero)));
+    norm_squared += dense_maximum(
+        dense_square(dense_minimum(down_z, zero)),
+        dense_square(dense_maximum(up_z, zero)));
+  }
+  const double difference = sqrt(norm_squared) / dx - 1.0;
+  const double sign = phi0 / sqrt(phi0 * phi0 + norm_squared);
+  const double updated = phi0 - dx * sign * difference;
+  double result = dense_minimum(phi0, updated) + offset - 1.0e-7;
+  bool remains_active = true;
+  if (dense_minimum(grid.interior_width, grid.exterior_width) <
+      dx * 4.0) {
+    const bool inside = result < 0.0;
+    if (inside && !(result > -grid.interior_width)) {
+      result = -grid.interior_width;
+      remains_active = false;
+    } else if (!inside && !(result < grid.exterior_width)) {
+      result = grid.exterior_width;
+      remains_active = false;
+    }
+  }
+  output_active[cell] = remains_active ? 1 : 0;
+  output_values[cell] = result;
+}
+
 __global__ void evaluate_narrowband_kernel(
     const float3 *vertices, const int3 *triangles,
     const NarrowbandFragment *fragments,
@@ -449,6 +571,7 @@ struct Runtime {
   DeviceBuffer dense_source_active;
   DeviceBuffer dense_inside;
   DeviceBuffer dense_distances;
+  DeviceBuffer dense_output_distances;
   DeviceBuffer dense_triangle_indices;
   DeviceBuffer dense_mask;
   DeviceBuffer dense_second_mask;
@@ -768,6 +891,9 @@ void expand_narrowband_dense_cuda_batch(
                             "allocate dense narrowband signs");
   state.dense_distances.ensure(cell_count * sizeof(double),
                                "allocate dense narrowband distances");
+  state.dense_output_distances.ensure(
+      cell_count * sizeof(double),
+      "allocate dense narrowband output distances");
   state.dense_triangle_indices.ensure(
       cell_count * sizeof(int), "allocate dense narrowband indices");
   state.dense_mask.ensure(cell_count * sizeof(int),
@@ -831,7 +957,8 @@ void expand_narrowband_dense_cuda_batch(
                   grid.dimensions[2]),
         leaf_dimensions, cell_offset, grid_cells, leaf_offset,
         vertex_offset, triangle_offset, grid.exterior_width,
-        grid.interior_width, grid.voxel_size, grid.iterations};
+        grid.interior_width, grid.voxel_size, grid.iterations,
+        grid.renormalize ? 1 : 0};
     for (size_t index = 0; index < mesh.vertices.size(); ++index) {
       const Vec3D &vertex = mesh.vertices[index];
       host_vertices[vertex_offset + index] = make_float3(
@@ -977,15 +1104,25 @@ void expand_narrowband_dense_cuda_batch(
         "advance dense narrowband mask");
   }
 
+  renormalize_dense_kernel<<<blocks, threads, 0, state.stream>>>(
+      state.dense_grids.as<PackedDenseGrid>(),
+      state.dense_cell_mesh_indices.as<int>(), cell_count,
+      state.dense_active.as<unsigned char>(),
+      state.dense_distances.as<double>(),
+      state.dense_source_active.as<unsigned char>(),
+      state.dense_output_distances.as<double>());
+  cuda_memory::check(cudaGetLastError(),
+                     "renormalize dense narrowband");
+
   cuda_memory::check(
       cudaMemcpyAsync(host_active,
-                      state.dense_active.as<unsigned char>(),
+                      state.dense_source_active.as<unsigned char>(),
                       cell_count * sizeof(unsigned char),
                       cudaMemcpyDeviceToHost, state.stream),
       "copy dense narrowband activity");
   cuda_memory::check(
       cudaMemcpyAsync(host_grid_distances,
-                      state.dense_distances.as<double>(),
+                      state.dense_output_distances.as<double>(),
                       cell_count * sizeof(double), cudaMemcpyDeviceToHost,
                       state.stream),
       "copy dense narrowband distances");
