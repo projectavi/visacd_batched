@@ -15,6 +15,10 @@ struct SparseSurfacePostGrid {
   std::vector<int> triangle_indices;
   std::vector<int> neighbour_indices;
   std::vector<double> neighbour_values;
+  // next/previous sparse leaf along X, Y, and Z. Unlike the immediate
+  // neighbours above, these links skip empty leaf-space exactly as OpenVDB's
+  // exterior connectivity table does.
+  std::vector<int> axis_neighbour_indices;
 };
 
 void postprocess_sparse_surface_cuda(SparseSurfacePostGrid &grid);

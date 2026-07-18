@@ -16,6 +16,7 @@ using cuda_memory::PinnedBuffer;
 
 constexpr size_t kLeafSize = 8 * 8 * 8;
 constexpr size_t kLeafNeighbourCount = 3 * 3 * 3;
+constexpr size_t kAxisNeighbourCount = 6;
 constexpr int kInvalidIndex = -1;
 
 struct PackedSurfacePostGrid {
@@ -28,6 +29,202 @@ struct CellData {
   int triangle;
   bool active;
 };
+
+__device__ bool trace_voxel_line(double *values, int leaf, int position,
+                                 int step) {
+  bool outside = true;
+  const size_t base = static_cast<size_t>(leaf) * kLeafSize;
+  for (int index = 0; index < 8; ++index) {
+    double &distance = values[base + position];
+    if (distance < 0.0) {
+      outside = true;
+    } else {
+      if (!(distance > 0.75))
+        outside = false;
+      if (outside)
+        distance = -distance;
+    }
+    position += step;
+  }
+  return outside;
+}
+
+__global__ void sweep_exterior_kernel(
+    size_t leaf_count, int axis, const int *axis_neighbours,
+    double *values) {
+  const size_t line =
+      static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (line >= leaf_count * 64)
+    return;
+  const int start = static_cast<int>(line / 64);
+  const int lane = static_cast<int>(line & 63);
+  const int previous_slot = axis * 2 + 1;
+  const int next_slot = axis * 2;
+  if (axis_neighbours[static_cast<size_t>(start) *
+                          kAxisNeighbourCount +
+                      previous_slot] != kInvalidIndex)
+    return;
+
+  int step;
+  int position;
+  if (axis == 2) {
+    step = 1;
+    position = (lane / 8) * 64 + (lane & 7) * 8;
+  } else if (axis == 1) {
+    step = 8;
+    position = (lane / 8) * 64 + (lane & 7);
+  } else {
+    step = 64;
+    position = (lane / 8) * 8 + (lane & 7);
+  }
+
+  int offset = start;
+  int last = start;
+  while (offset != kInvalidIndex &&
+         trace_voxel_line(values, offset, position, step)) {
+    last = offset;
+    offset = axis_neighbours[static_cast<size_t>(offset) *
+                                 kAxisNeighbourCount +
+                             next_slot];
+  }
+  offset = last;
+  while (offset != kInvalidIndex) {
+    last = offset;
+    offset = axis_neighbours[static_cast<size_t>(offset) *
+                                 kAxisNeighbourCount +
+                             next_slot];
+  }
+  offset = last;
+  position += step * 7;
+  while (offset != kInvalidIndex &&
+         trace_voxel_line(values, offset, position, -step)) {
+    offset = axis_neighbours[static_cast<size_t>(offset) *
+                                 kAxisNeighbourCount +
+                             previous_slot];
+  }
+}
+
+__global__ void scan_fill_exterior_kernel(
+    size_t leaf_count, const unsigned char *changed_nodes,
+    double *values) {
+  const size_t leaf =
+      static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (leaf >= leaf_count || !changed_nodes[leaf])
+    return;
+  double *data = values + leaf * kLeafSize;
+  bool changed;
+  do {
+    changed = false;
+    for (int position = 0; position < 512; ++position) {
+      double &distance = data[position];
+      if (distance < 0.0 || !(distance > 0.75))
+        continue;
+      const int x = position / 64;
+      const int y = (position / 8) & 7;
+      const int z = position & 7;
+      if ((z != 0 && data[position - 1] < 0.0) ||
+          (z != 7 && data[position + 1] < 0.0) ||
+          (y != 0 && data[position - 8] < 0.0) ||
+          (y != 7 && data[position + 8] < 0.0) ||
+          (x != 0 && data[position - 64] < 0.0) ||
+          (x != 7 && data[position + 64] < 0.0)) {
+        distance = -distance;
+        changed = true;
+      }
+    }
+  } while (changed);
+}
+
+__device__ bool seed_exterior_face(
+    size_t leaf, int axis, bool first_face,
+    const int *axis_neighbours, const unsigned char *changed_nodes,
+    const double *values, unsigned char *changed_voxels) {
+  const int slot = axis * 2 + (first_face ? 1 : 0);
+  const int neighbour =
+      axis_neighbours[leaf * kAxisNeighbourCount + slot];
+  if (neighbour == kInvalidIndex || !changed_nodes[neighbour])
+    return false;
+  const double *lhs = values + leaf * kLeafSize;
+  const double *rhs =
+      values + static_cast<size_t>(neighbour) * kLeafSize;
+  unsigned char *mask = changed_voxels + leaf * kLeafSize;
+  bool changed = false;
+  for (int first = 0; first < 8; ++first) {
+    for (int second = 0; second < 8; ++second) {
+      int lhs_position;
+      int rhs_position;
+      if (axis == 2) {
+        const int base = first * 64 + second * 8;
+        lhs_position = base + (first_face ? 0 : 7);
+        rhs_position = base + (first_face ? 7 : 0);
+      } else if (axis == 1) {
+        const int base = first * 64 + second;
+        lhs_position = base + (first_face ? 0 : 56);
+        rhs_position = base + (first_face ? 56 : 0);
+      } else {
+        const int base = first * 8 + second;
+        lhs_position = base + (first_face ? 0 : 448);
+        rhs_position = base + (first_face ? 448 : 0);
+      }
+      if (lhs[lhs_position] > 0.75 && rhs[rhs_position] < 0.0) {
+        mask[lhs_position] = 1;
+        changed = true;
+      }
+    }
+  }
+  return changed;
+}
+
+__global__ void seed_exterior_points_kernel(
+    size_t leaf_count, const int *axis_neighbours,
+    const unsigned char *changed_nodes,
+    unsigned char *next_changed_nodes,
+    const double *values, unsigned char *changed_voxels,
+    int *any_changed) {
+  const size_t leaf =
+      static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (leaf >= leaf_count)
+    return;
+  bool changed = false;
+  changed |= seed_exterior_face(leaf, 2, true, axis_neighbours,
+                                changed_nodes, values,
+                                changed_voxels);
+  changed |= seed_exterior_face(leaf, 2, false, axis_neighbours,
+                                changed_nodes, values,
+                                changed_voxels);
+  changed |= seed_exterior_face(leaf, 1, true, axis_neighbours,
+                                changed_nodes, values,
+                                changed_voxels);
+  changed |= seed_exterior_face(leaf, 1, false, axis_neighbours,
+                                changed_nodes, values,
+                                changed_voxels);
+  changed |= seed_exterior_face(leaf, 0, true, axis_neighbours,
+                                changed_nodes, values,
+                                changed_voxels);
+  changed |= seed_exterior_face(leaf, 0, false, axis_neighbours,
+                                changed_nodes, values,
+                                changed_voxels);
+  next_changed_nodes[leaf] = changed ? 1 : 0;
+  if (changed)
+    atomicExch(any_changed, 1);
+}
+
+__global__ void sync_exterior_voxels_kernel(
+    size_t leaf_count, const unsigned char *changed_nodes,
+    unsigned char *changed_voxels, double *values) {
+  const size_t leaf =
+      static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (leaf >= leaf_count || !changed_nodes[leaf])
+    return;
+  double *data = values + leaf * kLeafSize;
+  unsigned char *mask = changed_voxels + leaf * kLeafSize;
+  for (int position = 0; position < 512; ++position) {
+    if (mask[position]) {
+      data[position] = -data[position];
+      mask[position] = 0;
+    }
+  }
+}
 
 __device__ double3 subtract(double3 first, double3 second) {
   return make_double3(first.x - second.x, first.y - second.y,
@@ -356,10 +553,14 @@ struct Runtime {
   DeviceBuffer active, active_output;
   DeviceBuffer values, sign_values, validated_values;
   DeviceBuffer triangle_indices, neighbour_indices, neighbour_values;
+  DeviceBuffer axis_neighbour_indices;
+  DeviceBuffer changed_nodes_a, changed_nodes_b, changed_voxels;
+  DeviceBuffer any_changed;
   PinnedBuffer host_grids, host_leaf_grid_indices, host_leaf_origins;
   PinnedBuffer host_vertices, host_triangles;
   PinnedBuffer host_active, host_values, host_triangle_indices;
   PinnedBuffer host_neighbour_indices, host_neighbour_values;
+  PinnedBuffer host_axis_neighbour_indices;
 
   ~Runtime() {
     if (stream)
@@ -411,7 +612,9 @@ void postprocess_sparse_surface_cuda_batch(
         grid->neighbour_indices.size() !=
             leaves * kLeafNeighbourCount ||
         grid->neighbour_values.size() !=
-            leaves * kLeafNeighbourCount)
+            leaves * kLeafNeighbourCount ||
+        grid->axis_neighbour_indices.size() !=
+            leaves * kAxisNeighbourCount)
       throw std::invalid_argument(
           "sparse surface topology is malformed");
     if (grid->mesh->vertices.size() >
@@ -434,6 +637,13 @@ void postprocess_sparse_surface_cuda_batch(
            static_cast<size_t>(neighbour) >= leaves))
         throw std::invalid_argument(
             "sparse surface neighbour index is invalid");
+    }
+    for (int neighbour : grid->axis_neighbour_indices) {
+      if (neighbour < -1 ||
+          (neighbour >= 0 &&
+           static_cast<size_t>(neighbour) >= leaves))
+        throw std::invalid_argument(
+            "sparse surface axis neighbour index is invalid");
     }
     for (size_t cell = 0; cell < grid->active.size(); ++cell) {
       if (grid->active[cell] &&
@@ -487,6 +697,17 @@ void postprocess_sparse_surface_cuda_batch(
   ENSURE(neighbour_values,
          leaf_count * kLeafNeighbourCount * sizeof(double),
          "allocate sparse surface neighbour values");
+  ENSURE(axis_neighbour_indices,
+         leaf_count * kAxisNeighbourCount * sizeof(int),
+         "allocate sparse surface axis neighbours");
+  ENSURE(changed_nodes_a, leaf_count * sizeof(unsigned char),
+         "allocate sparse surface changed nodes A");
+  ENSURE(changed_nodes_b, leaf_count * sizeof(unsigned char),
+         "allocate sparse surface changed nodes B");
+  ENSURE(changed_voxels, cell_count * sizeof(unsigned char),
+         "allocate sparse surface changed voxels");
+  ENSURE(any_changed, sizeof(int),
+         "allocate sparse surface change flag");
   ENSURE(host_grids, grids.size() * sizeof(PackedSurfacePostGrid),
          "allocate host sparse surface grids");
   ENSURE(host_leaf_grid_indices, leaf_count * sizeof(int),
@@ -509,6 +730,9 @@ void postprocess_sparse_surface_cuda_batch(
   ENSURE(host_neighbour_values,
          leaf_count * kLeafNeighbourCount * sizeof(double),
          "allocate host sparse surface neighbour values");
+  ENSURE(host_axis_neighbour_indices,
+         leaf_count * kAxisNeighbourCount * sizeof(int),
+         "allocate host sparse surface axis neighbours");
 #undef ENSURE
 
   auto *host_grids = state.host_grids.as<PackedSurfacePostGrid>();
@@ -523,6 +747,8 @@ void postprocess_sparse_surface_cuda_batch(
   int *host_neighbours = state.host_neighbour_indices.as<int>();
   double *host_neighbour_values =
       state.host_neighbour_values.as<double>();
+  int *host_axis_neighbours =
+      state.host_axis_neighbour_indices.as<int>();
   size_t leaf_offset = 0, vertex_offset = 0, triangle_offset = 0;
   for (size_t grid_index = 0; grid_index < grids.size(); ++grid_index) {
     SparseSurfacePostGrid &grid = *grids[grid_index];
@@ -569,6 +795,13 @@ void postprocess_sparse_surface_cuda_batch(
           leaf_offset * kLeafNeighbourCount + index] =
           grid.neighbour_values[index];
     }
+    for (size_t index = 0;
+         index < leaves * kAxisNeighbourCount; ++index) {
+      const int local = grid.axis_neighbour_indices[index];
+      host_axis_neighbours[
+          leaf_offset * kAxisNeighbourCount + index] =
+          local < 0 ? -1 : static_cast<int>(leaf_offset) + local;
+    }
     leaf_offset += leaves;
     vertex_offset += mesh.vertices.size();
     triangle_offset += mesh.triangles.size();
@@ -607,10 +840,80 @@ void postprocess_sparse_surface_cuda_batch(
   COPY(neighbour_values, double, host_neighbour_values,
        leaf_count * kLeafNeighbourCount * sizeof(double),
        "copy sparse surface neighbour values");
+  COPY(axis_neighbour_indices, int, host_axis_neighbours,
+       leaf_count * kAxisNeighbourCount * sizeof(int),
+       "copy sparse surface axis neighbours");
 #undef COPY
 
   const int blocks =
       static_cast<int>((cell_count + threads - 1) / threads);
+  const int leaf_blocks =
+      static_cast<int>((leaf_count + threads - 1) / threads);
+  const size_t line_count = leaf_count * 64;
+  const int line_blocks =
+      static_cast<int>((line_count + threads - 1) / threads);
+  for (int axis = 2; axis >= 0; --axis) {
+    sweep_exterior_kernel<<<line_blocks, threads, 0, state.stream>>>(
+        leaf_count, axis,
+        state.axis_neighbour_indices.as<int>(),
+        state.values.as<double>());
+    cuda_memory::check(cudaGetLastError(),
+                       "launch sparse exterior sweep");
+  }
+  cuda_memory::check(
+      cudaMemsetAsync(state.changed_nodes_a.as<unsigned char>(), 1,
+                      leaf_count * sizeof(unsigned char), state.stream),
+      "initialize sparse exterior changed nodes A");
+  cuda_memory::check(
+      cudaMemsetAsync(state.changed_nodes_b.as<unsigned char>(), 0,
+                      leaf_count * sizeof(unsigned char), state.stream),
+      "initialize sparse exterior changed nodes B");
+  cuda_memory::check(
+      cudaMemsetAsync(state.changed_voxels.as<unsigned char>(), 0,
+                      cell_count * sizeof(unsigned char), state.stream),
+      "initialize sparse exterior changed voxels");
+  unsigned char *changed_nodes =
+      state.changed_nodes_a.as<unsigned char>();
+  unsigned char *next_changed_nodes =
+      state.changed_nodes_b.as<unsigned char>();
+  while (true) {
+    scan_fill_exterior_kernel<<<leaf_blocks, threads, 0,
+                                state.stream>>>(
+        leaf_count, changed_nodes, state.values.as<double>());
+    cuda_memory::check(cudaGetLastError(),
+                       "launch sparse exterior scan fill");
+    cuda_memory::check(
+        cudaMemsetAsync(state.any_changed.as<int>(), 0, sizeof(int),
+                        state.stream),
+        "clear sparse exterior change flag");
+    seed_exterior_points_kernel<<<leaf_blocks, threads, 0,
+                                  state.stream>>>(
+        leaf_count, state.axis_neighbour_indices.as<int>(),
+        changed_nodes, next_changed_nodes,
+        state.values.as<double>(),
+        state.changed_voxels.as<unsigned char>(),
+        state.any_changed.as<int>());
+    cuda_memory::check(cudaGetLastError(),
+                       "launch sparse exterior seed points");
+    int any_changed = 0;
+    cuda_memory::check(
+        cudaMemcpyAsync(&any_changed, state.any_changed.as<int>(),
+                        sizeof(int), cudaMemcpyDeviceToHost,
+                        state.stream),
+        "copy sparse exterior change flag");
+    cuda_memory::check(cudaStreamSynchronize(state.stream),
+                       "wait for sparse exterior iteration");
+    std::swap(changed_nodes, next_changed_nodes);
+    if (!any_changed)
+      break;
+    sync_exterior_voxels_kernel<<<leaf_blocks, threads, 0,
+                                  state.stream>>>(
+        leaf_count, changed_nodes,
+        state.changed_voxels.as<unsigned char>(),
+        state.values.as<double>());
+    cuda_memory::check(cudaGetLastError(),
+                       "launch sparse exterior voxel sync");
+  }
   compute_surface_sign_kernel<<<blocks, threads, 0, state.stream>>>(
       state.grids.as<PackedSurfacePostGrid>(),
       state.leaf_grid_indices.as<int>(),

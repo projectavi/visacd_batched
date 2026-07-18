@@ -800,6 +800,7 @@ bool postprocess_sparse_surface_cuda(
       cell_count, Int32(util::INVALID_IDX));
   grid.neighbour_indices.resize(nodes.size() * 27, -1);
   grid.neighbour_values.resize(nodes.size() * 27);
+  grid.axis_neighbour_indices.resize(nodes.size() * 6, -1);
 
   unordered_map<const NarrowbandLeaf *, int> leaf_indices;
   leaf_indices.reserve(nodes.size());
@@ -855,6 +856,44 @@ bool postprocess_sparse_surface_cuda(
     }
   }
 
+  vector<size_t> order(nodes.size());
+  for (size_t leaf = 0; leaf < nodes.size(); ++leaf)
+    order[leaf] = leaf;
+  for (int axis = 0; axis < 3; ++axis) {
+    const int first_other = axis == 0 ? 1 : 0;
+    const int second_other = axis == 2 ? 1 : 2;
+    sort(order.begin(), order.end(), [&](size_t first, size_t second) {
+      const auto coordinate = [&](size_t leaf, int component) {
+        return grid.leaf_origins[leaf * 3 + component];
+      };
+      if (coordinate(first, first_other) !=
+          coordinate(second, first_other))
+        return coordinate(first, first_other) <
+               coordinate(second, first_other);
+      if (coordinate(first, second_other) !=
+          coordinate(second, second_other))
+        return coordinate(first, second_other) <
+               coordinate(second, second_other);
+      return coordinate(first, axis) < coordinate(second, axis);
+    });
+    for (size_t index = 1; index < order.size(); ++index) {
+      const size_t previous = order[index - 1];
+      const size_t current = order[index];
+      const auto coordinate = [&](size_t leaf, int component) {
+        return grid.leaf_origins[leaf * 3 + component];
+      };
+      if (coordinate(previous, first_other) !=
+              coordinate(current, first_other) ||
+          coordinate(previous, second_other) !=
+              coordinate(current, second_other))
+        continue;
+      grid.axis_neighbour_indices[previous * 6 + axis * 2] =
+          static_cast<int>(current);
+      grid.axis_neighbour_indices[current * 6 + axis * 2 + 1] =
+          static_cast<int>(previous);
+    }
+  }
+
   sparse_surface_post_cuda_batcher().process(grid);
   for (size_t leaf = 0; leaf < nodes.size(); ++leaf) {
     NarrowbandLeaf &distance_leaf = *nodes[leaf];
@@ -866,11 +905,12 @@ bool postprocess_sparse_surface_cuda(
     double *values = distance_leaf.buffer().data();
     const size_t cell_offset =
         leaf * static_cast<size_t>(NarrowbandLeaf::SIZE);
+    copy_n(grid.values.begin() + cell_offset,
+           NarrowbandLeaf::SIZE, values);
     for (Index position = 0; position < NarrowbandLeaf::SIZE;
          ++position) {
       if (!distance_leaf.getValueMask().isOn(position))
         continue;
-      values[position] = grid.values[cell_offset + position];
       if (!grid.active[cell_offset + position]) {
         distance_leaf.setValueOff(position);
         index_leaf->setValueOff(position);
@@ -1098,15 +1138,10 @@ DoubleGrid::Ptr signed_distance_field_from_surface(
     metrics->sdf_seed_grid_ns = elapsed_ns(seed_grid_start);
 
   const auto trace_start = PreprocessClock::now();
-  tools::traceExteriorBoundaries(distance_tree);
-  if (metrics)
-    metrics->sdf_trace_ns = elapsed_ns(trace_start);
   vector<LeafNodeType *> nodes;
   nodes.reserve(distance_tree.leafCount());
   distance_tree.getNodes(nodes);
   const tbb::blocked_range<size_t> node_range(0, nodes.size());
-  const auto sign_start = PreprocessClock::now();
-  auto cleanup_start = sign_start;
   bool cuda_surface_postprocessed = false;
   if (environment_enabled("VISACD_ENABLE_CUDA_PREPROCESS_SIGN")) {
     try {
@@ -1124,13 +1159,21 @@ DoubleGrid::Ptr signed_distance_field_from_surface(
       cuda_surface_postprocessed = false;
     }
   }
+  auto cleanup_start = PreprocessClock::now();
   if (cuda_surface_postprocessed) {
     if (metrics) {
-      metrics->sdf_sign_ns = elapsed_ns(sign_start);
+      // Exterior tracing and surface postprocessing share one resident CUDA
+      // submission, so report their combined wall time in the sign stage.
+      metrics->sdf_trace_ns = 0;
+      metrics->sdf_sign_ns = elapsed_ns(trace_start);
       metrics->sdf_validate_ns = 0;
     }
     cleanup_start = PreprocessClock::now();
   } else {
+    tools::traceExteriorBoundaries(distance_tree);
+    if (metrics)
+      metrics->sdf_trace_ns = elapsed_ns(trace_start);
+    const auto sign_start = PreprocessClock::now();
     using SignOperation =
         tools::mesh_to_volume_internal::ComputeIntersectingVoxelSign<
             TreeType, Adapter>;
