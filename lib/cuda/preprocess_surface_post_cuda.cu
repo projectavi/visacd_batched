@@ -22,6 +22,8 @@ constexpr int kInvalidIndex = -1;
 struct PackedSurfacePostGrid {
   size_t triangle_offset;
   double voxel_size;
+  double exterior_width;
+  double interior_width;
 };
 
 struct CellData {
@@ -545,6 +547,58 @@ __global__ void transform_surface_values_kernel(
   output[cell] = weight * sqrt(fabs(value));
 }
 
+__global__ void flood_surface_leaf_values_kernel(
+    const PackedSurfacePostGrid *grids,
+    const int *leaf_grid_indices, size_t leaf_count,
+    const unsigned char *active, double *values) {
+  const size_t leaf =
+      static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (leaf >= leaf_count)
+    return;
+  const unsigned char *mask = active + leaf * kLeafSize;
+  double *data = values + leaf * kLeafSize;
+  int first_active = -1;
+  for (int position = 0; position < 512; ++position) {
+    if (mask[position]) {
+      first_active = position;
+      break;
+    }
+  }
+  const PackedSurfacePostGrid grid =
+      grids[leaf_grid_indices[leaf]];
+  if (first_active < 0) {
+    const double fill =
+        data[0] < 0.0 ? grid.interior_width : grid.exterior_width;
+    for (int position = 0; position < 512; ++position)
+      data[position] = fill;
+    return;
+  }
+  bool x_inside = data[first_active] < 0.0;
+  bool y_inside = x_inside;
+  bool z_inside = x_inside;
+  for (int x = 0; x < 8; ++x) {
+    const int x00 = x * 64;
+    if (mask[x00])
+      x_inside = data[x00] < 0.0;
+    y_inside = x_inside;
+    for (int y = 0; y < 8; ++y) {
+      const int xy0 = x00 + y * 8;
+      if (mask[xy0])
+        y_inside = data[xy0] < 0.0;
+      z_inside = y_inside;
+      for (int z = 0; z < 8; ++z) {
+        const int position = xy0 + z;
+        if (mask[position]) {
+          z_inside = data[position] < 0.0;
+        } else {
+          data[position] = z_inside ? grid.interior_width
+                                    : grid.exterior_width;
+        }
+      }
+    }
+  }
+}
+
 struct Runtime {
   std::mutex mutex;
   cudaStream_t stream = nullptr;
@@ -603,6 +657,12 @@ void postprocess_sparse_surface_cuda_batch(
         grid->voxel_size <= 0.0)
       throw std::invalid_argument(
           "sparse surface voxel size must be finite and positive");
+    if (!std::isfinite(grid->exterior_width) ||
+        grid->exterior_width < 0.0 ||
+        !std::isfinite(grid->interior_width) ||
+        grid->interior_width > 0.0)
+      throw std::invalid_argument(
+          "sparse surface flood widths are invalid");
     if (grid->active.size() != grid->values.size() ||
         grid->active.size() != grid->triangle_indices.size() ||
         grid->active.size() % kLeafSize != 0)
@@ -754,7 +814,8 @@ void postprocess_sparse_surface_cuda_batch(
     SparseSurfacePostGrid &grid = *grids[grid_index];
     const size_t leaves = grid.active.size() / kLeafSize;
     host_grids[grid_index] =
-        {triangle_offset, grid.voxel_size};
+        {triangle_offset, grid.voxel_size,
+         grid.exterior_width, grid.interior_width};
     std::fill_n(host_owners + leaf_offset, leaves,
                 static_cast<int>(grid_index));
     for (size_t leaf = 0; leaf < leaves; ++leaf) {
@@ -952,6 +1013,14 @@ void postprocess_sparse_surface_cuda_batch(
       state.sign_values.as<double>());
   cuda_memory::check(cudaGetLastError(),
                      "launch sparse surface value transformation");
+  flood_surface_leaf_values_kernel<<<leaf_blocks, threads, 0,
+                                      state.stream>>>(
+      state.grids.as<PackedSurfacePostGrid>(),
+      state.leaf_grid_indices.as<int>(), leaf_count,
+      state.active_output.as<unsigned char>(),
+      state.sign_values.as<double>());
+  cuda_memory::check(cudaGetLastError(),
+                     "launch sparse surface leaf flood fill");
   cuda_memory::check(
       cudaMemcpyAsync(host_values, state.sign_values.as<double>(),
                       cell_count * sizeof(double),

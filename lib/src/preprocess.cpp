@@ -781,7 +781,8 @@ SparseSurfacePostCudaBatcher &sparse_surface_post_cuda_batcher() {
 bool postprocess_sparse_surface_cuda(
     NarrowbandTree &distance_tree, NarrowbandIndexTree &index_tree,
     const vector<NarrowbandLeaf *> &nodes, const Mesh &source_mesh,
-    double scale, double voxel_size) {
+    double scale, double voxel_size, double exterior_width,
+    double interior_width) {
   if (nodes.empty())
     return true;
   if (nodes.size() >
@@ -791,6 +792,8 @@ bool postprocess_sparse_surface_cuda(
   grid.mesh = &source_mesh;
   grid.scale = scale;
   grid.voxel_size = voxel_size;
+  grid.exterior_width = abs(exterior_width);
+  grid.interior_width = -abs(interior_width);
   const size_t cell_count =
       nodes.size() * static_cast<size_t>(NarrowbandLeaf::SIZE);
   grid.leaf_origins.resize(nodes.size() * 3);
@@ -1147,7 +1150,7 @@ DoubleGrid::Ptr signed_distance_field_from_surface(
     try {
       cuda_surface_postprocessed = postprocess_sparse_surface_cuda(
           distance_tree, index_tree, nodes, source_mesh, scale,
-          voxel_size);
+          voxel_size, exterior_width, interior_width);
     } catch (const exception &error) {
       if (environment_enabled("VISACD_PREPROCESS_SIGN_TRACE"))
         cerr << "[visacd surface post] fallback=" << error.what()
@@ -1219,8 +1222,9 @@ DoubleGrid::Ptr signed_distance_field_from_surface(
             nodes, voxel_size, false));
   }
   distance_tree.root().setBackground(exterior_width, false);
-  tools::signedFloodFillWithValues(distance_tree, exterior_width,
-                                   -interior_width);
+  tools::signedFloodFillWithValues(
+      distance_tree, exterior_width, -interior_width, true, 1,
+      cuda_surface_postprocessed ? 1 : 0);
   if (metrics)
     metrics->sdf_transform_flood_ns =
         elapsed_ns(transform_flood_start);
