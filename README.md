@@ -150,6 +150,21 @@ whole-batch results. Each mesh has an independent deterministic random stream,
 so CPU scheduling does not affect the result. A seeded batch is not required to
 match separate seeded `process` calls.
 
+To benchmark one complete batch, use `benchmark_parallel.py`; `-n` is the
+number of meshes submitted together:
+
+```bash
+python benchmark_parallel.py -n 200 --repeats 4 --stage-timing
+```
+
+Results, throughput, output digests, and optional native stage timings are
+printed to the console. The first repetition includes CUDA and OptiX startup,
+so use the later repetitions when comparing steady-state throughput. The
+digest and `repeatable` fields provide a quick deterministic-output check.
+Use `--cpu-threads`, `--max-batch-size`, `--memory-fraction`,
+`--optix-build-preference`, and `--optix-max-concurrency` to benchmark explicit
+tuning overrides; their defaults exercise the automatic heuristics.
+
 ## decompose.py
 
 [decompose.py](decompose.py) is a ready-to-use CLI script:
