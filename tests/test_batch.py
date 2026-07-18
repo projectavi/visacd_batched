@@ -94,6 +94,25 @@ class BatchValidationTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "batch_memory_fraction"):
                     visacd.process_batch([], 0.04, 2)
 
+    def test_numpy_mesh_constructor_and_buffer_views(self):
+        vertices = np.arange(12, dtype=np.float64).reshape(4, 3)
+        triangles = np.asarray([[0, 1, 2], [1, 2, 3]], dtype=np.int32)
+        mesh = visacd.Mesh(vertices, triangles)
+
+        vertex_view = np.asarray(mesh.vertices)
+        triangle_view = np.asarray(mesh.triangles)
+        self.assertEqual(vertex_view.shape, (4, 3))
+        self.assertEqual(triangle_view.shape, (2, 3))
+        self.assertFalse(vertex_view.flags.owndata)
+        self.assertFalse(triangle_view.flags.owndata)
+        vertex_view[0, 0] = 99.0
+        self.assertEqual(np.asarray(mesh.vertices)[0, 0], 99.0)
+
+        vertices[1, 1] = -1.0
+        self.assertNotEqual(np.asarray(mesh.vertices)[1, 1], -1.0)
+        with self.assertRaisesRegex(ValueError, "shape"):
+            visacd.Mesh(np.zeros((3, 2)), triangles)
+
 
 @unittest.skipUnless(
     RUN_GPU_TESTS,

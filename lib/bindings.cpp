@@ -1,5 +1,6 @@
 #include <config.hpp>
 #include <core.hpp>
+#include <cstring>
 #include <iostream>
 #include <process.hpp>
 #include <pybind11/numpy.h>
@@ -11,17 +12,69 @@ namespace py = pybind11;
 PYBIND11_MAKE_OPAQUE(std::vector<std::array<double, 3>>);
 PYBIND11_MAKE_OPAQUE(std::vector<std::array<int, 3>>);
 
+namespace {
+
+template <typename T>
+std::vector<std::array<T, 3>> copy_triplets(
+    py::array_t<T, py::array::c_style | py::array::forcecast> input,
+    const char *name) {
+    static_assert(sizeof(std::array<T, 3>) == 3 * sizeof(T));
+    const py::buffer_info buffer = input.request();
+    if (buffer.ndim != 2 || buffer.shape[1] != 3) {
+        throw py::value_error(std::string(name) +
+                              " must have shape (N, 3)");
+    }
+    std::vector<std::array<T, 3>> result(
+        static_cast<size_t>(buffer.shape[0]));
+    if (!result.empty()) {
+        std::memcpy(result.data(), buffer.ptr,
+                    result.size() * sizeof(std::array<T, 3>));
+    }
+    return result;
+}
+
+} // namespace
+
 PYBIND11_MODULE(visacd, m)
 {
-    py::bind_vector<std::vector<std::array<double, 3>>>(
-        m, "VecArray3d"); // 3D vector array
-    py::bind_vector<std::vector<std::array<int, 3>>>(
-        m, "VecArray3i"); // triangle array
+    auto vec_array_3d =
+        py::bind_vector<std::vector<std::array<double, 3>>>(
+            m, "VecArray3d", py::buffer_protocol());
+    vec_array_3d.def_buffer(
+        [](std::vector<std::array<double, 3>> &values) {
+            return py::buffer_info(
+                values.data(), sizeof(double),
+                py::format_descriptor<double>::format(), 2,
+                {values.size(), size_t{3}},
+                {sizeof(std::array<double, 3>), sizeof(double)});
+        });
+    auto vec_array_3i = py::bind_vector<std::vector<std::array<int, 3>>>(
+        m, "VecArray3i", py::buffer_protocol());
+    vec_array_3i.def_buffer(
+        [](std::vector<std::array<int, 3>> &values) {
+            return py::buffer_info(
+                values.data(), sizeof(int),
+                py::format_descriptor<int>::format(), 2,
+                {values.size(), size_t{3}},
+                {sizeof(std::array<int, 3>), sizeof(int)});
+        });
 
     py::class_<neural_acd::Mesh>(m, "Mesh")
         .def_readwrite("vertices", &neural_acd::Mesh::vertices)
         .def_readwrite("triangles", &neural_acd::Mesh::triangles)
-        .def(py::init<>());
+        .def(py::init<>())
+        .def(py::init([](
+                          py::array_t<
+                              double, py::array::c_style |
+                                          py::array::forcecast> vertices,
+                          py::array_t<
+                              int, py::array::c_style |
+                                       py::array::forcecast> triangles) {
+            neural_acd::Mesh mesh;
+            mesh.vertices = copy_triplets<double>(vertices, "vertices");
+            mesh.triangles = copy_triplets<int>(triangles, "triangles");
+            return mesh;
+        }), py::arg("vertices"), py::arg("triangles"));
 
     py::bind_vector<neural_acd::MeshList>(m, "MeshList");
 
@@ -43,23 +96,16 @@ PYBIND11_MODULE(visacd, m)
         .def_readwrite("batch_cpu_threads",
                        &neural_acd::Config::batch_cpu_threads);
 
-    m.def("make_vecarray3i", [](py::array_t<int> input)
-          {
-    auto buf = input.request();
-    std::vector<std::array<int, 3>> result;
-
-    int X = buf.shape[0];
-    int *ptr = (int *)buf.ptr;
-
-    for (size_t idx = 0; idx < X; idx++) {
-      std::array<int, 3> arr;
-      arr[0] = ptr[idx * 3];
-      arr[1] = ptr[idx * 3 + 1];
-      arr[2] = ptr[idx * 3 + 2];
-      result.push_back(arr);
-    }
-
-    return result; });
+    m.def("make_vecarray3d", [](py::array_t<
+                                     double, py::array::c_style |
+                                                 py::array::forcecast> input) {
+        return copy_triplets<double>(input, "input");
+    });
+    m.def("make_vecarray3i", [](py::array_t<
+                                     int, py::array::c_style |
+                                              py::array::forcecast> input) {
+        return copy_triplets<int>(input, "input");
+    });
 
     m.def("set_seed", &neural_acd::set_seed, py::arg("seed"));
 
@@ -71,8 +117,10 @@ PYBIND11_MODULE(visacd, m)
         .def_readwrite("concavity", &neural_acd::ProcessResult::concavity)
         .def_readwrite("num_parts", &neural_acd::ProcessResult::num_parts);
 
-    m.def("process", &neural_acd::process, py::arg("mesh"), py::arg("concavity"),
-          py::arg("num_parts"));
+    m.def("process", &neural_acd::process, py::arg("mesh"),
+          py::arg("concavity"), py::arg("num_parts"),
+          py::call_guard<py::gil_scoped_release>());
     m.def("process_batch", &neural_acd::process_batch, py::arg("meshes"),
-          py::arg("concavity"), py::arg("num_parts"));
+          py::arg("concavity"), py::arg("num_parts"),
+          py::call_guard<py::gil_scoped_release>());
 }

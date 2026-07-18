@@ -100,16 +100,10 @@ def load_batch(path, count):
     loaded = trimesh.load(path, force="mesh")
     if not isinstance(loaded, trimesh.Trimesh):
         raise TypeError("{} did not load as a triangle mesh".format(path))
-    vertices = np.asarray(loaded.vertices, dtype=np.float64).tolist()
-    triangles = np.asarray(loaded.faces, dtype=np.int32)
+    vertices = np.ascontiguousarray(loaded.vertices, dtype=np.float64)
+    triangles = np.ascontiguousarray(loaded.faces, dtype=np.int32)
 
-    meshes = []
-    for _ in range(count):
-        mesh = visacd.Mesh()
-        mesh.vertices = visacd.VecArray3d(vertices)
-        mesh.triangles = visacd.make_vecarray3i(triangles)
-        meshes.append(mesh)
-    return meshes
+    return [visacd.Mesh(vertices, triangles) for _ in range(count)]
 
 
 @contextmanager
@@ -134,8 +128,8 @@ def result_digest(results):
     for result in results:
         digest.update(struct.pack("<di", result.concavity, result.num_parts))
         for part in result.parts:
-            vertices = np.asarray(list(part.vertices), dtype="<f8")
-            triangles = np.asarray(list(part.triangles), dtype="<i4")
+            vertices = np.asarray(part.vertices, dtype="<f8")
+            triangles = np.asarray(part.triangles, dtype="<i4")
             digest.update(struct.pack("<QQ", len(vertices), len(triangles)))
             digest.update(vertices.tobytes())
             digest.update(triangles.tobytes())
