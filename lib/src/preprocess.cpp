@@ -1,9 +1,11 @@
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <core.hpp>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -14,7 +16,9 @@
 #include <openvdb/util/Util.h>
 #include <preprocess.hpp>
 #include <preprocess_cuda.hpp>
+#include <preprocess_expand_cuda.hpp>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace openvdb;
@@ -37,13 +41,416 @@ bool environment_enabled(const char *name) {
   return value != nullptr && value[0] != '\0' && string(value) != "0";
 }
 
+using NarrowbandTree = DoubleGrid::TreeType;
+using NarrowbandLeaf = NarrowbandTree::LeafNodeType;
+using NarrowbandIndexTree =
+    NarrowbandTree::ValueConverter<Int32>::Type;
+using NarrowbandBoolTree =
+    NarrowbandTree::ValueConverter<bool>::Type;
+using NarrowbandBoolLeaf = NarrowbandBoolTree::LeafNodeType;
+
+struct NarrowbandLeafWork {
+  Coord origin;
+  CoordBBox bounds;
+  NarrowbandLeaf::NodeMaskType second_mask;
+  size_t fragment_offset = 0;
+  size_t fragment_count = 0;
+  size_t first_candidate_offset = 0;
+  size_t first_candidate_count = 0;
+  size_t second_candidate_offset = 0;
+  size_t second_candidate_count = 0;
+};
+
+void gather_narrowband_fragments(
+    const CoordBBox &bounds,
+    tree::ValueAccessor<NarrowbandTree> &distance_accessor,
+    tree::ValueAccessor<NarrowbandIndexTree> &index_accessor,
+    vector<NarrowbandFragment> &fragments) {
+  const Coord node_minimum =
+      bounds.min() & ~(NarrowbandLeaf::DIM - 1);
+  const Coord node_maximum =
+      bounds.max() & ~(NarrowbandLeaf::DIM - 1);
+  Coord origin;
+  for (origin[0] = node_minimum[0]; origin[0] <= node_maximum[0];
+       origin[0] += NarrowbandLeaf::DIM) {
+    for (origin[1] = node_minimum[1]; origin[1] <= node_maximum[1];
+         origin[1] += NarrowbandLeaf::DIM) {
+      for (origin[2] = node_minimum[2]; origin[2] <= node_maximum[2];
+           origin[2] += NarrowbandLeaf::DIM) {
+        const NarrowbandLeaf *distance_leaf =
+            distance_accessor.probeConstLeaf(origin);
+        if (!distance_leaf)
+          continue;
+        const NarrowbandIndexTree::LeafNodeType *index_leaf =
+            index_accessor.probeConstLeaf(origin);
+        if (!index_leaf)
+          throw logic_error("Narrowband distance and index trees diverged");
+        const Coord region_minimum =
+            Coord::maxComponent(bounds.min(), origin);
+        const Coord region_maximum = Coord::minComponent(
+            bounds.max(),
+            origin.offsetBy(NarrowbandLeaf::DIM - 1));
+        const auto &mask = distance_leaf->getValueMask();
+        const Int32 *indices = index_leaf->buffer().data();
+        for (int x = region_minimum[0]; x <= region_maximum[0]; ++x) {
+          for (int y = region_minimum[1]; y <= region_maximum[1]; ++y) {
+            for (int z = region_minimum[2]; z <= region_maximum[2]; ++z) {
+              const Coord coordinate(x, y, z);
+              const Index position =
+                  NarrowbandLeaf::coordToOffset(coordinate);
+              if (mask.isOn(position)) {
+                fragments.push_back(
+                    {indices[position], x, y, z});
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+bool update_narrowband_voxel(
+    const Coord &coordinate, const NarrowbandDistance &evaluation,
+    tree::ValueAccessor<NarrowbandTree> &distance_accessor,
+    tree::ValueAccessor<NarrowbandIndexTree> &index_accessor,
+    double exterior_width, double interior_width, double voxel_size) {
+  const bool inside = distance_accessor.getValue(coordinate) < 0.0;
+  if (!inside && evaluation.distance < exterior_width) {
+    distance_accessor.setValue(coordinate, evaluation.distance);
+    index_accessor.setValue(coordinate, evaluation.triangle_index);
+    return evaluation.distance + voxel_size < exterior_width;
+  }
+  if (inside && evaluation.distance < interior_width) {
+    distance_accessor.setValue(coordinate, -evaluation.distance);
+    index_accessor.setValue(coordinate, evaluation.triangle_index);
+    return evaluation.distance + voxel_size < interior_width;
+  }
+  return false;
+}
+
+void evaluate_narrowband_distances(
+    const Mesh &source_mesh, double scale, const vector<Vec3s> &points,
+    const vector<Vec3I> &triangles, double voxel_size,
+    const vector<NarrowbandFragment> &fragments,
+    const vector<NarrowbandCandidate> &candidates,
+    vector<NarrowbandDistance> &distances);
+
+void expand_narrowband_cuda_iteration(
+    NarrowbandTree &distance_tree, NarrowbandIndexTree &index_tree,
+    NarrowbandBoolTree &mask_tree,
+    vector<NarrowbandBoolLeaf *> &mask_nodes, const Mesh &source_mesh,
+    double scale, const vector<Vec3s> &points,
+    const vector<Vec3I> &triangles, double exterior_width,
+    double interior_width, double voxel_size) {
+  vector<NarrowbandLeafWork> work;
+  vector<NarrowbandFragment> fragments;
+  vector<NarrowbandCandidate> first_candidates;
+  work.reserve(mask_nodes.size());
+  tree::ValueAccessor<NarrowbandTree> distance_accessor(distance_tree);
+  tree::ValueAccessor<NarrowbandIndexTree> index_accessor(index_tree);
+
+  for (NarrowbandBoolLeaf *mask_leaf : mask_nodes) {
+    if (!mask_leaf || mask_leaf->isEmpty())
+      continue;
+    NarrowbandLeafWork leaf_work;
+    leaf_work.origin = mask_leaf->origin();
+    leaf_work.bounds = mask_leaf->getNodeBoundingBox();
+    CoordBBox fragment_bounds(Coord::max(), Coord::min());
+    for (auto iterator = mask_leaf->cbeginValueOn(); iterator; ++iterator)
+      fragment_bounds.expand(iterator.getCoord());
+    fragment_bounds.expand(1);
+    leaf_work.fragment_offset = fragments.size();
+    gather_narrowband_fragments(fragment_bounds, distance_accessor,
+                                index_accessor, fragments);
+    leaf_work.fragment_count =
+        fragments.size() - leaf_work.fragment_offset;
+    sort(fragments.begin() + leaf_work.fragment_offset, fragments.end(),
+         [](const NarrowbandFragment &first,
+            const NarrowbandFragment &second) {
+           return first.triangle_index < second.triangle_index;
+         });
+    leaf_work.first_candidate_offset = first_candidates.size();
+    for (auto iterator = mask_leaf->cbeginValueOn(); iterator; ++iterator) {
+      const Coord coordinate = iterator.getCoord();
+      first_candidates.push_back(
+          {coordinate[0], coordinate[1], coordinate[2], 5,
+           leaf_work.fragment_offset, leaf_work.fragment_count});
+    }
+    leaf_work.first_candidate_count =
+        first_candidates.size() - leaf_work.first_candidate_offset;
+    work.push_back(move(leaf_work));
+  }
+
+  vector<NarrowbandDistance> first_distances;
+  evaluate_narrowband_distances(
+      source_mesh, scale, points, triangles, voxel_size, fragments,
+      first_candidates, first_distances);
+
+  NarrowbandBoolTree next_mask_tree(false);
+  tree::ValueAccessor<NarrowbandBoolTree> next_mask_accessor(next_mask_tree);
+  vector<NarrowbandCandidate> second_candidates;
+  for (NarrowbandLeafWork &leaf_work : work) {
+    for (size_t local = 0; local < leaf_work.first_candidate_count;
+         ++local) {
+      const size_t candidate_index =
+          leaf_work.first_candidate_offset + local;
+      const NarrowbandCandidate &candidate =
+          first_candidates[candidate_index];
+      const Coord coordinate(candidate.x, candidate.y, candidate.z);
+      if (!update_narrowband_voxel(
+              coordinate, first_distances[candidate_index],
+              distance_accessor, index_accessor, exterior_width,
+              interior_width, voxel_size)) {
+        continue;
+      }
+      for (int neighbour = 0; neighbour < 6; ++neighbour) {
+        const Coord adjacent =
+            coordinate + util::COORD_OFFSETS[neighbour];
+        if (leaf_work.bounds.isInside(adjacent)) {
+          leaf_work.second_mask.setOn(
+              NarrowbandLeaf::coordToOffset(adjacent));
+        } else {
+          next_mask_accessor.setValueOn(adjacent);
+        }
+      }
+      for (int neighbour = 6; neighbour < 26; ++neighbour) {
+        const Coord adjacent =
+            coordinate + util::COORD_OFFSETS[neighbour];
+        if (leaf_work.bounds.isInside(adjacent)) {
+          leaf_work.second_mask.setOn(
+              NarrowbandLeaf::coordToOffset(adjacent));
+        }
+      }
+    }
+
+    leaf_work.second_candidate_offset = second_candidates.size();
+    for (auto iterator = leaf_work.second_mask.beginOn(); iterator;
+         ++iterator) {
+      const Coord coordinate =
+          leaf_work.origin + NarrowbandLeaf::offsetToLocalCoord(iterator.pos());
+      if (index_accessor.isValueOn(coordinate))
+        continue;
+      second_candidates.push_back(
+          {coordinate[0], coordinate[1], coordinate[2], 6,
+           leaf_work.fragment_offset, leaf_work.fragment_count});
+    }
+    leaf_work.second_candidate_count =
+        second_candidates.size() - leaf_work.second_candidate_offset;
+  }
+
+  vector<NarrowbandDistance> second_distances;
+  evaluate_narrowband_distances(
+      source_mesh, scale, points, triangles, voxel_size, fragments,
+      second_candidates, second_distances);
+  for (const NarrowbandLeafWork &leaf_work : work) {
+    for (size_t local = 0; local < leaf_work.second_candidate_count;
+         ++local) {
+      const size_t candidate_index =
+          leaf_work.second_candidate_offset + local;
+      const NarrowbandCandidate &candidate =
+          second_candidates[candidate_index];
+      const Coord coordinate(candidate.x, candidate.y, candidate.z);
+      if (!update_narrowband_voxel(
+              coordinate, second_distances[candidate_index],
+              distance_accessor, index_accessor, exterior_width,
+              interior_width, voxel_size)) {
+        continue;
+      }
+      for (int neighbour = 0; neighbour < 6; ++neighbour) {
+        next_mask_accessor.setValueOn(
+            coordinate + util::COORD_OFFSETS[neighbour]);
+      }
+    }
+  }
+  mask_tree.clear();
+  mask_tree.merge(next_mask_tree);
+}
+
+void evaluate_narrowband_distances_cpu(
+    const vector<Vec3s> &points, const vector<Vec3I> &triangles,
+    double voxel_size, const vector<NarrowbandFragment> &fragments,
+    const vector<NarrowbandCandidate> &candidates,
+    vector<NarrowbandDistance> &distances) {
+  distances.resize(candidates.size());
+  for (size_t candidate_index = 0;
+       candidate_index < candidates.size(); ++candidate_index) {
+    const NarrowbandCandidate &candidate = candidates[candidate_index];
+    const Vec3d center(candidate.x, candidate.y, candidate.z);
+    double closest_distance = numeric_limits<double>::max();
+    int closest_triangle_index = 0;
+    int last_triangle_index = Int32(util::INVALID_IDX);
+    const size_t end =
+        candidate.fragment_offset + candidate.fragment_count;
+    for (size_t fragment_index = candidate.fragment_offset;
+         fragment_index < end; ++fragment_index) {
+      const NarrowbandFragment &fragment = fragments[fragment_index];
+      if (last_triangle_index == fragment.triangle_index)
+        continue;
+      const int manhattan = abs(fragment.x - candidate.x) +
+                            abs(fragment.y - candidate.y) +
+                            abs(fragment.z - candidate.z);
+      if (manhattan > candidate.manhattan_limit)
+        continue;
+      last_triangle_index = fragment.triangle_index;
+      const Vec3I &triangle = triangles[fragment.triangle_index];
+      const Vec3d a(points[triangle[0]]);
+      const Vec3d b(points[triangle[1]]);
+      const Vec3d c(points[triangle[2]]);
+      Vec3d uvw;
+      const double distance =
+          (center - math::closestPointOnTriangleToPoint(
+                        a, c, b, center, uvw))
+              .lengthSqr();
+      if (distance < closest_distance) {
+        closest_distance = distance;
+        closest_triangle_index = fragment.triangle_index;
+      }
+    }
+    distances[candidate_index] =
+        {sqrt(closest_distance) * voxel_size, closest_triangle_index};
+  }
+}
+
+struct NarrowbandBatchRequest {
+  NarrowbandEvaluationInput input;
+  bool done = false;
+  exception_ptr error;
+};
+
+class NarrowbandCudaBatcher {
+public:
+  void evaluate(const NarrowbandEvaluationInput &input) {
+    if (input.candidates->empty()) {
+      input.distances->clear();
+      return;
+    }
+    auto request = make_shared<NarrowbandBatchRequest>();
+    request->input = input;
+    bool leader = false;
+    {
+      lock_guard<mutex> lock(mutex_);
+      queue_.push_back(request);
+      if (!processing_) {
+        processing_ = true;
+        leader = true;
+      }
+      condition_.notify_all();
+    }
+
+    if (!leader) {
+      unique_lock<mutex> lock(mutex_);
+      condition_.wait(lock, [&]() { return request->done; });
+      if (request->error)
+        rethrow_exception(request->error);
+      return;
+    }
+
+    while (true) {
+      vector<shared_ptr<NarrowbandBatchRequest>> batch;
+      {
+        unique_lock<mutex> lock(mutex_);
+        condition_.wait_for(lock, chrono::microseconds(250), [&]() {
+          return queue_.size() >= 32;
+        });
+        const size_t count = min<size_t>(200, queue_.size());
+        batch.reserve(count);
+        for (size_t index = 0; index < count; ++index) {
+          batch.push_back(move(queue_.front()));
+          queue_.pop_front();
+        }
+      }
+
+      exception_ptr error;
+      try {
+        vector<NarrowbandEvaluationInput> inputs;
+        inputs.reserve(batch.size());
+        size_t candidate_count = 0;
+        for (const auto &pending : batch) {
+          inputs.push_back(pending->input);
+          candidate_count += pending->input.candidates->size();
+        }
+        if (environment_enabled("VISACD_PREPROCESS_EXPAND_TRACE")) {
+          cerr << "[visacd expand] meshes=" << batch.size()
+               << " candidates=" << candidate_count << '\n';
+        }
+        evaluate_narrowband_distances_cuda_batch(inputs);
+      } catch (...) {
+        error = current_exception();
+      }
+
+      bool finished = false;
+      {
+        lock_guard<mutex> lock(mutex_);
+        for (const auto &pending : batch) {
+          pending->error = error;
+          pending->done = true;
+        }
+        if (queue_.empty()) {
+          processing_ = false;
+          finished = true;
+        }
+        condition_.notify_all();
+      }
+      if (finished)
+        break;
+    }
+
+    if (request->error)
+      rethrow_exception(request->error);
+  }
+
+private:
+  mutex mutex_;
+  condition_variable condition_;
+  deque<shared_ptr<NarrowbandBatchRequest>> queue_;
+  bool processing_ = false;
+};
+
+NarrowbandCudaBatcher &narrowband_cuda_batcher() {
+  static NarrowbandCudaBatcher batcher;
+  return batcher;
+}
+
+void evaluate_narrowband_distances(
+    const Mesh &source_mesh, double scale, const vector<Vec3s> &points,
+    const vector<Vec3I> &triangles, double voxel_size,
+    const vector<NarrowbandFragment> &fragments,
+    const vector<NarrowbandCandidate> &candidates,
+    vector<NarrowbandDistance> &distances) {
+  try {
+    narrowband_cuda_batcher().evaluate(
+        {&source_mesh, scale, voxel_size, &fragments, &candidates,
+         &distances});
+  } catch (...) {
+    evaluate_narrowband_distances_cpu(
+        points, triangles, voxel_size, fragments, candidates, distances);
+    return;
+  }
+  if (!environment_enabled("VISACD_VERIFY_CUDA_PREPROCESS_EXPAND"))
+    return;
+  vector<NarrowbandDistance> reference;
+  evaluate_narrowband_distances_cpu(
+      points, triangles, voxel_size, fragments, candidates, reference);
+  bool exact = reference.size() == distances.size();
+  for (size_t index = 0; exact && index < reference.size(); ++index) {
+    exact = reference[index].triangle_index ==
+                distances[index].triangle_index &&
+            memcmp(&reference[index].distance, &distances[index].distance,
+                   sizeof(double)) == 0;
+  }
+  if (!exact)
+    distances = move(reference);
+}
+
 // This is the post-voxelization portion of OpenVDB 8.2's MeshToVolume
 // pipeline, specialized for the exact surface records produced on CUDA.
 DoubleGrid::Ptr signed_distance_field_from_surface(
     const vector<Vec3s> &points, const vector<Vec3I> &triangles,
     const math::Transform &transform,
     const vector<SurfaceVoxelRecord> &surface, float exterior_band_width,
-    float interior_band_width, ManifoldPreprocessMetrics *metrics) {
+    float interior_band_width, ManifoldPreprocessMetrics *metrics,
+    const Mesh &source_mesh, double scale) {
   using GridType = DoubleGrid;
   using TreeType = GridType::TreeType;
   using LeafNodeType = TreeType::LeafNodeType;
@@ -170,9 +577,16 @@ DoubleGrid::Ptr signed_distance_field_from_surface(
           range,
           tools::mesh_to_volume_internal::DiffLeafNodeMask<TreeType>(
               distance_tree, mask_nodes));
-      tools::mesh_to_volume_internal::expandNarrowband(
-          distance_tree, index_tree, mask_tree, mask_nodes, mesh,
-          exterior_width, interior_width, voxel_size);
+      if (environment_enabled("VISACD_ENABLE_CUDA_PREPROCESS_EXPAND")) {
+        expand_narrowband_cuda_iteration(
+            distance_tree, index_tree, mask_tree, mask_nodes,
+            source_mesh, scale, points, triangles, exterior_width,
+            interior_width, voxel_size);
+      } else {
+        tools::mesh_to_volume_internal::expandNarrowband(
+            distance_tree, index_tree, mask_tree, mask_nodes, mesh,
+            exterior_width, interior_width, voxel_size);
+      }
       if (++iteration >= maximum_iterations)
         break;
     }
@@ -335,7 +749,8 @@ bool sdf_manifold(Mesh &input, Mesh &output, double scale, double level_set,
   if (provided_surface) {
     sgrid = signed_distance_field_from_surface(
         points, tris, *xform, *provided_surface,
-        static_cast<float>(level_set * scale + 1.0), 3.0f, metrics);
+        static_cast<float>(level_set * scale + 1.0), 3.0f, metrics,
+        input, scale);
   } else if (use_cuda) {
     try {
       static thread_local ManifoldCudaRuntime runtime;
@@ -348,7 +763,8 @@ bool sdf_manifold(Mesh &input, Mesh &output, double scale, double level_set,
       }
       sgrid = signed_distance_field_from_surface(
           points, tris, *xform, surface.records,
-          static_cast<float>(level_set * scale + 1.0), 3.0f, metrics);
+          static_cast<float>(level_set * scale + 1.0), 3.0f, metrics,
+          input, scale);
     } catch (const exception &error) {
       if (fallback_reason)
         *fallback_reason = error.what();

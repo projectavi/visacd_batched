@@ -1,0 +1,48 @@
+#pragma once
+
+#include <core.hpp>
+#include <cstddef>
+#include <vector>
+
+namespace neural_acd {
+
+struct NarrowbandFragment {
+  int triangle_index = 0;
+  int x = 0;
+  int y = 0;
+  int z = 0;
+};
+
+struct NarrowbandCandidate {
+  int x = 0;
+  int y = 0;
+  int z = 0;
+  int manhattan_limit = 0;
+  size_t fragment_offset = 0;
+  size_t fragment_count = 0;
+};
+
+struct NarrowbandDistance {
+  double distance = 0.0;
+  int triangle_index = 0;
+};
+
+struct NarrowbandEvaluationInput {
+  const Mesh *mesh = nullptr;
+  double scale = 1.0;
+  double voxel_size = 1.0;
+  const std::vector<NarrowbandFragment> *fragments = nullptr;
+  const std::vector<NarrowbandCandidate> *candidates = nullptr;
+  std::vector<NarrowbandDistance> *distances = nullptr;
+};
+
+void evaluate_narrowband_distances_cuda_batch(
+    const std::vector<NarrowbandEvaluationInput> &inputs);
+
+void evaluate_narrowband_distances_cuda(
+    const Mesh &mesh, double scale, double voxel_size,
+    const std::vector<NarrowbandFragment> &fragments,
+    const std::vector<NarrowbandCandidate> &candidates,
+    std::vector<NarrowbandDistance> &distances);
+
+} // namespace neural_acd
