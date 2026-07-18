@@ -255,7 +255,7 @@ class BatchGpuTests(unittest.TestCase):
             load_sample(name)
             for name in ("cow.obj", "KitchenPot.obj", "armadillo.obj")
         ]
-        for max_batch_size in (1, 3, 200):
+        for max_batch_size in (0, 1, 3, 200):
             for scale in (20.0, 30.0, 40.0):
                 with self.subTest(
                     max_batch_size=max_batch_size, scale=scale
@@ -272,6 +272,13 @@ class BatchGpuTests(unittest.TestCase):
                         self.assertEqual(case["coordinate_mismatches"], 0)
                         self.assertEqual(case["distance_mismatches"], 0)
                         self.assertEqual(case["triangle_mismatches"], 0)
+
+        low_memory = visacd._verify_preprocess_voxelization_batch(
+            meshes, 30.0, 0, 1e-12
+        )
+        for case in low_memory["cases"]:
+            self.assertFalse(case["supported"])
+            self.assertIn("memory budget", case["fallback_reason"])
 
     def test_cuda_manifold_preprocessing_matches_openvdb(self):
         configurations = (
@@ -295,17 +302,30 @@ class BatchGpuTests(unittest.TestCase):
                     self.assertEqual(comparison["triangle_mismatches"], 0)
 
     def test_cuda_preprocessing_preserves_decomposition_output(self):
-        visacd.config.max_batch_size = 1
-        visacd.config.batch_cpu_threads = 1
         os.environ.pop("VISACD_ENABLE_CUDA_PREPROCESS", None)
         os.environ.pop("VISACD_VERIFY_CUDA_PREPROCESS", None)
+        visacd.config.max_batch_size = 0
+        visacd.config.batch_cpu_threads = 0
         visacd.set_seed(1234)
-        reference = visacd.process_batch([load_cow()], 0.04, 2)
+        reference = visacd.process_batch(
+            [load_cow(-100.0), load_cow(100.0)], 0.04, 2
+        )
 
         os.environ["VISACD_ENABLE_CUDA_PREPROCESS"] = "1"
         visacd.set_seed(1234)
-        candidate = visacd.process_batch([load_cow()], 0.04, 2)
+        candidate = visacd.process_batch(
+            [load_cow(-100.0), load_cow(100.0)], 0.04, 2
+        )
+        visacd.config.max_batch_size = 1
+        visacd.config.batch_cpu_threads = 1
+        visacd.set_seed(1234)
+        forced_waves = visacd.process_batch(
+            [load_cow(-100.0), load_cow(100.0)], 0.04, 2
+        )
         self.assertEqual(result_digest(reference), result_digest(candidate))
+        self.assertEqual(
+            result_digest(reference), result_digest(forced_waves)
+        )
 
     def test_flat_surface_pipeline_is_repeatable(self):
         def run(
