@@ -37,6 +37,17 @@ def parse_args():
             "scale/level-set configuration"
         ),
     )
+    parser.add_argument(
+        "--packed",
+        action="store_true",
+        help="also verify all meshes through packed CUDA waves",
+    )
+    parser.add_argument(
+        "--max-batch-size",
+        type=int,
+        default=0,
+        help="forced packed wave size; 0 uses memory-aware sizing",
+    )
     return parser.parse_args()
 
 
@@ -95,6 +106,55 @@ def main():
             exact + fallbacks + failures, exact, fallbacks, failures
         )
     )
+
+    if args.packed:
+        packed_exact = 0
+        packed_fallbacks = 0
+        packed_failures = 0
+        meshes = [load_mesh(path) for path in paths]
+        for scale in scales:
+            comparison = visacd._verify_preprocess_voxelization_batch(
+                meshes,
+                scale,
+                args.max_batch_size,
+                args.memory_fraction,
+            )
+            for path, result in zip(paths, comparison["cases"]):
+                print(
+                    "packed_mesh={} scale={} supported={} exact={} "
+                    "reference_voxels={} candidate_voxels={} "
+                    "coordinate_mismatches={} distance_mismatches={} "
+                    "triangle_mismatches={} wave_ms={:.3f} "
+                    "fallback_reason={}".format(
+                        path,
+                        scale,
+                        result["supported"],
+                        result["exact"],
+                        result["reference_voxels"],
+                        result["candidate_voxels"],
+                        result["coordinate_mismatches"],
+                        result["distance_mismatches"],
+                        result["triangle_mismatches"],
+                        result["cuda_wave_ms"],
+                        result["fallback_reason"],
+                    ),
+                    flush=True,
+                )
+                if result["exact"]:
+                    packed_exact += 1
+                elif not result["supported"]:
+                    packed_fallbacks += 1
+                else:
+                    packed_failures += 1
+        print(
+            "packed_summary cases={} exact={} fallbacks={} failures={}".format(
+                packed_exact + packed_fallbacks + packed_failures,
+                packed_exact,
+                packed_fallbacks,
+                packed_failures,
+            )
+        )
+        failures += packed_failures
 
     if args.full_output:
         configurations = [
