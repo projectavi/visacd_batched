@@ -7,10 +7,14 @@
 
 namespace neural_acd {
 
+class DeviceMesh;
+
 struct ComponentBatchInput {
   const Mesh *mesh = nullptr;
   std::vector<int> *labels = nullptr;
   MeshList *components = nullptr;
+  const DeviceMesh *projected_edge_source = nullptr;
+  const std::vector<int> *projected_vertex_map = nullptr;
 };
 
 class ComponentBatchRuntime {
@@ -44,7 +48,10 @@ void label_components_batch(const std::vector<ComponentBatchInput> &inputs,
 // Labels and stably compacts connected components on the GPU. The returned
 // meshes preserve the ordering of assemble_disjoint_parts exactly: component
 // order follows first triangle occurrence, vertices follow first corner
-// occurrence, and triangles and intersecting edges retain source order.
+// occurrence, and triangles and intersecting edges retain source order. When
+// projected_edge_source and projected_vertex_map are provided, the source
+// mesh's intersecting edges are projected through the 1-based vertex map on
+// the GPU before component assignment.
 void separate_components_batch(
     const std::vector<ComponentBatchInput> &inputs,
     ComponentBatchRuntime &runtime, size_t max_batch_size = 0,

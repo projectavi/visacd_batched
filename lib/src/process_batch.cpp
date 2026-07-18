@@ -221,6 +221,8 @@ struct ComponentWork {
   bool initial = false;
   MeshList parts;
   vector<MeshList> separated;
+  shared_ptr<DeviceMesh> projected_edge_source;
+  vector<vector<int>> projected_vertex_maps;
 };
 
 struct FinalizeWork {
@@ -981,6 +983,11 @@ int get_part_with_highest_cached_concavity(const BatchState &state,
   return best_index;
 }
 
+bool gpu_edge_projection_enabled() {
+  const char *disabled = getenv("VISACD_DISABLE_GPU_EDGE_PROJECTION");
+  return !disabled || !*disabled || string(disabled) == "0";
+}
+
 void propagate_existing_edges(
     const Mesh &part, const int *first_map, const int *second_map,
     MeshList &new_parts) {
@@ -1503,15 +1510,23 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
             return;
           }
 
-          propagate_existing_edges(split->part, first_map, second_map,
-                                   new_parts);
-          delete[] first_map;
-          delete[] second_map;
-
           auto components = make_shared<ComponentWork>();
           components->state_index = split->state_index;
+          if (gpu_edge_projection_enabled() && split->part_cache.device) {
+            components->projected_edge_source = split->part_cache.device;
+            components->projected_vertex_maps.resize(2);
+            components->projected_vertex_maps[0].assign(
+                first_map, first_map + split->part.vertices.size());
+            components->projected_vertex_maps[1].assign(
+                second_map, second_map + split->part.vertices.size());
+          } else {
+            propagate_existing_edges(split->part, first_map, second_map,
+                                     new_parts);
+          }
           components->parts = move(new_parts);
           components->separated.resize(components->parts.size());
+          delete[] first_map;
+          delete[] second_map;
           coordinator.enqueue_components(move(components));
         },
         true);
@@ -1898,8 +1913,17 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
             throw logic_error("Component work is out of sync");
           for (size_t part_index = 0; part_index < work->parts.size();
                ++part_index) {
-            inputs.push_back({&work->parts[part_index], nullptr,
-                              &work->separated[part_index]});
+            const bool projects_edges =
+                work->projected_edge_source &&
+                part_index < work->projected_vertex_maps.size();
+            inputs.push_back(
+                {&work->parts[part_index], nullptr,
+                 &work->separated[part_index],
+                 projects_edges ? work->projected_edge_source.get()
+                                : nullptr,
+                 projects_edges
+                     ? &work->projected_vertex_maps[part_index]
+                     : nullptr});
           }
         }
         coordinator.submit_gpu(
