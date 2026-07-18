@@ -473,11 +473,6 @@ bool batched_cuda_preprocessing_enabled() {
          !environment_flag_enabled("VISACD_VERIFY_CUDA_PREPROCESS");
 }
 
-bool batched_cuda_child_preprocessing_enabled() {
-  const char *value = getenv("VISACD_BATCH_CHILD_PREPROCESS");
-  return !value || !*value || string(value) != "0";
-}
-
 size_t environment_size(const char *name, size_t fallback,
                         size_t maximum) {
   const char *value = getenv(name);
@@ -489,17 +484,6 @@ size_t environment_size(const char *name, size_t fallback,
     throw invalid_argument(string(name) + " must be in [1, " +
                            to_string(maximum) + "]");
   return static_cast<size_t>(parsed);
-}
-
-size_t configured_preprocess_batch_threshold(size_t total_states) {
-  const size_t automatic = max<size_t>(1, min<size_t>(64, total_states));
-  return environment_size("VISACD_PREPROCESS_BATCH_THRESHOLD", automatic,
-                          200);
-}
-
-chrono::microseconds configured_preprocess_coalesce_time() {
-  return chrono::microseconds(environment_size(
-      "VISACD_PREPROCESS_COALESCE_US", 1000, 100000));
 }
 
 template <typename Work, typename SizeFunction>
@@ -594,11 +578,7 @@ public:
                       size_t total_states, size_t gpu_batch_threshold)
       : executor_(executor), gpu_executor_(gpu_executor),
         total_states_(total_states),
-        gpu_batch_threshold_(max<size_t>(1, gpu_batch_threshold)),
-        preprocess_batch_threshold_(
-            configured_preprocess_batch_threshold(total_states)),
-        preprocess_coalesce_time_(
-            configured_preprocess_coalesce_time()) {}
+        gpu_batch_threshold_(max<size_t>(1, gpu_batch_threshold)) {}
 
   void submit_cpu(function<void()> task, bool priority = false) {
     submit_task(executor_, move(task), priority);
@@ -724,10 +704,7 @@ public:
         return GpuWork{GpuWorkKind::complete};
 
       if (!gpu_batch_ready() && active_tasks_ != 0) {
-        const auto coalesce_time = preprocess_queue_.empty()
-                                       ? chrono::milliseconds(1)
-                                       : preprocess_coalesce_time_;
-        condition_.wait_for(lock, coalesce_time, [this]() {
+        condition_.wait_for(lock, chrono::milliseconds(1), [this]() {
           return error_ || completed() || gpu_batch_ready() ||
                  active_tasks_ == 0;
         });
@@ -1024,8 +1001,7 @@ private:
            (gpu_lane_available(6) &&
             merge_request_count_ >= gpu_batch_threshold_) ||
            (gpu_lane_available(7) &&
-            preprocess_request_count_ >=
-                preprocess_batch_threshold_);
+            preprocess_request_count_ >= gpu_batch_threshold_);
   }
 
   void record_error(exception_ptr error) {
@@ -1064,8 +1040,6 @@ private:
   BatchExecutor &gpu_executor_;
   const size_t total_states_;
   const size_t gpu_batch_threshold_;
-  const size_t preprocess_batch_threshold_;
-  const chrono::microseconds preprocess_coalesce_time_;
   deque<shared_ptr<IntersectionWork>> intersection_queue_;
   deque<shared_ptr<SplitWork>> plane_queue_;
   deque<shared_ptr<HausdorffWork>> hausdorff_queue_;
@@ -1688,8 +1662,7 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
             return;
           }
 
-          if (batched_cuda_preprocessing_enabled() &&
-              batched_cuda_child_preprocessing_enabled()) {
+          if (batched_cuda_preprocessing_enabled()) {
             auto remaining = make_shared<atomic<size_t>>(
                 intersections->pending_parts.size());
             for (size_t part_index = 0;
