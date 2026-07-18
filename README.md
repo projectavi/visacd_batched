@@ -100,8 +100,9 @@ Initialize the vendored dependencies:
 git submodule update --init --recursive
 ```
 
-Install OptiX and point the build at the directory that contains its
-`include/` directory:
+Download [NVIDIA OptiX 8.0](https://developer.nvidia.com/designworks/optix/downloads/legacy),
+extract it, and point the build at the directory that contains its `include/`
+directory:
 
 ```bash
 export OptiX_INSTALL_DIR=/path/to/NVIDIA-OptiX-SDK-8.0
@@ -126,6 +127,75 @@ Build a Release extension as an editable install:
 
 ```bash
 python -m pip install -e .
+```
+
+### Reference workstation setup: RTX 5090 and Conda
+
+The development workstation uses the `visacd` Conda environment with Python
+3.11, CUDA `nvcc` 12.8.93, OptiX 8.0.0, and two RTX 5090 GPUs. The following is
+the exact setup sequence used on that machine.
+
+Activate the environment and install the CUDA compiler from the NVIDIA Conda
+channel:
+
+```bash
+conda activate visacd
+conda install -c nvidia cuda-nvcc=12.8
+```
+
+After installing or changing the Conda CUDA package, reactivate the environment
+so its compiler hooks are regenerated. Clear hook variables first so values
+from another CUDA installation cannot survive the switch:
+
+```bash
+conda deactivate
+unset NVCC_PREPEND_FLAGS NVCC_PREPEND_FLAGS_BACKUP
+unset NVCC_APPEND_FLAGS NVCC_APPEND_FLAGS_BACKUP
+conda activate visacd
+```
+
+Select the Conda `nvcc` explicitly and verify that it reports CUDA 12.8:
+
+```bash
+export CUDACXX="$CONDA_PREFIX/bin/nvcc"
+nvcc --version
+```
+
+On this checkout, the OptiX SDK is extracted directly under the repository
+root. Point CMake at that exact directory:
+
+```bash
+export OptiX_INSTALL_DIR="$PWD/NVIDIA-OptiX-SDK-8.0.0-linux64-x86_64"
+```
+
+The workstation has two GPUs. Set the PTX target explicitly so CMake does not
+turn the multiple `nvidia-smi` result lines into an invalid architecture:
+
+```bash
+export PTX_COMPUTE=120
+```
+
+Remove any build generated with a different CUDA compiler, then install:
+
+```bash
+rm -rf build
+python -m pip install -e .
+```
+
+For a single-GPU batch run on this host, select one RTX 5090 at runtime:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python benchmark_parallel.py -n 200 --repeats 4
+```
+
+The resulting CMake configuration should resolve the important paths as
+follows:
+
+```text
+CMAKE_CUDA_COMPILER=$CONDA_PREFIX/bin/nvcc
+CUDA_TOOLKIT_ROOT_DIR=$CONDA_PREFIX/targets/x86_64-linux
+OptiX_INSTALL_DIR=<repository>/NVIDIA-OptiX-SDK-8.0.0-linux64-x86_64
+PTX architecture=sm_120
 ```
 
 The generated build is stored in `build/`. Delete that generated directory
