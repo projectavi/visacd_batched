@@ -21,6 +21,9 @@ struct PackedRenormalizeGrid {
   size_t leaf_offset;
   size_t leaf_count;
   double voxel_size;
+  double exterior_width;
+  double interior_width;
+  int trim_narrow_band;
 };
 
 __device__ double maximum(double first, double second) {
@@ -87,13 +90,15 @@ __global__ void renormalize_sparse_kernel(
     const PackedRenormalizeGrid *grids, const int *leaf_grid_indices,
     size_t cell_count, const int *neighbour_indices,
     const double *neighbour_values, const unsigned char *active,
-    const double *values, double *output) {
+    const double *values, double *output,
+    unsigned char *output_active) {
   const size_t cell =
       static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (cell >= cell_count)
     return;
   if (!active[cell]) {
     output[cell] = values[cell];
+    output_active[cell] = 0;
     return;
   }
   const size_t leaf = cell / kLeafSize;
@@ -158,7 +163,20 @@ __global__ void renormalize_sparse_kernel(
   const double sign =
       phi0 / sqrt(phi0 * phi0 + norm_squared);
   const double updated = phi0 - dx * sign * difference;
-  output[cell] = minimum(phi0, updated);
+  double result = minimum(phi0, updated) + offset - 1.0e-7;
+  bool remains_active = true;
+  if (grid.trim_narrow_band) {
+    const bool inside = result < 0.0;
+    if (inside && !(result > -grid.interior_width)) {
+      result = -grid.interior_width;
+      remains_active = false;
+    } else if (!inside && !(result < grid.exterior_width)) {
+      result = grid.exterior_width;
+      remains_active = false;
+    }
+  }
+  output[cell] = result;
+  output_active[cell] = remains_active ? 1 : 0;
 }
 
 struct Runtime {
@@ -169,6 +187,7 @@ struct Runtime {
   DeviceBuffer active;
   DeviceBuffer values;
   DeviceBuffer output;
+  DeviceBuffer output_active;
   DeviceBuffer neighbour_indices;
   DeviceBuffer neighbour_values;
   PinnedBuffer host_grids;
@@ -215,6 +234,12 @@ void renormalize_sparse_cuda_batch(
     if (!std::isfinite(grid->voxel_size) || grid->voxel_size <= 0.0)
       throw std::invalid_argument(
           "sparse renormalization voxel size must be finite and positive");
+    if (!std::isfinite(grid->exterior_width) ||
+        grid->exterior_width < 0.0 ||
+        !std::isfinite(grid->interior_width) ||
+        grid->interior_width < 0.0)
+      throw std::invalid_argument(
+          "sparse renormalization band widths are invalid");
     if (grid->active.size() != grid->values.size() ||
         grid->active.size() % kLeafSize != 0) {
       throw std::invalid_argument(
@@ -273,6 +298,9 @@ void renormalize_sparse_cuda_batch(
                       "allocate sparse renormalization values");
   state.output.ensure(cell_count * sizeof(double),
                       "allocate sparse renormalization output");
+  state.output_active.ensure(
+      cell_count * sizeof(unsigned char),
+      "allocate sparse renormalization output activity");
   state.neighbour_indices.ensure(
       leaf_count * kNeighbourCount * sizeof(int),
       "allocate sparse renormalization neighbours");
@@ -314,7 +342,9 @@ void renormalize_sparse_cuda_batch(
     SparseRenormalizeGrid &grid = *grids[grid_index];
     const size_t grid_leaves = grid.active.size() / kLeafSize;
     host_grids[grid_index] =
-        {leaf_offset, grid_leaves, grid.voxel_size};
+        {leaf_offset, grid_leaves, grid.voxel_size,
+         grid.exterior_width, grid.interior_width,
+         grid.trim_narrow_band ? 1 : 0};
     std::fill_n(host_owners + leaf_offset, grid_leaves,
                 static_cast<int>(grid_index));
     std::copy(grid.active.begin(), grid.active.end(),
@@ -371,7 +401,8 @@ void renormalize_sparse_cuda_batch(
       state.neighbour_indices.as<int>(),
       state.neighbour_values.as<double>(),
       state.active.as<unsigned char>(), state.values.as<double>(),
-      state.output.as<double>());
+      state.output.as<double>(),
+      state.output_active.as<unsigned char>());
   cuda_memory::check(cudaGetLastError(),
                      "launch sparse renormalization");
   cuda_memory::check(
@@ -379,6 +410,12 @@ void renormalize_sparse_cuda_batch(
                       cell_count * sizeof(double),
                       cudaMemcpyDeviceToHost, state.stream),
       "copy sparse renormalization values");
+  cuda_memory::check(
+      cudaMemcpyAsync(host_active,
+                      state.output_active.as<unsigned char>(),
+                      cell_count * sizeof(unsigned char),
+                      cudaMemcpyDeviceToHost, state.stream),
+      "copy sparse renormalization activity");
   cuda_memory::check(cudaStreamSynchronize(state.stream),
                      "wait for sparse renormalization");
 
@@ -386,6 +423,8 @@ void renormalize_sparse_cuda_batch(
   for (SparseRenormalizeGrid *grid : grids) {
     std::copy_n(host_values + leaf_offset * kLeafSize,
                 grid->values.size(), grid->values.begin());
+    std::copy_n(host_active + leaf_offset * kLeafSize,
+                grid->active.size(), grid->active.begin());
     leaf_offset += grid->active.size() / kLeafSize;
   }
 }

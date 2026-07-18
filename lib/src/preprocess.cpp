@@ -617,7 +617,9 @@ SparseRenormalizeCudaBatcher &sparse_renormalize_cuda_batcher() {
 
 bool renormalize_sparse_cuda(
     NarrowbandTree &distance_tree,
-    const vector<NarrowbandLeaf *> &nodes, double voxel_size) {
+    const vector<NarrowbandLeaf *> &nodes, double voxel_size,
+    double exterior_width, double interior_width,
+    bool trim_narrow_band) {
   if (nodes.empty())
     return true;
   if (nodes.size() >
@@ -625,6 +627,9 @@ bool renormalize_sparse_cuda(
     return false;
   SparseRenormalizeGrid grid;
   grid.voxel_size = voxel_size;
+  grid.exterior_width = exterior_width;
+  grid.interior_width = interior_width;
+  grid.trim_narrow_band = trim_narrow_band;
   const size_t cell_count =
       nodes.size() * static_cast<size_t>(NarrowbandLeaf::SIZE);
   const size_t neighbour_count = nodes.size() * 6;
@@ -679,9 +684,12 @@ bool renormalize_sparse_cuda(
     double *values = node.buffer().data();
     const size_t cell_offset =
         leaf * static_cast<size_t>(NarrowbandLeaf::SIZE);
-    for (auto iterator = node.cbeginValueOn(); iterator; ++iterator)
-      values[iterator.pos()] =
-          grid.values[cell_offset + iterator.pos()];
+    for (auto iterator = node.beginValueOn(); iterator; ++iterator) {
+      const Index position = iterator.pos();
+      values[position] = grid.values[cell_offset + position];
+      if (!grid.active[cell_offset + position])
+        iterator.setValueOff();
+    }
   }
   return true;
 }
@@ -1310,12 +1318,16 @@ DoubleGrid::Ptr signed_distance_field_from_surface(
   distance_tree.getNodes(nodes);
   const ValueType offset = ValueType(0.8 * voxel_size);
   const tbb::blocked_range<size_t> final_node_range(0, nodes.size());
+  const bool trim_narrow_band =
+      min(interior_width, exterior_width) <
+      voxel_size * ValueType(4.0);
   bool cuda_renormalized = false;
   if (environment_enabled(
           "VISACD_ENABLE_CUDA_PREPROCESS_RENORMALIZE")) {
     try {
       cuda_renormalized = renormalize_sparse_cuda(
-          distance_tree, nodes, voxel_size);
+          distance_tree, nodes, voxel_size, exterior_width,
+          interior_width, trim_narrow_band);
     } catch (const exception &error) {
       if (environment_enabled(
               "VISACD_PREPROCESS_RENORMALIZE_TRACE")) {
@@ -1347,19 +1359,22 @@ DoubleGrid::Ptr signed_distance_field_from_surface(
         tools::mesh_to_volume_internal::MinCombine<TreeType>(
             nodes, buffer.get()));
   }
-  tbb::parallel_for(
-      final_node_range,
-      tools::mesh_to_volume_internal::OffsetValues<TreeType>(
-          nodes,
-          offset -
-              tools::mesh_to_volume_internal::Tolerance<ValueType>::epsilon()));
-
-  if (min(interior_width, exterior_width) <
-      voxel_size * ValueType(4.0)) {
+  if (!cuda_renormalized) {
     tbb::parallel_for(
         final_node_range,
-        tools::mesh_to_volume_internal::InactivateValues<TreeType>(
-            nodes, exterior_width, interior_width));
+        tools::mesh_to_volume_internal::OffsetValues<TreeType>(
+            nodes,
+            offset - tools::mesh_to_volume_internal::
+                         Tolerance<ValueType>::epsilon()));
+  }
+
+  if (trim_narrow_band) {
+    if (!cuda_renormalized) {
+      tbb::parallel_for(
+          final_node_range,
+          tools::mesh_to_volume_internal::InactivateValues<TreeType>(
+              nodes, exterior_width, interior_width));
+    }
     tools::pruneLevelSet(distance_tree, exterior_width, -interior_width);
   }
   if (metrics)
