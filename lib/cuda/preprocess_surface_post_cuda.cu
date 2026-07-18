@@ -20,6 +20,7 @@ constexpr int kInvalidIndex = -1;
 
 struct PackedSurfacePostGrid {
   size_t triangle_offset;
+  double voxel_size;
 };
 
 struct CellData {
@@ -326,6 +327,27 @@ __global__ void cleanup_surface_kernel(
                      : 0;
 }
 
+__global__ void transform_surface_values_kernel(
+    const PackedSurfacePostGrid *grids,
+    const int *leaf_grid_indices, size_t cell_count,
+    const unsigned char *active, const double *values,
+    double *output) {
+  const size_t cell =
+      static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (cell >= cell_count)
+    return;
+  const double value = values[cell];
+  if (!active[cell]) {
+    output[cell] = value;
+    return;
+  }
+  const size_t leaf = cell / kLeafSize;
+  const double voxel_size =
+      grids[leaf_grid_indices[leaf]].voxel_size;
+  const double weight = value < 0.0 ? voxel_size : -voxel_size;
+  output[cell] = weight * sqrt(fabs(value));
+}
+
 struct Runtime {
   std::mutex mutex;
   cudaStream_t stream = nullptr;
@@ -376,6 +398,10 @@ void postprocess_sparse_surface_cuda_batch(
     if (!std::isfinite(grid->scale) || grid->scale <= 0.0)
       throw std::invalid_argument(
           "sparse surface scale must be finite and positive");
+    if (!std::isfinite(grid->voxel_size) ||
+        grid->voxel_size <= 0.0)
+      throw std::invalid_argument(
+          "sparse surface voxel size must be finite and positive");
     if (grid->active.size() != grid->values.size() ||
         grid->active.size() != grid->triangle_indices.size() ||
         grid->active.size() % kLeafSize != 0)
@@ -501,7 +527,8 @@ void postprocess_sparse_surface_cuda_batch(
   for (size_t grid_index = 0; grid_index < grids.size(); ++grid_index) {
     SparseSurfacePostGrid &grid = *grids[grid_index];
     const size_t leaves = grid.active.size() / kLeafSize;
-    host_grids[grid_index] = {triangle_offset};
+    host_grids[grid_index] =
+        {triangle_offset, grid.voxel_size};
     std::fill_n(host_owners + leaf_offset, leaves,
                 static_cast<int>(grid_index));
     for (size_t leaf = 0; leaf < leaves; ++leaf) {
@@ -614,8 +641,16 @@ void postprocess_sparse_surface_cuda_batch(
       state.active_output.as<unsigned char>());
   cuda_memory::check(cudaGetLastError(),
                      "launch sparse surface cleanup");
+  transform_surface_values_kernel<<<blocks, threads, 0, state.stream>>>(
+      state.grids.as<PackedSurfacePostGrid>(),
+      state.leaf_grid_indices.as<int>(), cell_count,
+      state.active_output.as<unsigned char>(),
+      state.validated_values.as<double>(),
+      state.sign_values.as<double>());
+  cuda_memory::check(cudaGetLastError(),
+                     "launch sparse surface value transformation");
   cuda_memory::check(
-      cudaMemcpyAsync(host_values, state.validated_values.as<double>(),
+      cudaMemcpyAsync(host_values, state.sign_values.as<double>(),
                       cell_count * sizeof(double),
                       cudaMemcpyDeviceToHost, state.stream),
       "copy sparse surface values");

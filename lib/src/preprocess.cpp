@@ -781,7 +781,7 @@ SparseSurfacePostCudaBatcher &sparse_surface_post_cuda_batcher() {
 bool postprocess_sparse_surface_cuda(
     NarrowbandTree &distance_tree, NarrowbandIndexTree &index_tree,
     const vector<NarrowbandLeaf *> &nodes, const Mesh &source_mesh,
-    double scale) {
+    double scale, double voxel_size) {
   if (nodes.empty())
     return true;
   if (nodes.size() >
@@ -790,6 +790,7 @@ bool postprocess_sparse_surface_cuda(
   SparseSurfacePostGrid grid;
   grid.mesh = &source_mesh;
   grid.scale = scale;
+  grid.voxel_size = voxel_size;
   const size_t cell_count =
       nodes.size() * static_cast<size_t>(NarrowbandLeaf::SIZE);
   grid.leaf_origins.resize(nodes.size() * 3);
@@ -1110,7 +1111,8 @@ DoubleGrid::Ptr signed_distance_field_from_surface(
   if (environment_enabled("VISACD_ENABLE_CUDA_PREPROCESS_SIGN")) {
     try {
       cuda_surface_postprocessed = postprocess_sparse_surface_cuda(
-          distance_tree, index_tree, nodes, source_mesh, scale);
+          distance_tree, index_tree, nodes, source_mesh, scale,
+          voxel_size);
     } catch (const exception &error) {
       if (environment_enabled("VISACD_PREPROCESS_SIGN_TRACE"))
         cerr << "[visacd surface post] fallback=" << error.what()
@@ -1167,11 +1169,12 @@ DoubleGrid::Ptr signed_distance_field_from_surface(
   nodes.reserve(distance_tree.leafCount());
   distance_tree.getNodes(nodes);
   const auto transform_flood_start = PreprocessClock::now();
-  tbb::parallel_for(
-      tbb::blocked_range<size_t>(0, nodes.size()),
-      tools::mesh_to_volume_internal::TransformValues<TreeType>(nodes,
-                                                                 voxel_size,
-                                                                 false));
+  if (!cuda_surface_postprocessed) {
+    tbb::parallel_for(
+        tbb::blocked_range<size_t>(0, nodes.size()),
+        tools::mesh_to_volume_internal::TransformValues<TreeType>(
+            nodes, voxel_size, false));
+  }
   distance_tree.root().setBackground(exterior_width, false);
   tools::signedFloodFillWithValues(distance_tree, exterior_width,
                                    -interior_width);

@@ -8,6 +8,7 @@ namespace neural_acd {
 struct SparseSurfacePostGrid {
   const Mesh *mesh = nullptr;
   double scale = 1.0;
+  double voxel_size = 1.0;
   std::vector<int> leaf_origins;
   std::vector<unsigned char> active;
   std::vector<double> values;
