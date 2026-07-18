@@ -41,6 +41,19 @@ bool environment_enabled(const char *name) {
   return value != nullptr && value[0] != '\0' && string(value) != "0";
 }
 
+unsigned int dense_narrowband_wait_microseconds() {
+  const char *value =
+      std::getenv("VISACD_PREPROCESS_EXPAND_DENSE_WAIT_US");
+  if (!value || !*value)
+    return 250;
+  char *end = nullptr;
+  const unsigned long parsed = std::strtoul(value, &end, 10);
+  if (!end || *end != '\0' || parsed > 100000)
+    throw invalid_argument(
+        "VISACD_PREPROCESS_EXPAND_DENSE_WAIT_US must be in [0, 100000]");
+  return static_cast<unsigned int>(parsed);
+}
+
 using NarrowbandTree = DoubleGrid::TreeType;
 using NarrowbandLeaf = NarrowbandTree::LeafNodeType;
 using NarrowbandIndexTree =
@@ -412,6 +425,241 @@ NarrowbandCudaBatcher &narrowband_cuda_batcher() {
   return batcher;
 }
 
+struct DenseNarrowbandBatchRequest {
+  DenseNarrowbandInput input;
+  bool done = false;
+  exception_ptr error;
+};
+
+class DenseNarrowbandCudaBatcher {
+public:
+  void expand(const DenseNarrowbandInput &input) {
+    auto request = make_shared<DenseNarrowbandBatchRequest>();
+    request->input = input;
+    bool leader = false;
+    {
+      lock_guard<mutex> lock(mutex_);
+      queue_.push_back(request);
+      if (!processing_) {
+        processing_ = true;
+        leader = true;
+      }
+      condition_.notify_all();
+    }
+    if (!leader) {
+      unique_lock<mutex> lock(mutex_);
+      condition_.wait(lock, [&]() { return request->done; });
+      if (request->error)
+        rethrow_exception(request->error);
+      return;
+    }
+
+    while (true) {
+      vector<shared_ptr<DenseNarrowbandBatchRequest>> batch;
+      {
+        unique_lock<mutex> lock(mutex_);
+        condition_.wait_for(
+            lock,
+            chrono::microseconds(dense_narrowband_wait_microseconds()),
+            [&]() { return queue_.size() >= 32; });
+        const size_t count = min<size_t>(200, queue_.size());
+        batch.reserve(count);
+        for (size_t index = 0; index < count; ++index) {
+          batch.push_back(move(queue_.front()));
+          queue_.pop_front();
+        }
+      }
+      exception_ptr error;
+      try {
+        vector<DenseNarrowbandInput> inputs;
+        inputs.reserve(batch.size());
+        size_t cell_count = 0;
+        for (const auto &pending : batch) {
+          inputs.push_back(pending->input);
+          cell_count += pending->input.grid->active.size();
+        }
+        if (environment_enabled("VISACD_PREPROCESS_EXPAND_TRACE")) {
+          cerr << "[visacd expand dense] meshes=" << batch.size()
+               << " cells=" << cell_count << '\n';
+        }
+        expand_narrowband_dense_cuda_batch(inputs);
+      } catch (...) {
+        error = current_exception();
+      }
+      bool finished = false;
+      {
+        lock_guard<mutex> lock(mutex_);
+        for (const auto &pending : batch) {
+          pending->error = error;
+          pending->done = true;
+        }
+        if (queue_.empty()) {
+          processing_ = false;
+          finished = true;
+        }
+        condition_.notify_all();
+      }
+      if (finished)
+        break;
+    }
+    if (request->error)
+      rethrow_exception(request->error);
+  }
+
+private:
+  mutex mutex_;
+  condition_variable condition_;
+  deque<shared_ptr<DenseNarrowbandBatchRequest>> queue_;
+  bool processing_ = false;
+};
+
+DenseNarrowbandCudaBatcher &dense_narrowband_cuda_batcher() {
+  static DenseNarrowbandCudaBatcher batcher;
+  return batcher;
+}
+
+bool expand_narrowband_dense(
+    NarrowbandTree &distance_tree, NarrowbandIndexTree &index_tree,
+    const Mesh &source_mesh, double scale, double exterior_width,
+    double interior_width, double voxel_size,
+    unsigned int maximum_iterations) {
+  CoordBBox active_bounds;
+  if (!distance_tree.evalActiveVoxelBoundingBox(active_bounds))
+    return true;
+  if (maximum_iterations >
+      static_cast<unsigned int>((numeric_limits<int>::max() - 3) / 2))
+    return false;
+  const int padding =
+      static_cast<int>(maximum_iterations) * 2 + 3;
+  Coord minimum = active_bounds.min().offsetBy(-padding);
+  Coord maximum = active_bounds.max().offsetBy(padding);
+  minimum &= ~7;
+  maximum |= 7;
+  const Coord dimensions = maximum - minimum + Coord(1);
+  size_t cell_count = static_cast<size_t>(dimensions[0]);
+  if (dimensions[0] <= 0 || dimensions[1] <= 0 || dimensions[2] <= 0 ||
+      cell_count > numeric_limits<size_t>::max() /
+                       static_cast<size_t>(dimensions[1])) {
+    return false;
+  }
+  cell_count *= static_cast<size_t>(dimensions[1]);
+  if (cell_count > numeric_limits<size_t>::max() /
+                       static_cast<size_t>(dimensions[2])) {
+    return false;
+  }
+  cell_count *= static_cast<size_t>(dimensions[2]);
+
+  DenseNarrowbandGrid grid;
+  for (int axis = 0; axis < 3; ++axis) {
+    grid.minimum[axis] = minimum[axis];
+    grid.dimensions[axis] = dimensions[axis];
+  }
+  grid.exterior_width = exterior_width;
+  grid.interior_width = interior_width;
+  grid.voxel_size = voxel_size;
+  grid.iterations = maximum_iterations;
+  grid.active.resize(cell_count);
+  grid.inside.resize(cell_count);
+  grid.distances.resize(cell_count);
+  grid.triangle_indices.resize(cell_count, Int32(util::INVALID_IDX));
+  vector<unsigned char> original_active(cell_count);
+  tree::ValueAccessor<NarrowbandTree> distance_accessor(distance_tree);
+  tree::ValueAccessor<NarrowbandIndexTree> index_accessor(index_tree);
+  const auto dense_offset = [&](int x, int y, int z) {
+    return (static_cast<size_t>(x - minimum[0]) *
+                static_cast<size_t>(dimensions[1]) +
+            static_cast<size_t>(y - minimum[1])) *
+               static_cast<size_t>(dimensions[2]) +
+           static_cast<size_t>(z - minimum[2]);
+  };
+  Coord origin;
+  for (int x = minimum[0]; x <= maximum[0];
+       x += NarrowbandLeaf::DIM) {
+    origin[0] = x;
+    for (int y = minimum[1]; y <= maximum[1];
+         y += NarrowbandLeaf::DIM) {
+      origin[1] = y;
+      for (int z = minimum[2]; z <= maximum[2];
+           z += NarrowbandLeaf::DIM) {
+        origin[2] = z;
+        const NarrowbandLeaf *distance_leaf =
+            distance_accessor.probeConstLeaf(origin);
+        const NarrowbandIndexTree::LeafNodeType *index_leaf =
+            index_accessor.probeConstLeaf(origin);
+        if (!distance_leaf) {
+          const double distance = distance_accessor.getValue(origin);
+          const unsigned char inside = distance < 0.0 ? 1 : 0;
+          for (int local_x = 0; local_x < NarrowbandLeaf::DIM;
+               ++local_x) {
+            for (int local_y = 0; local_y < NarrowbandLeaf::DIM;
+                 ++local_y) {
+              for (int local_z = 0; local_z < NarrowbandLeaf::DIM;
+                   ++local_z) {
+                const size_t offset =
+                    dense_offset(x + local_x, y + local_y,
+                                 z + local_z);
+                grid.inside[offset] = inside;
+                grid.distances[offset] = distance;
+              }
+            }
+          }
+          continue;
+        }
+        const auto &mask = distance_leaf->getValueMask();
+        const double *distances = distance_leaf->buffer().data();
+        const Int32 *indices =
+            index_leaf ? index_leaf->buffer().data() : nullptr;
+        for (int local_x = 0; local_x < NarrowbandLeaf::DIM;
+             ++local_x) {
+          for (int local_y = 0; local_y < NarrowbandLeaf::DIM;
+               ++local_y) {
+            for (int local_z = 0; local_z < NarrowbandLeaf::DIM;
+                 ++local_z) {
+              const Coord coordinate(x + local_x, y + local_y,
+                                     z + local_z);
+              const Index position =
+                  NarrowbandLeaf::coordToOffset(coordinate);
+              const size_t offset =
+                  dense_offset(coordinate[0], coordinate[1],
+                               coordinate[2]);
+              const bool active = mask.isOn(position);
+              if (active && !indices)
+                throw logic_error(
+                    "Narrowband distance and index trees diverged");
+              grid.active[offset] = active ? 1 : 0;
+              original_active[offset] = grid.active[offset];
+              grid.inside[offset] =
+                  distances[position] < 0.0 ? 1 : 0;
+              grid.distances[offset] = distances[position];
+              if (active)
+                grid.triangle_indices[offset] = indices[position];
+            }
+          }
+        }
+      }
+    }
+  }
+
+  dense_narrowband_cuda_batcher().expand({&source_mesh, scale, &grid});
+  size_t offset = 0;
+  Coord coordinate;
+  for (int x = minimum[0]; x <= maximum[0]; ++x) {
+    coordinate[0] = x;
+    for (int y = minimum[1]; y <= maximum[1]; ++y) {
+      coordinate[1] = y;
+      for (int z = minimum[2]; z <= maximum[2]; ++z, ++offset) {
+        if (!grid.active[offset] || original_active[offset])
+          continue;
+        coordinate[2] = z;
+        distance_accessor.setValue(coordinate, grid.distances[offset]);
+        index_accessor.setValue(coordinate,
+                                grid.triangle_indices[offset]);
+      }
+    }
+  }
+  return true;
+}
+
 void evaluate_narrowband_distances(
     const Mesh &source_mesh, double scale, const vector<Vec3s> &points,
     const vector<Vec3I> &triangles, double voxel_size,
@@ -563,32 +811,54 @@ DoubleGrid::Ptr signed_distance_field_from_surface(
     if (estimated < double(maximum_iterations))
       maximum_iterations = unsigned(estimated);
 
-    vector<BoolTreeType::LeafNodeType *> mask_nodes;
-    unsigned iteration = 0;
-    while (true) {
-      const size_t mask_node_count = mask_tree.leafCount();
-      if (mask_node_count == 0)
-        break;
-      mask_nodes.clear();
-      mask_nodes.reserve(mask_node_count);
-      mask_tree.getNodes(mask_nodes);
-      const tbb::blocked_range<size_t> range(0, mask_nodes.size());
-      tbb::parallel_for(
-          range,
-          tools::mesh_to_volume_internal::DiffLeafNodeMask<TreeType>(
-              distance_tree, mask_nodes));
-      if (environment_enabled("VISACD_ENABLE_CUDA_PREPROCESS_EXPAND")) {
-        expand_narrowband_cuda_iteration(
-            distance_tree, index_tree, mask_tree, mask_nodes,
-            source_mesh, scale, points, triangles, exterior_width,
-            interior_width, voxel_size);
-      } else {
-        tools::mesh_to_volume_internal::expandNarrowband(
-            distance_tree, index_tree, mask_tree, mask_nodes, mesh,
-            exterior_width, interior_width, voxel_size);
+    bool dense_expanded = false;
+    if (environment_enabled(
+            "VISACD_ENABLE_CUDA_PREPROCESS_EXPAND_DENSE")) {
+      try {
+        dense_expanded = expand_narrowband_dense(
+            distance_tree, index_tree, source_mesh, scale,
+            exterior_width, interior_width, voxel_size,
+            maximum_iterations);
+      } catch (const exception &error) {
+        if (environment_enabled("VISACD_PREPROCESS_EXPAND_TRACE"))
+          cerr << "[visacd expand dense] fallback=" << error.what()
+               << '\n';
+        dense_expanded = false;
+      } catch (...) {
+        if (environment_enabled("VISACD_PREPROCESS_EXPAND_TRACE"))
+          cerr << "[visacd expand dense] fallback=unknown exception\n";
+        dense_expanded = false;
       }
-      if (++iteration >= maximum_iterations)
-        break;
+    }
+
+    if (!dense_expanded) {
+      vector<BoolTreeType::LeafNodeType *> mask_nodes;
+      unsigned iteration = 0;
+      while (true) {
+        const size_t mask_node_count = mask_tree.leafCount();
+        if (mask_node_count == 0)
+          break;
+        mask_nodes.clear();
+        mask_nodes.reserve(mask_node_count);
+        mask_tree.getNodes(mask_nodes);
+        const tbb::blocked_range<size_t> range(0, mask_nodes.size());
+        tbb::parallel_for(
+            range,
+            tools::mesh_to_volume_internal::DiffLeafNodeMask<TreeType>(
+                distance_tree, mask_nodes));
+        if (environment_enabled("VISACD_ENABLE_CUDA_PREPROCESS_EXPAND")) {
+          expand_narrowband_cuda_iteration(
+              distance_tree, index_tree, mask_tree, mask_nodes,
+              source_mesh, scale, points, triangles, exterior_width,
+              interior_width, voxel_size);
+        } else {
+          tools::mesh_to_volume_internal::expandNarrowband(
+              distance_tree, index_tree, mask_tree, mask_nodes, mesh,
+              exterior_width, interior_width, voxel_size);
+        }
+        if (++iteration >= maximum_iterations)
+          break;
+      }
     }
   }
   if (metrics)

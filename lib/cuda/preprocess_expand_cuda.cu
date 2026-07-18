@@ -26,6 +26,21 @@ struct PackedNarrowbandCandidate {
   double voxel_size;
 };
 
+struct PackedDenseGrid {
+  int3 minimum;
+  int3 dimensions;
+  int3 leaf_dimensions;
+  size_t cell_offset;
+  size_t cell_count;
+  size_t leaf_offset;
+  size_t vertex_offset;
+  size_t triangle_offset;
+  double exterior_width;
+  double interior_width;
+  double voxel_size;
+  unsigned int iterations;
+};
+
 __device__ double3 subtract(double3 first, double3 second) {
   return make_double3(first.x - second.x, first.y - second.y,
                       first.z - second.z);
@@ -95,6 +110,277 @@ __device__ double3 closest_triangle(double3 a, double3 b, double3 c,
                     ac, c_weight);
 }
 
+__device__ int3 axis_neighbour(int index) {
+  switch (index) {
+  case 0:
+    return make_int3(-1, 0, 0);
+  case 1:
+    return make_int3(1, 0, 0);
+  case 2:
+    return make_int3(0, -1, 0);
+  case 3:
+    return make_int3(0, 1, 0);
+  case 4:
+    return make_int3(0, 0, -1);
+  default:
+    return make_int3(0, 0, 1);
+  }
+}
+
+__device__ bool dense_cell_offset(const PackedDenseGrid &grid,
+                                  int3 coordinate, size_t &offset) {
+  const int x = coordinate.x - grid.minimum.x;
+  const int y = coordinate.y - grid.minimum.y;
+  const int z = coordinate.z - grid.minimum.z;
+  if (x < 0 || y < 0 || z < 0 || x >= grid.dimensions.x ||
+      y >= grid.dimensions.y || z >= grid.dimensions.z) {
+    return false;
+  }
+  offset = grid.cell_offset +
+           (static_cast<size_t>(x) * grid.dimensions.y + y) *
+               grid.dimensions.z +
+           z;
+  return true;
+}
+
+__device__ int3 dense_coordinate(const PackedDenseGrid &grid,
+                                 size_t packed_offset) {
+  size_t local = packed_offset - grid.cell_offset;
+  const size_t yz = static_cast<size_t>(grid.dimensions.y) *
+                    grid.dimensions.z;
+  const int x = static_cast<int>(local / yz);
+  local %= yz;
+  const int y = static_cast<int>(local / grid.dimensions.z);
+  const int z = static_cast<int>(local % grid.dimensions.z);
+  return make_int3(grid.minimum.x + x, grid.minimum.y + y,
+                   grid.minimum.z + z);
+}
+
+__device__ size_t dense_leaf_offset(const PackedDenseGrid &grid,
+                                    int3 coordinate) {
+  const int x = (coordinate.x - grid.minimum.x) >> 3;
+  const int y = (coordinate.y - grid.minimum.y) >> 3;
+  const int z = (coordinate.z - grid.minimum.z) >> 3;
+  return grid.leaf_offset +
+         (static_cast<size_t>(x) * grid.leaf_dimensions.y + y) *
+             grid.leaf_dimensions.z +
+         z;
+}
+
+__device__ NarrowbandDistance evaluate_dense_candidate(
+    const PackedDenseGrid &grid, int3 coordinate, int manhattan_limit,
+    const int3 &fragment_minimum, const int3 &fragment_maximum,
+    const unsigned char *source_active, const int *triangle_indices,
+    const float3 *vertices, const int3 *triangles) {
+  double closest_distance = DBL_MAX;
+  int closest_triangle_index = 0;
+  const double3 point = make_double3(coordinate.x, coordinate.y,
+                                     coordinate.z);
+  for (int x = fragment_minimum.x; x <= fragment_maximum.x; ++x) {
+    for (int y = fragment_minimum.y; y <= fragment_maximum.y; ++y) {
+      for (int z = fragment_minimum.z; z <= fragment_maximum.z; ++z) {
+        size_t fragment_offset = 0;
+        if (!dense_cell_offset(grid, make_int3(x, y, z),
+                               fragment_offset) ||
+            !source_active[fragment_offset]) {
+          continue;
+        }
+        const int manhattan = abs(x - coordinate.x) +
+                              abs(y - coordinate.y) +
+                              abs(z - coordinate.z);
+        if (manhattan > manhattan_limit)
+          continue;
+        const int local_triangle_index =
+            triangle_indices[fragment_offset];
+        const int3 triangle =
+            triangles[grid.triangle_offset + local_triangle_index];
+        const float3 af = vertices[triangle.x];
+        const float3 bf = vertices[triangle.y];
+        const float3 cf = vertices[triangle.z];
+        const double3 a = make_double3(af.x, af.y, af.z);
+        const double3 b = make_double3(bf.x, bf.y, bf.z);
+        const double3 c = make_double3(cf.x, cf.y, cf.z);
+        const double3 closest = closest_triangle(a, c, b, point);
+        const double3 delta = subtract(point, closest);
+        const double distance = dot_product(delta, delta);
+        if (distance < closest_distance ||
+            (distance == closest_distance &&
+             local_triangle_index < closest_triangle_index)) {
+          closest_distance = distance;
+          closest_triangle_index = local_triangle_index;
+        }
+      }
+    }
+  }
+  return {sqrt(closest_distance) * grid.voxel_size,
+          closest_triangle_index};
+}
+
+__global__ void construct_dense_mask_kernel(
+    const PackedDenseGrid *grids, const int *cell_mesh_indices,
+    size_t cell_count, const unsigned char *active, int *mask) {
+  const size_t cell =
+      static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (cell >= cell_count || !active[cell])
+    return;
+  const PackedDenseGrid grid = grids[cell_mesh_indices[cell]];
+  if (grid.iterations == 0)
+    return;
+  const int3 coordinate = dense_coordinate(grid, cell);
+  for (int neighbour = 0; neighbour < 6; ++neighbour) {
+    const int3 delta = axis_neighbour(neighbour);
+    const int3 adjacent = make_int3(coordinate.x + delta.x,
+                                    coordinate.y + delta.y,
+                                    coordinate.z + delta.z);
+    size_t adjacent_offset = 0;
+    if (dense_cell_offset(grid, adjacent, adjacent_offset) &&
+        !active[adjacent_offset]) {
+      atomicExch(mask + adjacent_offset, 1);
+    }
+  }
+}
+
+__global__ void reduce_dense_mask_bounds_kernel(
+    const PackedDenseGrid *grids, const int *cell_mesh_indices,
+    size_t cell_count, unsigned int iteration,
+    const unsigned char *active, const int *mask,
+    int3 *leaf_minimum, int3 *leaf_maximum) {
+  const size_t cell =
+      static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (cell >= cell_count || !mask[cell] || active[cell])
+    return;
+  const PackedDenseGrid grid = grids[cell_mesh_indices[cell]];
+  if (iteration >= grid.iterations)
+    return;
+  const int3 coordinate = dense_coordinate(grid, cell);
+  const size_t leaf = dense_leaf_offset(grid, coordinate);
+  atomicMin(&leaf_minimum[leaf].x, coordinate.x);
+  atomicMin(&leaf_minimum[leaf].y, coordinate.y);
+  atomicMin(&leaf_minimum[leaf].z, coordinate.z);
+  atomicMax(&leaf_maximum[leaf].x, coordinate.x);
+  atomicMax(&leaf_maximum[leaf].y, coordinate.y);
+  atomicMax(&leaf_maximum[leaf].z, coordinate.z);
+}
+
+__device__ void propagate_first_dense_layer(
+    const PackedDenseGrid &grid, int3 coordinate, int *second_mask,
+    int *next_mask) {
+  const int3 leaf_origin = make_int3(coordinate.x & ~7,
+                                     coordinate.y & ~7,
+                                     coordinate.z & ~7);
+  for (int dx = -1; dx <= 1; ++dx) {
+    for (int dy = -1; dy <= 1; ++dy) {
+      for (int dz = -1; dz <= 1; ++dz) {
+        if (dx == 0 && dy == 0 && dz == 0)
+          continue;
+        const int3 adjacent = make_int3(coordinate.x + dx,
+                                        coordinate.y + dy,
+                                        coordinate.z + dz);
+        size_t adjacent_offset = 0;
+        if (!dense_cell_offset(grid, adjacent, adjacent_offset))
+          continue;
+        const bool same_leaf = (adjacent.x & ~7) == leaf_origin.x &&
+                               (adjacent.y & ~7) == leaf_origin.y &&
+                               (adjacent.z & ~7) == leaf_origin.z;
+        if (same_leaf) {
+          atomicExch(second_mask + adjacent_offset, 1);
+        } else if (abs(dx) + abs(dy) + abs(dz) == 1) {
+          atomicExch(next_mask + adjacent_offset, 1);
+        }
+      }
+    }
+  }
+}
+
+__global__ void expand_dense_first_layer_kernel(
+    const PackedDenseGrid *grids, const int *cell_mesh_indices,
+    size_t cell_count, unsigned int iteration, const float3 *vertices,
+    const int3 *triangles, const unsigned char *source_active,
+    unsigned char *active, const unsigned char *inside,
+    double *distances, int *triangle_indices,
+    const int *mask, const int3 *leaf_minimum,
+    const int3 *leaf_maximum, int *second_mask, int *next_mask) {
+  const size_t cell =
+      static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (cell >= cell_count || !mask[cell] || active[cell])
+    return;
+  const PackedDenseGrid grid = grids[cell_mesh_indices[cell]];
+  if (iteration >= grid.iterations)
+    return;
+  const int3 coordinate = dense_coordinate(grid, cell);
+  const size_t leaf = dense_leaf_offset(grid, coordinate);
+  int3 fragment_minimum = leaf_minimum[leaf];
+  int3 fragment_maximum = leaf_maximum[leaf];
+  fragment_minimum.x -= 1;
+  fragment_minimum.y -= 1;
+  fragment_minimum.z -= 1;
+  fragment_maximum.x += 1;
+  fragment_maximum.y += 1;
+  fragment_maximum.z += 1;
+  const NarrowbandDistance result = evaluate_dense_candidate(
+      grid, coordinate, 5, fragment_minimum, fragment_maximum,
+      source_active, triangle_indices, vertices, triangles);
+  const bool is_inside = inside[cell] != 0;
+  const double width =
+      is_inside ? grid.interior_width : grid.exterior_width;
+  if (!(result.distance < width))
+    return;
+  active[cell] = 1;
+  distances[cell] = is_inside ? -result.distance : result.distance;
+  triangle_indices[cell] = result.triangle_index;
+  if (result.distance + grid.voxel_size < width)
+    propagate_first_dense_layer(grid, coordinate, second_mask, next_mask);
+}
+
+__global__ void expand_dense_second_layer_kernel(
+    const PackedDenseGrid *grids, const int *cell_mesh_indices,
+    size_t cell_count, unsigned int iteration, const float3 *vertices,
+    const int3 *triangles, const unsigned char *source_active,
+    unsigned char *active, const unsigned char *inside,
+    double *distances, int *triangle_indices,
+    const int *second_mask, const int3 *leaf_minimum,
+    const int3 *leaf_maximum, int *next_mask) {
+  const size_t cell =
+      static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (cell >= cell_count || !second_mask[cell] || active[cell])
+    return;
+  const PackedDenseGrid grid = grids[cell_mesh_indices[cell]];
+  if (iteration >= grid.iterations)
+    return;
+  const int3 coordinate = dense_coordinate(grid, cell);
+  const size_t leaf = dense_leaf_offset(grid, coordinate);
+  int3 fragment_minimum = leaf_minimum[leaf];
+  int3 fragment_maximum = leaf_maximum[leaf];
+  fragment_minimum.x -= 1;
+  fragment_minimum.y -= 1;
+  fragment_minimum.z -= 1;
+  fragment_maximum.x += 1;
+  fragment_maximum.y += 1;
+  fragment_maximum.z += 1;
+  const NarrowbandDistance result = evaluate_dense_candidate(
+      grid, coordinate, 6, fragment_minimum, fragment_maximum,
+      source_active, triangle_indices, vertices, triangles);
+  const bool is_inside = inside[cell] != 0;
+  const double width =
+      is_inside ? grid.interior_width : grid.exterior_width;
+  if (!(result.distance < width))
+    return;
+  active[cell] = 1;
+  distances[cell] = is_inside ? -result.distance : result.distance;
+  triangle_indices[cell] = result.triangle_index;
+  if (result.distance + grid.voxel_size >= width)
+    return;
+  for (int neighbour = 0; neighbour < 6; ++neighbour) {
+    const int3 delta = axis_neighbour(neighbour);
+    const int3 adjacent = make_int3(coordinate.x + delta.x,
+                                    coordinate.y + delta.y,
+                                    coordinate.z + delta.z);
+    size_t adjacent_offset = 0;
+    if (dense_cell_offset(grid, adjacent, adjacent_offset))
+      atomicExch(next_mask + adjacent_offset, 1);
+  }
+}
+
 __global__ void evaluate_narrowband_kernel(
     const float3 *vertices, const int3 *triangles,
     const NarrowbandFragment *fragments,
@@ -157,6 +443,24 @@ struct Runtime {
   PinnedBuffer host_fragments;
   PinnedBuffer host_candidates;
   PinnedBuffer host_distances;
+  DeviceBuffer dense_grids;
+  DeviceBuffer dense_cell_mesh_indices;
+  DeviceBuffer dense_active;
+  DeviceBuffer dense_source_active;
+  DeviceBuffer dense_inside;
+  DeviceBuffer dense_distances;
+  DeviceBuffer dense_triangle_indices;
+  DeviceBuffer dense_mask;
+  DeviceBuffer dense_second_mask;
+  DeviceBuffer dense_next_mask;
+  DeviceBuffer dense_leaf_minimum;
+  DeviceBuffer dense_leaf_maximum;
+  PinnedBuffer host_dense_grids;
+  PinnedBuffer host_dense_cell_mesh_indices;
+  PinnedBuffer host_dense_active;
+  PinnedBuffer host_dense_inside;
+  PinnedBuffer host_dense_distances;
+  PinnedBuffer host_dense_triangle_indices;
 
   ~Runtime() {
     if (stream)
@@ -352,6 +656,358 @@ void evaluate_narrowband_distances_cuda_batch(
                     candidate_offset,
                 input.candidates->size(), input.distances->begin());
     candidate_offset += input.candidates->size();
+  }
+}
+
+void expand_narrowband_dense_cuda(
+    const Mesh &mesh, double scale, DenseNarrowbandGrid &grid) {
+  std::vector<DenseNarrowbandInput> inputs{{&mesh, scale, &grid}};
+  expand_narrowband_dense_cuda_batch(inputs);
+}
+
+void expand_narrowband_dense_cuda_batch(
+    const std::vector<DenseNarrowbandInput> &inputs) {
+  size_t vertex_count = 0;
+  size_t triangle_count = 0;
+  size_t cell_count = 0;
+  size_t leaf_count = 0;
+  unsigned int maximum_iterations = 0;
+  for (const DenseNarrowbandInput &input : inputs) {
+    if (!input.mesh || !input.grid)
+      throw std::invalid_argument(
+          "dense narrowband CUDA batch contains a null input");
+    DenseNarrowbandGrid &grid = *input.grid;
+    if (!std::isfinite(input.scale) || input.scale <= 0.0 ||
+        !std::isfinite(grid.exterior_width) ||
+        !std::isfinite(grid.interior_width) ||
+        !std::isfinite(grid.voxel_size) || grid.exterior_width <= 0.0 ||
+        grid.interior_width <= 0.0 || grid.voxel_size <= 0.0) {
+      throw std::invalid_argument(
+          "dense narrowband CUDA parameters must be finite and positive");
+    }
+    if (input.mesh->vertices.empty() || input.mesh->triangles.empty())
+      throw std::invalid_argument("dense narrowband CUDA mesh is empty");
+    if ((grid.minimum[0] & 7) != 0 || (grid.minimum[1] & 7) != 0 ||
+        (grid.minimum[2] & 7) != 0 || grid.dimensions[0] <= 0 ||
+        grid.dimensions[1] <= 0 || grid.dimensions[2] <= 0 ||
+        (grid.dimensions[0] & 7) != 0 ||
+        (grid.dimensions[1] & 7) != 0 ||
+        (grid.dimensions[2] & 7) != 0) {
+      throw std::invalid_argument(
+          "dense narrowband CUDA bounds must contain complete leaves");
+    }
+    size_t grid_cells = static_cast<size_t>(grid.dimensions[0]);
+    if (grid_cells > std::numeric_limits<size_t>::max() /
+                         static_cast<size_t>(grid.dimensions[1]))
+      throw std::overflow_error("dense narrowband CUDA cell overflow");
+    grid_cells *= static_cast<size_t>(grid.dimensions[1]);
+    if (grid_cells > std::numeric_limits<size_t>::max() /
+                         static_cast<size_t>(grid.dimensions[2]))
+      throw std::overflow_error("dense narrowband CUDA cell overflow");
+    grid_cells *= static_cast<size_t>(grid.dimensions[2]);
+    if (grid.active.size() != grid_cells ||
+        grid.inside.size() != grid_cells ||
+        grid.distances.size() != grid_cells ||
+        grid.triangle_indices.size() != grid_cells) {
+      throw std::invalid_argument(
+          "dense narrowband CUDA arrays do not match their bounds");
+    }
+    const size_t grid_leaves = grid_cells / (8 * 8 * 8);
+    if (input.mesh->vertices.size() >
+            static_cast<size_t>(std::numeric_limits<int>::max()) ||
+        input.mesh->triangles.size() >
+            static_cast<size_t>(std::numeric_limits<int>::max())) {
+      throw std::overflow_error("dense narrowband CUDA mesh overflow");
+    }
+    if (cell_count > std::numeric_limits<size_t>::max() - grid_cells ||
+        leaf_count > std::numeric_limits<size_t>::max() - grid_leaves ||
+        vertex_count > static_cast<size_t>(
+                           std::numeric_limits<int>::max()) -
+                           input.mesh->vertices.size() ||
+        triangle_count > static_cast<size_t>(
+                             std::numeric_limits<int>::max()) -
+                             input.mesh->triangles.size()) {
+      throw std::overflow_error("dense narrowband CUDA packed overflow");
+    }
+    cell_count += grid_cells;
+    leaf_count += grid_leaves;
+    vertex_count += input.mesh->vertices.size();
+    triangle_count += input.mesh->triangles.size();
+    maximum_iterations = std::max(maximum_iterations, grid.iterations);
+  }
+  if (inputs.empty() || cell_count == 0 || maximum_iterations == 0)
+    return;
+  if (inputs.size() >
+          static_cast<size_t>(std::numeric_limits<int>::max()) ||
+      cell_count > std::numeric_limits<size_t>::max() / sizeof(double)) {
+    throw std::overflow_error("dense narrowband CUDA allocation overflow");
+  }
+  constexpr size_t threads = 128;
+  if ((cell_count + threads - 1) / threads >
+      static_cast<size_t>(std::numeric_limits<int>::max())) {
+    throw std::overflow_error("dense narrowband CUDA launch overflow");
+  }
+
+  Runtime &state = runtime();
+  std::lock_guard<std::mutex> lock(state.mutex);
+  state.ensure_stream();
+  state.vertices.ensure(vertex_count * sizeof(float3),
+                        "allocate dense narrowband vertices");
+  state.triangles.ensure(triangle_count * sizeof(int3),
+                         "allocate dense narrowband triangles");
+  state.dense_grids.ensure(inputs.size() * sizeof(PackedDenseGrid),
+                           "allocate dense narrowband grids");
+  state.dense_cell_mesh_indices.ensure(
+      cell_count * sizeof(int), "allocate dense narrowband owners");
+  state.dense_active.ensure(cell_count * sizeof(unsigned char),
+                            "allocate dense narrowband activity");
+  state.dense_source_active.ensure(
+      cell_count * sizeof(unsigned char),
+      "allocate dense narrowband source activity");
+  state.dense_inside.ensure(cell_count * sizeof(unsigned char),
+                            "allocate dense narrowband signs");
+  state.dense_distances.ensure(cell_count * sizeof(double),
+                               "allocate dense narrowband distances");
+  state.dense_triangle_indices.ensure(
+      cell_count * sizeof(int), "allocate dense narrowband indices");
+  state.dense_mask.ensure(cell_count * sizeof(int),
+                          "allocate dense narrowband mask");
+  state.dense_second_mask.ensure(
+      cell_count * sizeof(int), "allocate dense narrowband second mask");
+  state.dense_next_mask.ensure(
+      cell_count * sizeof(int), "allocate dense narrowband next mask");
+  state.dense_leaf_minimum.ensure(
+      leaf_count * sizeof(int3), "allocate dense narrowband leaf minima");
+  state.dense_leaf_maximum.ensure(
+      leaf_count * sizeof(int3), "allocate dense narrowband leaf maxima");
+  state.host_vertices.ensure(vertex_count * sizeof(float3),
+                             "allocate host dense narrowband vertices");
+  state.host_triangles.ensure(triangle_count * sizeof(int3),
+                              "allocate host dense narrowband triangles");
+  state.host_dense_grids.ensure(
+      inputs.size() * sizeof(PackedDenseGrid),
+      "allocate host dense narrowband grids");
+  state.host_dense_cell_mesh_indices.ensure(
+      cell_count * sizeof(int), "allocate host dense narrowband owners");
+  state.host_dense_active.ensure(
+      cell_count * sizeof(unsigned char),
+      "allocate host dense narrowband activity");
+  state.host_dense_inside.ensure(
+      cell_count * sizeof(unsigned char),
+      "allocate host dense narrowband signs");
+  state.host_dense_distances.ensure(
+      cell_count * sizeof(double), "allocate host dense narrowband distances");
+  state.host_dense_triangle_indices.ensure(
+      cell_count * sizeof(int), "allocate host dense narrowband indices");
+
+  float3 *host_vertices = state.host_vertices.as<float3>();
+  int3 *host_triangles = state.host_triangles.as<int3>();
+  PackedDenseGrid *host_grids =
+      state.host_dense_grids.as<PackedDenseGrid>();
+  int *host_owners = state.host_dense_cell_mesh_indices.as<int>();
+  unsigned char *host_active =
+      state.host_dense_active.as<unsigned char>();
+  unsigned char *host_inside =
+      state.host_dense_inside.as<unsigned char>();
+  double *host_grid_distances =
+      state.host_dense_distances.as<double>();
+  int *host_grid_indices =
+      state.host_dense_triangle_indices.as<int>();
+  size_t vertex_offset = 0;
+  size_t triangle_offset = 0;
+  size_t cell_offset = 0;
+  size_t leaf_offset = 0;
+  for (size_t input_index = 0; input_index < inputs.size(); ++input_index) {
+    const DenseNarrowbandInput &input = inputs[input_index];
+    const Mesh &mesh = *input.mesh;
+    DenseNarrowbandGrid &grid = *input.grid;
+    const size_t grid_cells = grid.active.size();
+    const int3 leaf_dimensions = make_int3(
+        grid.dimensions[0] / 8, grid.dimensions[1] / 8,
+        grid.dimensions[2] / 8);
+    host_grids[input_index] = {
+        make_int3(grid.minimum[0], grid.minimum[1], grid.minimum[2]),
+        make_int3(grid.dimensions[0], grid.dimensions[1],
+                  grid.dimensions[2]),
+        leaf_dimensions, cell_offset, grid_cells, leaf_offset,
+        vertex_offset, triangle_offset, grid.exterior_width,
+        grid.interior_width, grid.voxel_size, grid.iterations};
+    for (size_t index = 0; index < mesh.vertices.size(); ++index) {
+      const Vec3D &vertex = mesh.vertices[index];
+      host_vertices[vertex_offset + index] = make_float3(
+          static_cast<float>(vertex[0] * input.scale),
+          static_cast<float>(vertex[1] * input.scale),
+          static_cast<float>(vertex[2] * input.scale));
+    }
+    for (size_t index = 0; index < mesh.triangles.size(); ++index) {
+      const auto &triangle = mesh.triangles[index];
+      host_triangles[triangle_offset + index] = make_int3(
+          static_cast<int>(vertex_offset) + triangle[0],
+          static_cast<int>(vertex_offset) + triangle[1],
+          static_cast<int>(vertex_offset) + triangle[2]);
+    }
+    for (size_t index = 0; index < grid_cells; ++index) {
+      const size_t packed = cell_offset + index;
+      host_owners[packed] = static_cast<int>(input_index);
+      host_active[packed] = grid.active[index] ? 1 : 0;
+      host_inside[packed] = grid.inside[index] ? 1 : 0;
+      host_grid_distances[packed] = grid.distances[index];
+      host_grid_indices[packed] = grid.triangle_indices[index];
+    }
+    vertex_offset += mesh.vertices.size();
+    triangle_offset += mesh.triangles.size();
+    cell_offset += grid_cells;
+    leaf_offset += static_cast<size_t>(leaf_dimensions.x) *
+                   leaf_dimensions.y * leaf_dimensions.z;
+  }
+
+  const auto copy_to_device = [&](void *destination, const void *source,
+                                  size_t bytes, const char *message) {
+    cuda_memory::check(cudaMemcpyAsync(destination, source, bytes,
+                                       cudaMemcpyHostToDevice,
+                                       state.stream),
+                       message);
+  };
+  copy_to_device(state.vertices.as<float3>(), host_vertices,
+                 vertex_count * sizeof(float3),
+                 "copy dense narrowband vertices");
+  copy_to_device(state.triangles.as<int3>(), host_triangles,
+                 triangle_count * sizeof(int3),
+                 "copy dense narrowband triangles");
+  copy_to_device(state.dense_grids.as<PackedDenseGrid>(), host_grids,
+                 inputs.size() * sizeof(PackedDenseGrid),
+                 "copy dense narrowband grids");
+  copy_to_device(state.dense_cell_mesh_indices.as<int>(), host_owners,
+                 cell_count * sizeof(int),
+                 "copy dense narrowband owners");
+  copy_to_device(state.dense_active.as<unsigned char>(), host_active,
+                 cell_count * sizeof(unsigned char),
+                 "copy dense narrowband activity");
+  copy_to_device(state.dense_inside.as<unsigned char>(), host_inside,
+                 cell_count * sizeof(unsigned char),
+                 "copy dense narrowband signs");
+  copy_to_device(state.dense_distances.as<double>(), host_grid_distances,
+                 cell_count * sizeof(double),
+                 "copy dense narrowband distances");
+  copy_to_device(state.dense_triangle_indices.as<int>(), host_grid_indices,
+                 cell_count * sizeof(int),
+                 "copy dense narrowband indices");
+  cuda_memory::check(
+      cudaMemsetAsync(state.dense_mask.as<int>(), 0,
+                      cell_count * sizeof(int), state.stream),
+      "clear dense narrowband mask");
+  const int blocks =
+      static_cast<int>((cell_count + threads - 1) / threads);
+  construct_dense_mask_kernel<<<blocks, threads, 0, state.stream>>>(
+      state.dense_grids.as<PackedDenseGrid>(),
+      state.dense_cell_mesh_indices.as<int>(), cell_count,
+      state.dense_active.as<unsigned char>(),
+      state.dense_mask.as<int>());
+  cuda_memory::check(cudaGetLastError(),
+                     "construct dense narrowband mask");
+
+  for (unsigned int iteration = 0; iteration < maximum_iterations;
+       ++iteration) {
+    cuda_memory::check(
+        cudaMemsetAsync(state.dense_leaf_minimum.as<int3>(), 0x7f,
+                        leaf_count * sizeof(int3), state.stream),
+        "clear dense narrowband leaf minima");
+    cuda_memory::check(
+        cudaMemsetAsync(state.dense_leaf_maximum.as<int3>(), 0x80,
+                        leaf_count * sizeof(int3), state.stream),
+        "clear dense narrowband leaf maxima");
+    cuda_memory::check(
+        cudaMemsetAsync(state.dense_second_mask.as<int>(), 0,
+                        cell_count * sizeof(int), state.stream),
+        "clear dense narrowband second mask");
+    cuda_memory::check(
+        cudaMemsetAsync(state.dense_next_mask.as<int>(), 0,
+                        cell_count * sizeof(int), state.stream),
+        "clear dense narrowband next mask");
+    cuda_memory::check(
+        cudaMemcpyAsync(state.dense_source_active.as<unsigned char>(),
+                        state.dense_active.as<unsigned char>(),
+                        cell_count * sizeof(unsigned char),
+                        cudaMemcpyDeviceToDevice, state.stream),
+        "snapshot dense narrowband activity");
+    reduce_dense_mask_bounds_kernel<<<blocks, threads, 0, state.stream>>>(
+        state.dense_grids.as<PackedDenseGrid>(),
+        state.dense_cell_mesh_indices.as<int>(), cell_count, iteration,
+        state.dense_active.as<unsigned char>(),
+        state.dense_mask.as<int>(),
+        state.dense_leaf_minimum.as<int3>(),
+        state.dense_leaf_maximum.as<int3>());
+    cuda_memory::check(cudaGetLastError(),
+                       "reduce dense narrowband mask bounds");
+    expand_dense_first_layer_kernel<<<blocks, threads, 0, state.stream>>>(
+        state.dense_grids.as<PackedDenseGrid>(),
+        state.dense_cell_mesh_indices.as<int>(), cell_count, iteration,
+        state.vertices.as<float3>(), state.triangles.as<int3>(),
+        state.dense_source_active.as<unsigned char>(),
+        state.dense_active.as<unsigned char>(),
+        state.dense_inside.as<unsigned char>(),
+        state.dense_distances.as<double>(),
+        state.dense_triangle_indices.as<int>(), state.dense_mask.as<int>(),
+        state.dense_leaf_minimum.as<int3>(),
+        state.dense_leaf_maximum.as<int3>(),
+        state.dense_second_mask.as<int>(),
+        state.dense_next_mask.as<int>());
+    cuda_memory::check(cudaGetLastError(),
+                       "expand dense narrowband first layer");
+    expand_dense_second_layer_kernel<<<blocks, threads, 0, state.stream>>>(
+        state.dense_grids.as<PackedDenseGrid>(),
+        state.dense_cell_mesh_indices.as<int>(), cell_count, iteration,
+        state.vertices.as<float3>(), state.triangles.as<int3>(),
+        state.dense_source_active.as<unsigned char>(),
+        state.dense_active.as<unsigned char>(),
+        state.dense_inside.as<unsigned char>(),
+        state.dense_distances.as<double>(),
+        state.dense_triangle_indices.as<int>(),
+        state.dense_second_mask.as<int>(),
+        state.dense_leaf_minimum.as<int3>(),
+        state.dense_leaf_maximum.as<int3>(),
+        state.dense_next_mask.as<int>());
+    cuda_memory::check(cudaGetLastError(),
+                       "expand dense narrowband second layer");
+    cuda_memory::check(
+        cudaMemcpyAsync(state.dense_mask.as<int>(),
+                        state.dense_next_mask.as<int>(),
+                        cell_count * sizeof(int), cudaMemcpyDeviceToDevice,
+                        state.stream),
+        "advance dense narrowband mask");
+  }
+
+  cuda_memory::check(
+      cudaMemcpyAsync(host_active,
+                      state.dense_active.as<unsigned char>(),
+                      cell_count * sizeof(unsigned char),
+                      cudaMemcpyDeviceToHost, state.stream),
+      "copy dense narrowband activity");
+  cuda_memory::check(
+      cudaMemcpyAsync(host_grid_distances,
+                      state.dense_distances.as<double>(),
+                      cell_count * sizeof(double), cudaMemcpyDeviceToHost,
+                      state.stream),
+      "copy dense narrowband distances");
+  cuda_memory::check(
+      cudaMemcpyAsync(host_grid_indices,
+                      state.dense_triangle_indices.as<int>(),
+                      cell_count * sizeof(int), cudaMemcpyDeviceToHost,
+                      state.stream),
+      "copy dense narrowband indices");
+  cuda_memory::check(cudaStreamSynchronize(state.stream),
+                     "wait for dense narrowband expansion");
+
+  cell_offset = 0;
+  for (const DenseNarrowbandInput &input : inputs) {
+    DenseNarrowbandGrid &grid = *input.grid;
+    for (size_t index = 0; index < grid.active.size(); ++index) {
+      const size_t packed = cell_offset + index;
+      grid.active[index] = host_active[packed] ? 1 : 0;
+      grid.distances[index] = host_grid_distances[packed];
+      grid.triangle_indices[index] = host_grid_indices[packed];
+    }
+    cell_offset += grid.active.size();
   }
 }
 

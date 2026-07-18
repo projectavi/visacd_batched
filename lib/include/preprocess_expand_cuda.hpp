@@ -36,6 +36,31 @@ struct NarrowbandEvaluationInput {
   std::vector<NarrowbandDistance> *distances = nullptr;
 };
 
+struct DenseNarrowbandGrid {
+  int minimum[3] = {0, 0, 0};
+  int dimensions[3] = {0, 0, 0};
+  double exterior_width = 0.0;
+  double interior_width = 0.0;
+  double voxel_size = 1.0;
+  unsigned int iterations = 0;
+  std::vector<unsigned char> active;
+  std::vector<unsigned char> inside;
+  std::vector<double> distances;
+  std::vector<int> triangle_indices;
+};
+
+struct DenseNarrowbandInput {
+  const Mesh *mesh = nullptr;
+  double scale = 1.0;
+  DenseNarrowbandGrid *grid = nullptr;
+};
+
+void expand_narrowband_dense_cuda_batch(
+    const std::vector<DenseNarrowbandInput> &inputs);
+
+void expand_narrowband_dense_cuda(
+    const Mesh &mesh, double scale, DenseNarrowbandGrid &grid);
+
 void evaluate_narrowband_distances_cuda_batch(
     const std::vector<NarrowbandEvaluationInput> &inputs);
 
