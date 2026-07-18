@@ -3,8 +3,11 @@
 #include <core.hpp>
 #include <cstddef>
 #include <string>
+#include <vector>
 
 namespace neural_acd {
+
+struct SurfaceVoxelRecord;
 
 struct ManifoldPreprocessMetrics {
   long long copy_input_ns = 0;
@@ -30,6 +33,11 @@ void manifold_preprocess_cpu_reference(
 bool manifold_preprocess_cuda_candidate(
     Mesh &m, double scale, double level_set,
     std::string *fallback_reason = nullptr,
+    ManifoldPreprocessMetrics *metrics = nullptr);
+
+void manifold_preprocess_from_surface_records(
+    Mesh &m, const std::vector<SurfaceVoxelRecord> &surface,
+    double scale, double level_set,
     ManifoldPreprocessMetrics *metrics = nullptr);
 
 } // namespace neural_acd

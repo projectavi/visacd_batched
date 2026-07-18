@@ -275,7 +275,9 @@ reference_surface_voxelization(const Mesh &input, double scale) {
 
 bool sdf_manifold(Mesh &input, Mesh &output, double scale, double level_set,
                   bool use_cuda, string *fallback_reason,
-                  ManifoldPreprocessMetrics *metrics) {
+                  ManifoldPreprocessMetrics *metrics,
+                  const vector<SurfaceVoxelRecord> *provided_surface =
+                      nullptr) {
   const auto marshal_start = PreprocessClock::now();
   vector<Vec3s> points;
   vector<Vec3I> tris;
@@ -305,7 +307,11 @@ bool sdf_manifold(Mesh &input, Mesh &output, double scale, double level_set,
 
   const auto sdf_start = PreprocessClock::now();
   DoubleGrid::Ptr sgrid;
-  if (use_cuda) {
+  if (provided_surface) {
+    sgrid = signed_distance_field_from_surface(
+        points, tris, *xform, *provided_surface,
+        static_cast<float>(level_set * scale + 1.0), 3.0f);
+  } else if (use_cuda) {
     try {
       static thread_local ManifoldCudaRuntime runtime;
       SurfaceVoxelizationResult surface =
@@ -396,6 +402,21 @@ bool manifold_preprocess_cuda_candidate(
     return false;
   m = std::move(output);
   return true;
+}
+
+void manifold_preprocess_from_surface_records(
+    Mesh &m, const vector<SurfaceVoxelRecord> &surface, double scale,
+    double level_set, ManifoldPreprocessMetrics *metrics) {
+  if (metrics)
+    *metrics = ManifoldPreprocessMetrics{};
+  const auto copy_start = PreprocessClock::now();
+  Mesh tmp = m;
+  if (metrics)
+    metrics->copy_input_ns = elapsed_ns(copy_start);
+  Mesh output;
+  sdf_manifold(tmp, output, scale, level_set, false, nullptr, metrics,
+               &surface);
+  m = std::move(output);
 }
 
 void manifold_preprocess(Mesh &m, double scale, double level_set,

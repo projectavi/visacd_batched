@@ -31,6 +31,7 @@
 #include <plane_intersections.hpp>
 #include <postprocess.hpp>
 #include <preprocess.hpp>
+#include <preprocess_cuda.hpp>
 #include <process.hpp>
 #include <sstream>
 #include <stdexcept>
@@ -67,6 +68,7 @@ enum class ProfileStage {
   preprocess_copy,
   preprocess_marshal,
   preprocess_sdf,
+  preprocess_gpu,
   preprocess_surface,
   preprocess_output,
   flat_surfaces,
@@ -121,6 +123,7 @@ public:
     static const array<const char *, kProfileStageCount> names = {
         "preprocess",         "preprocess_copy",
         "preprocess_marshal", "preprocess_sdf",
+        "preprocess_gpu",
         "preprocess_surface", "preprocess_output",
         "flat_surfaces",      "components_gpu",
         "components_cpu",     "intersections",
@@ -210,17 +213,34 @@ uint64_t manifold_output_hash(const Mesh &mesh) {
 
 void profiled_manifold_preprocess(Mesh &mesh, double scale,
                                   double level_set, const char *kind,
-                                  StageProfiler &profiler) {
+                                  StageProfiler &profiler,
+                                  const vector<SurfaceVoxelRecord> *surface =
+                                      nullptr,
+                                  bool force_cpu = false) {
   const char *trace_value = getenv("VISACD_PREPROCESS_TRACE");
   const bool trace = trace_value && *trace_value &&
                      string(trace_value) != "0";
   if (!profiler.enabled() && !trace) {
-    manifold_preprocess(mesh, scale, level_set);
+    if (surface) {
+      manifold_preprocess_from_surface_records(mesh, *surface, scale,
+                                               level_set);
+    } else if (force_cpu) {
+      manifold_preprocess_cpu_reference(mesh, scale, level_set);
+    } else {
+      manifold_preprocess(mesh, scale, level_set);
+    }
     return;
   }
 
   ManifoldPreprocessMetrics metrics;
-  manifold_preprocess(mesh, scale, level_set, &metrics);
+  if (surface) {
+    manifold_preprocess_from_surface_records(mesh, *surface, scale,
+                                             level_set, &metrics);
+  } else if (force_cpu) {
+    manifold_preprocess_cpu_reference(mesh, scale, level_set, &metrics);
+  } else {
+    manifold_preprocess(mesh, scale, level_set, &metrics);
+  }
   if (profiler.enabled()) {
     profiler.record(ProfileStage::preprocess_copy,
                     chrono::nanoseconds(metrics.copy_input_ns),
@@ -297,6 +317,28 @@ struct PendingPart {
   Mesh cage;
 };
 
+enum class PreprocessPurpose {
+  initial,
+  initial_retry,
+  initial_cage,
+  child_cage
+};
+
+struct IntersectionWork;
+
+struct PreprocessWork {
+  PreprocessPurpose purpose = PreprocessPurpose::initial;
+  size_t state_index = 0;
+  size_t child_index = 0;
+  double scale = 1.0;
+  double level_set = 0.0;
+  Mesh mesh;
+  Mesh retry_source;
+  SurfaceVoxelizationResult surface;
+  shared_ptr<IntersectionWork> child_intersections;
+  shared_ptr<atomic<size_t>> child_remaining;
+};
+
 struct IntersectionWork {
   size_t state_index;
   bool initial = false;
@@ -360,6 +402,7 @@ enum class GpuWorkKind {
   hulls,
   flat_surfaces,
   merges,
+  preprocess,
   complete
 };
 
@@ -377,6 +420,7 @@ struct GpuWork {
   vector<shared_ptr<HullWork>> hulls;
   vector<shared_ptr<FlatSurfaceWork>> flat_surfaces;
   vector<shared_ptr<MergeWork>> merges;
+  vector<shared_ptr<PreprocessWork>> preprocess;
 };
 
 size_t saturating_add(size_t first, size_t second) {
@@ -417,6 +461,16 @@ bool work_bucketing_enabled() {
 bool double_buffering_enabled() {
   const char *disabled = getenv("VISACD_DISABLE_DOUBLE_BUFFERING");
   return !disabled || !*disabled || string(disabled) == "0";
+}
+
+bool environment_flag_enabled(const char *name) {
+  const char *value = getenv(name);
+  return value && *value && string(value) != "0";
+}
+
+bool batched_cuda_preprocessing_enabled() {
+  return environment_flag_enabled("VISACD_ENABLE_CUDA_PREPROCESS") &&
+         !environment_flag_enabled("VISACD_VERIFY_CUDA_PREPROCESS");
 }
 
 template <typename Work, typename SizeFunction>
@@ -498,6 +552,10 @@ size_t merge_work_size(const MergeWork &work) {
   for (const Mesh &hull : work.finalize_work->hulls)
     size = saturating_add(size, mesh_work_size(hull));
   return size;
+}
+
+size_t preprocess_work_size(const PreprocessWork &work) {
+  return mesh_work_size(work.mesh);
 }
 
 class PipelineCoordinator {
@@ -588,6 +646,15 @@ public:
     condition_.notify_one();
   }
 
+  void enqueue_preprocess(shared_ptr<PreprocessWork> work) {
+    lock_guard<mutex> lock(mutex_);
+    if (error_)
+      return;
+    ++preprocess_request_count_;
+    preprocess_queue_.push_back(move(work));
+    condition_.notify_one();
+  }
+
   void complete_state() {
     lock_guard<mutex> lock(mutex_);
     ++completed_states_;
@@ -610,7 +677,8 @@ public:
                (gpu_lane_available(3) && !component_queue_.empty()) ||
                (gpu_lane_available(4) && !hull_queue_.empty()) ||
                (gpu_lane_available(5) && !flat_surface_queue_.empty()) ||
-               (gpu_lane_available(6) && !merge_queue_.empty());
+               (gpu_lane_available(6) && !merge_queue_.empty()) ||
+               (gpu_lane_available(7) && !preprocess_queue_.empty());
       });
 
       if (error_) {
@@ -640,7 +708,8 @@ public:
           gpu_lane_available(3) && !component_queue_.empty(),
           gpu_lane_available(4) && !hull_queue_.empty(),
           gpu_lane_available(5) && !flat_surface_queue_.empty(),
-          gpu_lane_available(6) && !merge_queue_.empty()};
+          gpu_lane_available(6) && !merge_queue_.empty(),
+          gpu_lane_available(7) && !preprocess_queue_.empty()};
       size_t selected = 0;
       for (; selected < available.size(); ++selected) {
         const size_t candidate =
@@ -767,17 +836,32 @@ public:
         return result;
       }
 
-      GpuWork result{GpuWorkKind::merges};
+      if (selected == 6) {
+        GpuWork result{GpuWorkKind::merges};
+        result.lane = lane;
+        result.shared_memory_budget = shared_memory_budget;
+        result.merges.reserve(merge_queue_.size());
+        while (!merge_queue_.empty()) {
+          result.merges.push_back(move(merge_queue_.front()));
+          merge_queue_.pop_front();
+        }
+        bucket_work(result.merges, merge_work_size);
+        split_work_wave(result.merges, merge_queue_, split_wave);
+        merge_request_count_ -= result.merges.size();
+        return result;
+      }
+
+      GpuWork result{GpuWorkKind::preprocess};
       result.lane = lane;
       result.shared_memory_budget = shared_memory_budget;
-      result.merges.reserve(merge_queue_.size());
-      while (!merge_queue_.empty()) {
-        result.merges.push_back(move(merge_queue_.front()));
-        merge_queue_.pop_front();
+      result.preprocess.reserve(preprocess_queue_.size());
+      while (!preprocess_queue_.empty()) {
+        result.preprocess.push_back(move(preprocess_queue_.front()));
+        preprocess_queue_.pop_front();
       }
-      bucket_work(result.merges, merge_work_size);
-      split_work_wave(result.merges, merge_queue_, split_wave);
-      merge_request_count_ -= result.merges.size();
+      bucket_work(result.preprocess, preprocess_work_size);
+      split_work_wave(result.preprocess, preprocess_queue_, split_wave);
+      preprocess_request_count_ -= result.preprocess.size();
       return result;
     }
   }
@@ -856,6 +940,9 @@ private:
           });
     case GpuWorkKind::merges:
       return queue_spans_work_size_buckets(merge_queue_, merge_work_size);
+    case GpuWorkKind::preprocess:
+      return queue_spans_work_size_buckets(preprocess_queue_,
+                                           preprocess_work_size);
     case GpuWorkKind::complete:
       return false;
     }
@@ -899,7 +986,9 @@ private:
            (gpu_lane_available(5) &&
             flat_surface_request_count_ >= gpu_batch_threshold_) ||
            (gpu_lane_available(6) &&
-            merge_request_count_ >= gpu_batch_threshold_);
+            merge_request_count_ >= gpu_batch_threshold_) ||
+           (gpu_lane_available(7) &&
+            preprocess_request_count_ >= gpu_batch_threshold_);
   }
 
   void record_error(exception_ptr error) {
@@ -912,12 +1001,14 @@ private:
     hull_queue_.clear();
     flat_surface_queue_.clear();
     merge_queue_.clear();
+    preprocess_queue_.clear();
     intersection_request_count_ = 0;
     hausdorff_request_count_ = 0;
     component_request_count_ = 0;
     hull_request_count_ = 0;
     flat_surface_request_count_ = 0;
     merge_request_count_ = 0;
+    preprocess_request_count_ = 0;
     for (auto &lanes : gpu_busy_)
       lanes.fill(false);
     gpu_split_pending_.fill(false);
@@ -943,12 +1034,14 @@ private:
   deque<shared_ptr<HullWork>> hull_queue_;
   deque<shared_ptr<FlatSurfaceWork>> flat_surface_queue_;
   deque<shared_ptr<MergeWork>> merge_queue_;
+  deque<shared_ptr<PreprocessWork>> preprocess_queue_;
   size_t intersection_request_count_ = 0;
   size_t hausdorff_request_count_ = 0;
   size_t component_request_count_ = 0;
   size_t hull_request_count_ = 0;
   size_t flat_surface_request_count_ = 0;
   size_t merge_request_count_ = 0;
+  size_t preprocess_request_count_ = 0;
   size_t active_tasks_ = 0;
   size_t completed_states_ = 0;
   size_t next_gpu_kind_ = 0;
@@ -1147,6 +1240,7 @@ struct PersistentBatchResources {
   array<ConvexHullBatchRuntime, 2> convex_hulls;
   array<FlatSurfaceBatchRuntime, 2> flat_surfaces;
   array<MergeBatchRuntime, 2> merges;
+  array<ManifoldCudaBatchRuntime, 2> preprocess;
 
   void configure_executors(size_t cpu_threads, size_t gpu_threads) {
     if (!executor || executor_threads != cpu_threads) {
@@ -1215,6 +1309,7 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
   auto &convex_hulls = resources.convex_hulls;
   auto &flat_surfaces = resources.flat_surfaces;
   auto &merges = resources.merges;
+  auto &preprocess = resources.preprocess;
 
   const uint32_t batch_seed = random_engine();
   for (size_t i = 0; i < states.size(); ++i) {
@@ -1233,6 +1328,7 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
   function<void(shared_ptr<ComponentWork>)> schedule_components;
   function<void(shared_ptr<SplitWork>)> schedule_clip;
   function<void(size_t)> schedule_initial_components;
+  function<void(shared_ptr<PreprocessWork>)> complete_preprocess;
 
   finish_state = [&](shared_ptr<FinalizeWork> work, double final_concavity) {
     coordinator.submit_cpu(
@@ -1546,6 +1642,27 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
             return;
           }
 
+          if (batched_cuda_preprocessing_enabled()) {
+            auto remaining = make_shared<atomic<size_t>>(
+                intersections->pending_parts.size());
+            for (size_t part_index = 0;
+                 part_index < intersections->pending_parts.size();
+                 ++part_index) {
+              auto preprocess_work = make_shared<PreprocessWork>();
+              preprocess_work->purpose = PreprocessPurpose::child_cage;
+              preprocess_work->state_index = work->state_index;
+              preprocess_work->child_index = part_index;
+              preprocess_work->scale = 40.0;
+              preprocess_work->level_set = 0.02;
+              preprocess_work->mesh = move(
+                  intersections->pending_parts[part_index].cage);
+              preprocess_work->child_intersections = intersections;
+              preprocess_work->child_remaining = remaining;
+              coordinator.enqueue_preprocess(move(preprocess_work));
+            }
+            return;
+          }
+
           intersections->requests.reserve(
               intersections->pending_parts.size());
           for (PendingPart &pending : intersections->pending_parts) {
@@ -1623,22 +1740,134 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
         true);
   };
 
-  for (size_t state_index = 0; state_index < states.size(); ++state_index) {
-    coordinator.submit_cpu([&, state_index]() {
-      {
-        StageTimer timer(profiler, ProfileStage::preprocess, 1);
-        initialize_state(move(meshes[state_index]), state_index,
-                         states[state_index], profiler);
-      }
-      if (config.use_flat_surfaces) {
-        auto surfaces = make_shared<FlatSurfaceWork>();
-        surfaces->state_index = state_index;
-        surfaces->estimated_size = mesh_work_size(states[state_index].cage);
-        coordinator.enqueue_flat_surfaces(move(surfaces));
+  complete_preprocess = [&](shared_ptr<PreprocessWork> work) {
+    BatchState &state = states[work->state_index];
+    const bool child = work->purpose == PreprocessPurpose::child_cage;
+    const char *kind = "initial";
+    if (work->purpose == PreprocessPurpose::initial_retry)
+      kind = "initial_retry";
+    else if (work->purpose == PreprocessPurpose::initial_cage)
+      kind = "initial_cage";
+    else if (child)
+      kind = "child_cage";
+
+    {
+      StageTimer timer(profiler,
+                       child ? ProfileStage::child_cage
+                             : ProfileStage::preprocess,
+                       1);
+      if (work->surface.supported) {
+        profiled_manifold_preprocess(
+            work->mesh, work->scale, work->level_set, kind, profiler,
+            &work->surface.records);
       } else {
-        schedule_initial_components(state_index);
+        profiled_manifold_preprocess(
+            work->mesh, work->scale, work->level_set, kind, profiler,
+            nullptr, true);
       }
+    }
+
+    if (child) {
+      if (!work->child_intersections || !work->child_remaining ||
+          work->child_index >=
+              work->child_intersections->pending_parts.size()) {
+        throw logic_error("Child preprocessing work is out of sync");
+      }
+      work->child_intersections
+          ->pending_parts[work->child_index]
+          .cage = move(work->mesh);
+      if (work->child_remaining->fetch_sub(1) == 1) {
+        auto &intersections = *work->child_intersections;
+        intersections.requests.clear();
+        intersections.requests.reserve(intersections.pending_parts.size());
+        for (PendingPart &pending : intersections.pending_parts) {
+          intersections.requests.emplace_back(&pending.part,
+                                               &pending.cage);
+        }
+        coordinator.enqueue_intersections(work->child_intersections);
+      }
+      return;
+    }
+
+    if (work->purpose == PreprocessPurpose::initial &&
+        work->mesh.vertices.size() > 15000) {
+      auto retry = make_shared<PreprocessWork>();
+      retry->purpose = PreprocessPurpose::initial_retry;
+      retry->state_index = work->state_index;
+      retry->scale = 20.0;
+      retry->level_set = 0.55 / 20.0;
+      retry->mesh = move(work->retry_source);
+      coordinator.enqueue_preprocess(move(retry));
+      return;
+    }
+
+    if (work->purpose == PreprocessPurpose::initial ||
+        work->purpose == PreprocessPurpose::initial_retry) {
+      log(work->state_index,
+          "Remeshed to " + to_string(work->mesh.vertices.size()) +
+              " verts.");
+      state.parts.clear();
+      state.parts.push_back(move(work->mesh));
+      auto cage = make_shared<PreprocessWork>();
+      cage->purpose = PreprocessPurpose::initial_cage;
+      cage->state_index = work->state_index;
+      cage->scale = 40.0;
+      cage->level_set = 0.03;
+      cage->mesh = state.parts.front().copy();
+      coordinator.enqueue_preprocess(move(cage));
+      return;
+    }
+
+    state.cage = move(work->mesh);
+    if (config.use_flat_surfaces) {
+      auto surfaces = make_shared<FlatSurfaceWork>();
+      surfaces->state_index = work->state_index;
+      surfaces->estimated_size = mesh_work_size(state.cage);
+      coordinator.enqueue_flat_surfaces(move(surfaces));
+    } else {
+      schedule_initial_components(work->state_index);
+    }
+  };
+
+  if (batched_cuda_preprocessing_enabled()) {
+    vector<shared_ptr<PreprocessWork>> initial_work(states.size());
+    executor.parallel_for(states.size(), [&](size_t state_index) {
+        Mesh mesh = move(meshes[state_index]);
+        states[state_index].original_bbox = mesh.normalize();
+        log(state_index,
+            "Preprocessing mesh (" + to_string(mesh.vertices.size()) +
+                " verts)...");
+        auto work = make_shared<PreprocessWork>();
+        work->purpose = PreprocessPurpose::initial;
+        work->state_index = state_index;
+        work->scale = 30.0;
+        work->level_set = 0.55 / 30.0;
+        work->retry_source = mesh.copy();
+        work->mesh = move(mesh);
+        initial_work[state_index] = move(work);
     });
+    for (shared_ptr<PreprocessWork> &work : initial_work)
+      coordinator.enqueue_preprocess(move(work));
+  } else {
+    for (size_t state_index = 0; state_index < states.size();
+         ++state_index) {
+      coordinator.submit_cpu([&, state_index]() {
+        {
+          StageTimer timer(profiler, ProfileStage::preprocess, 1);
+          initialize_state(move(meshes[state_index]), state_index,
+                           states[state_index], profiler);
+        }
+        if (config.use_flat_surfaces) {
+          auto surfaces = make_shared<FlatSurfaceWork>();
+          surfaces->state_index = state_index;
+          surfaces->estimated_size =
+              mesh_work_size(states[state_index].cage);
+          coordinator.enqueue_flat_surfaces(move(surfaces));
+        } else {
+          schedule_initial_components(state_index);
+        }
+      });
+    }
   }
 
   try {
@@ -1651,6 +1880,44 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
           gpu_work.shared_memory_budget
               ? gpu_memory_fraction * 0.5
               : gpu_memory_fraction;
+
+      if (gpu_work.kind == GpuWorkKind::preprocess) {
+        vector<SurfaceVoxelizationInput> inputs;
+        inputs.reserve(gpu_work.preprocess.size());
+        for (shared_ptr<PreprocessWork> &work : gpu_work.preprocess) {
+          inputs.push_back(
+              {&work->mesh, work->scale, &work->surface});
+        }
+        coordinator.submit_gpu(
+            [&, lane = gpu_lane,
+             memory_fraction = work_memory_fraction,
+             inputs = move(inputs),
+             works = move(gpu_work.preprocess)]() mutable {
+              try {
+                {
+                  StageTimer timer(profiler, ProfileStage::preprocess_gpu,
+                                   inputs.size());
+                  voxelize_surfaces_batch(
+                      inputs, preprocess[lane], configured_batch_size(),
+                      memory_fraction);
+                }
+                for (shared_ptr<PreprocessWork> &work : works) {
+                  coordinator.submit_cpu(
+                      [&, work = move(work)]() mutable {
+                        complete_preprocess(move(work));
+                      },
+                      true);
+                }
+                coordinator.complete_gpu_batch(
+                    GpuWorkKind::preprocess, lane);
+              } catch (...) {
+                coordinator.complete_gpu_batch(
+                    GpuWorkKind::preprocess, lane);
+                throw;
+              }
+            });
+        continue;
+      }
 
       if (gpu_work.kind == GpuWorkKind::flat_surfaces) {
         vector<FlatSurfaceBatchInput> inputs;
