@@ -120,6 +120,12 @@ class BatchValidationTests(unittest.TestCase):
 )
 class BatchGpuTests(unittest.TestCase):
     def setUp(self):
+        self.saved_cuda_preprocess = os.environ.get(
+            "VISACD_ENABLE_CUDA_PREPROCESS"
+        )
+        self.saved_cuda_verify = os.environ.get(
+            "VISACD_VERIFY_CUDA_PREPROCESS"
+        )
         self.saved_config = {
             "return_parts": visacd.config.return_parts,
             "score_mode": visacd.config.score_mode,
@@ -137,6 +143,14 @@ class BatchGpuTests(unittest.TestCase):
         visacd.config.batch_cpu_threads = 0
 
     def tearDown(self):
+        for name, value in (
+            ("VISACD_ENABLE_CUDA_PREPROCESS", self.saved_cuda_preprocess),
+            ("VISACD_VERIFY_CUDA_PREPROCESS", self.saved_cuda_verify),
+        ):
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
         for name, value in self.saved_config.items():
             setattr(visacd.config, name, value)
 
@@ -235,6 +249,40 @@ class BatchGpuTests(unittest.TestCase):
         )
         self.assertFalse(fallback["supported"])
         self.assertIn("memory budget", fallback["fallback_reason"])
+
+    def test_cuda_manifold_preprocessing_matches_openvdb(self):
+        configurations = (
+            (20.0, 0.55 / 20.0),
+            (30.0, 0.55 / 30.0),
+            (40.0, 0.03),
+            (40.0, 0.02),
+        )
+        for sample in ("cow.obj", "KitchenPot.obj", "armadillo.obj"):
+            mesh = load_sample(sample)
+            for scale, level_set in configurations:
+                with self.subTest(
+                    sample=sample, scale=scale, level_set=level_set
+                ):
+                    comparison = visacd._verify_manifold_preprocessing(
+                        mesh, scale, level_set
+                    )
+                    self.assertTrue(comparison["supported"])
+                    self.assertTrue(comparison["exact"])
+                    self.assertEqual(comparison["vertex_mismatches"], 0)
+                    self.assertEqual(comparison["triangle_mismatches"], 0)
+
+    def test_cuda_preprocessing_preserves_decomposition_output(self):
+        visacd.config.max_batch_size = 1
+        visacd.config.batch_cpu_threads = 1
+        os.environ.pop("VISACD_ENABLE_CUDA_PREPROCESS", None)
+        os.environ.pop("VISACD_VERIFY_CUDA_PREPROCESS", None)
+        visacd.set_seed(1234)
+        reference = visacd.process_batch([load_cow()], 0.04, 2)
+
+        os.environ["VISACD_ENABLE_CUDA_PREPROCESS"] = "1"
+        visacd.set_seed(1234)
+        candidate = visacd.process_batch([load_cow()], 0.04, 2)
+        self.assertEqual(result_digest(reference), result_digest(candidate))
 
     def test_flat_surface_pipeline_is_repeatable(self):
         def run(

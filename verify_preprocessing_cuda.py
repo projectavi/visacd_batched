@@ -29,6 +29,14 @@ def parse_args():
         help="preprocessing scale; may be repeated (defaults: 20, 30, 40)",
     )
     parser.add_argument("--memory-fraction", type=float, default=0.7)
+    parser.add_argument(
+        "--full-output",
+        action="store_true",
+        help=(
+            "also compare complete OpenVDB remeshing at every production "
+            "scale/level-set configuration"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -87,6 +95,62 @@ def main():
             exact + fallbacks + failures, exact, fallbacks, failures
         )
     )
+
+    if args.full_output:
+        configurations = [
+            (20.0, 0.55 / 20.0),
+            (30.0, 0.55 / 30.0),
+            (40.0, 0.03),
+            (40.0, 0.02),
+        ]
+        full_exact = 0
+        full_fallbacks = 0
+        full_failures = 0
+        for path in paths:
+            mesh = load_mesh(path)
+            for scale, level_set in configurations:
+                result = visacd._verify_manifold_preprocessing(
+                    mesh, scale, level_set
+                )
+                print(
+                    "full_mesh={} scale={} level_set={} supported={} "
+                    "exact={} reference_vertices={} candidate_vertices={} "
+                    "reference_triangles={} candidate_triangles={} "
+                    "vertex_mismatches={} triangle_mismatches={} "
+                    "reference_ms={:.3f} candidate_ms={:.3f} "
+                    "fallback_reason={}".format(
+                        path,
+                        scale,
+                        level_set,
+                        result["supported"],
+                        result["exact"],
+                        result["reference_vertices"],
+                        result["candidate_vertices"],
+                        result["reference_triangles"],
+                        result["candidate_triangles"],
+                        result["vertex_mismatches"],
+                        result["triangle_mismatches"],
+                        result["reference_ms"],
+                        result["candidate_ms"],
+                        result["fallback_reason"],
+                    ),
+                    flush=True,
+                )
+                if result["exact"]:
+                    full_exact += 1
+                elif not result["supported"]:
+                    full_fallbacks += 1
+                else:
+                    full_failures += 1
+        print(
+            "full_summary cases={} exact={} fallbacks={} failures={}".format(
+                full_exact + full_fallbacks + full_failures,
+                full_exact,
+                full_fallbacks,
+                full_failures,
+            )
+        )
+        failures += full_failures
     if failures:
         raise SystemExit(1)
 

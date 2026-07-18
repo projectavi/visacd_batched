@@ -2,6 +2,7 @@
 
 #include <core.hpp>
 #include <cstddef>
+#include <string>
 
 namespace neural_acd {
 
@@ -21,5 +22,14 @@ struct ManifoldPreprocessMetrics {
 void manifold_preprocess(Mesh &m, double scale = 50.0f,
                          double level_set = 0.55f,
                          ManifoldPreprocessMetrics *metrics = nullptr);
+
+void manifold_preprocess_cpu_reference(
+    Mesh &m, double scale, double level_set,
+    ManifoldPreprocessMetrics *metrics = nullptr);
+
+bool manifold_preprocess_cuda_candidate(
+    Mesh &m, double scale, double level_set,
+    std::string *fallback_reason = nullptr,
+    ManifoldPreprocessMetrics *metrics = nullptr);
 
 } // namespace neural_acd

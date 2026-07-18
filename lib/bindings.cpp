@@ -1,5 +1,6 @@
 #include <config.hpp>
 #include <core.hpp>
+#include <preprocess.hpp>
 #include <preprocess_cuda.hpp>
 #include <chrono>
 #include <cstring>
@@ -195,6 +196,95 @@ PYBIND11_MODULE(visacd, m)
           },
           py::arg("mesh"), py::arg("scale"),
           py::arg("memory_fraction") = 0.7);
+
+    m.def("_verify_manifold_preprocessing",
+          [](neural_acd::Mesh mesh, double scale, double level_set) {
+              mesh.normalize();
+              neural_acd::Mesh reference = mesh;
+              neural_acd::Mesh candidate = mesh;
+              neural_acd::ManifoldPreprocessMetrics reference_metrics;
+              neural_acd::ManifoldPreprocessMetrics candidate_metrics;
+
+              const auto reference_start =
+                  std::chrono::steady_clock::now();
+              neural_acd::manifold_preprocess_cpu_reference(
+                  reference, scale, level_set, &reference_metrics);
+              const double reference_ms =
+                  std::chrono::duration<double, std::milli>(
+                      std::chrono::steady_clock::now() - reference_start)
+                      .count();
+
+              std::string fallback_reason;
+              const auto candidate_start =
+                  std::chrono::steady_clock::now();
+              const bool supported =
+                  neural_acd::manifold_preprocess_cuda_candidate(
+                      candidate, scale, level_set, &fallback_reason,
+                      &candidate_metrics);
+              const double candidate_ms =
+                  std::chrono::duration<double, std::milli>(
+                      std::chrono::steady_clock::now() - candidate_start)
+                      .count();
+
+              size_t vertex_mismatches = 0;
+              size_t triangle_mismatches = 0;
+              if (supported) {
+                  const size_t common_vertices = std::min(
+                      reference.vertices.size(), candidate.vertices.size());
+                  for (size_t index = 0; index < common_vertices; ++index) {
+                      bool mismatch = false;
+                      for (int axis = 0; axis < 3; ++axis) {
+                          mismatch = mismatch ||
+                              std::memcmp(
+                                  &reference.vertices[index][axis],
+                                  &candidate.vertices[index][axis],
+                                  sizeof(double)) != 0;
+                      }
+                      vertex_mismatches += mismatch ? 1 : 0;
+                  }
+                  vertex_mismatches +=
+                      reference.vertices.size() > common_vertices
+                          ? reference.vertices.size() - common_vertices
+                          : candidate.vertices.size() - common_vertices;
+                  const size_t common_triangles = std::min(
+                      reference.triangles.size(),
+                      candidate.triangles.size());
+                  for (size_t index = 0; index < common_triangles; ++index) {
+                      triangle_mismatches +=
+                          reference.triangles[index] !=
+                                  candidate.triangles[index]
+                              ? 1
+                              : 0;
+                  }
+                  triangle_mismatches +=
+                      reference.triangles.size() > common_triangles
+                          ? reference.triangles.size() - common_triangles
+                          : candidate.triangles.size() - common_triangles;
+              }
+
+              py::dict result;
+              result["supported"] = supported;
+              result["fallback_reason"] = fallback_reason;
+              result["exact"] =
+                  supported && vertex_mismatches == 0 &&
+                  triangle_mismatches == 0;
+              result["reference_vertices"] = reference.vertices.size();
+              result["candidate_vertices"] = candidate.vertices.size();
+              result["reference_triangles"] =
+                  reference.triangles.size();
+              result["candidate_triangles"] =
+                  candidate.triangles.size();
+              result["vertex_mismatches"] = vertex_mismatches;
+              result["triangle_mismatches"] = triangle_mismatches;
+              result["reference_ms"] = reference_ms;
+              result["candidate_ms"] = candidate_ms;
+              result["reference_sdf_ms"] =
+                  reference_metrics.mesh_to_sdf_ns / 1e6;
+              result["candidate_sdf_ms"] =
+                  candidate_metrics.mesh_to_sdf_ns / 1e6;
+              return result;
+          },
+          py::arg("mesh"), py::arg("scale"), py::arg("level_set"));
 
     m.attr("config") =
         py::cast(&neural_acd::config, py::return_value_policy::reference);
