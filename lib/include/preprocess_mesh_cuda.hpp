@@ -19,4 +19,7 @@ struct DenseVolumeMeshingGrid {
 
 void mesh_dense_volume_cuda(DenseVolumeMeshingGrid &grid);
 
+void mesh_dense_volume_cuda_batch(
+    const std::vector<DenseVolumeMeshingGrid *> &grids);
+
 } // namespace neural_acd

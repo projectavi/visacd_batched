@@ -1415,6 +1415,97 @@ bool meshes_match_exactly(const Mesh &first, const Mesh &second) {
   return first.triangles == second.triangles;
 }
 
+struct DenseVolumeMeshBatchRequest {
+  DenseVolumeMeshingGrid *grid = nullptr;
+  bool done = false;
+  exception_ptr error;
+};
+
+class DenseVolumeMeshCudaBatcher {
+public:
+  void mesh(DenseVolumeMeshingGrid &grid) {
+    auto request = make_shared<DenseVolumeMeshBatchRequest>();
+    request->grid = &grid;
+    bool leader = false;
+    {
+      lock_guard<mutex> lock(mutex_);
+      queue_.push_back(request);
+      if (!processing_) {
+        processing_ = true;
+        leader = true;
+      }
+      condition_.notify_all();
+    }
+    if (!leader) {
+      unique_lock<mutex> lock(mutex_);
+      condition_.wait(lock, [&]() { return request->done; });
+      if (request->error)
+        rethrow_exception(request->error);
+      return;
+    }
+    while (true) {
+      vector<shared_ptr<DenseVolumeMeshBatchRequest>> batch;
+      {
+        unique_lock<mutex> lock(mutex_);
+        condition_.wait_for(lock, chrono::microseconds(250), [&]() {
+          return queue_.size() >= 32;
+        });
+        const size_t count = min<size_t>(200, queue_.size());
+        batch.reserve(count);
+        for (size_t index = 0; index < count; ++index) {
+          batch.push_back(move(queue_.front()));
+          queue_.pop_front();
+        }
+      }
+      exception_ptr error;
+      try {
+        vector<DenseVolumeMeshingGrid *> grids;
+        grids.reserve(batch.size());
+        size_t cell_count = 0;
+        for (const auto &pending : batch) {
+          grids.push_back(pending->grid);
+          cell_count += pending->grid->active.size();
+        }
+        if (environment_enabled("VISACD_PREPROCESS_MESH_TRACE")) {
+          cerr << "[visacd volume mesh] meshes=" << batch.size()
+               << " cells=" << cell_count << '\n';
+        }
+        mesh_dense_volume_cuda_batch(grids);
+      } catch (...) {
+        error = current_exception();
+      }
+      bool finished = false;
+      {
+        lock_guard<mutex> lock(mutex_);
+        for (const auto &pending : batch) {
+          pending->error = error;
+          pending->done = true;
+        }
+        if (queue_.empty()) {
+          processing_ = false;
+          finished = true;
+        }
+        condition_.notify_all();
+      }
+      if (finished)
+        break;
+    }
+    if (request->error)
+      rethrow_exception(request->error);
+  }
+
+private:
+  mutex mutex_;
+  condition_variable condition_;
+  deque<shared_ptr<DenseVolumeMeshBatchRequest>> queue_;
+  bool processing_ = false;
+};
+
+DenseVolumeMeshCudaBatcher &dense_volume_mesh_cuda_batcher() {
+  static DenseVolumeMeshCudaBatcher batcher;
+  return batcher;
+}
+
 bool volume_to_mesh_cuda(const DoubleGrid &grid, double isovalue,
                          vector<Vec3s> &points,
                          vector<Vec4I> &quads) {
@@ -1510,7 +1601,7 @@ bool volume_to_mesh_cuda(const DoubleGrid &grid, double isovalue,
       }
     }
   }
-  mesh_dense_volume_cuda(dense);
+  dense_volume_mesh_cuda_batcher().mesh(dense);
   if (dense.points.size() % 3 != 0 || dense.quads.size() % 4 != 0)
     throw logic_error("CUDA volume meshing output is malformed");
   points.resize(dense.points.size() / 3);
@@ -1758,8 +1849,10 @@ void manifold_preprocess_from_surface_records(
   if (metrics)
     metrics->copy_input_ns = elapsed_ns(copy_start);
   Mesh output;
-  sdf_manifold(tmp, output, scale, level_set, false, nullptr, metrics,
-               &surface);
+  sdf_manifold(
+      tmp, output, scale, level_set,
+      environment_enabled("VISACD_ENABLE_CUDA_PREPROCESS"), nullptr,
+      metrics, &surface);
   m = std::move(output);
 }
 

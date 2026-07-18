@@ -514,6 +514,7 @@ struct Runtime {
   DeviceBuffer scan_storage, points, quads;
   PinnedBuffer host_active, host_values, host_points, host_quads;
   PinnedBuffer host_leaf_order, host_leaf_ranks;
+  PinnedBuffer host_totals;
 
   ~Runtime() {
     if (stream)
@@ -554,252 +555,344 @@ Runtime &runtime() {
 } // namespace
 
 void mesh_dense_volume_cuda(DenseVolumeMeshingGrid &grid) {
-  if ((grid.minimum[0] & 7) != 0 || (grid.minimum[1] & 7) != 0 ||
-      (grid.minimum[2] & 7) != 0 || grid.dimensions[0] <= 0 ||
-      grid.dimensions[1] <= 0 || grid.dimensions[2] <= 0 ||
-      (grid.dimensions[0] & 7) != 0 ||
-      (grid.dimensions[1] & 7) != 0 ||
-      (grid.dimensions[2] & 7) != 0 ||
-      !std::isfinite(grid.isovalue))
-    throw std::invalid_argument("dense volume meshing grid is invalid");
-  size_t cell_count = static_cast<size_t>(grid.dimensions[0]);
-  if (cell_count > std::numeric_limits<size_t>::max() /
-                       static_cast<size_t>(grid.dimensions[1]))
-    throw std::overflow_error("dense volume meshing cell overflow");
-  cell_count *= static_cast<size_t>(grid.dimensions[1]);
-  if (cell_count > std::numeric_limits<size_t>::max() /
-                       static_cast<size_t>(grid.dimensions[2]))
-    throw std::overflow_error("dense volume meshing cell overflow");
-  cell_count *= static_cast<size_t>(grid.dimensions[2]);
-  if (grid.active.size() != cell_count || grid.values.size() != cell_count)
-    throw std::invalid_argument("dense volume meshing arrays are malformed");
-  if (cell_count == 0 ||
-      cell_count > static_cast<size_t>(std::numeric_limits<int>::max()))
-    throw std::overflow_error("dense volume meshing launch overflow");
-  const size_t leaf_count = cell_count / 512;
-  if (grid.leaf_order.size() != leaf_count)
-    throw std::invalid_argument(
-        "dense volume meshing leaf order is malformed");
-  std::vector<unsigned char> seen(leaf_count, 0);
-  for (int leaf : grid.leaf_order) {
-    if (leaf < 0 || static_cast<size_t>(leaf) >= leaf_count ||
-        seen[leaf])
+  std::vector<DenseVolumeMeshingGrid *> grids{&grid};
+  mesh_dense_volume_cuda_batch(grids);
+}
+
+void mesh_dense_volume_cuda_batch(
+    const std::vector<DenseVolumeMeshingGrid *> &grids) {
+  struct BatchGrid {
+    PackedGrid packed;
+    size_t cell_offset = 0;
+    size_t cell_count = 0;
+    size_t leaf_offset = 0;
+    size_t leaf_count = 0;
+    size_t point_count = 0;
+    size_t quad_count = 0;
+    size_t point_output_offset = 0;
+    size_t quad_output_offset = 0;
+  };
+  std::vector<BatchGrid> batch(grids.size());
+  size_t cell_count = 0, leaf_count = 0;
+  for (size_t grid_index = 0; grid_index < grids.size(); ++grid_index) {
+    DenseVolumeMeshingGrid *grid = grids[grid_index];
+    if (!grid || (grid->minimum[0] & 7) != 0 ||
+        (grid->minimum[1] & 7) != 0 ||
+        (grid->minimum[2] & 7) != 0 || grid->dimensions[0] <= 0 ||
+        grid->dimensions[1] <= 0 || grid->dimensions[2] <= 0 ||
+        (grid->dimensions[0] & 7) != 0 ||
+        (grid->dimensions[1] & 7) != 0 ||
+        (grid->dimensions[2] & 7) != 0 ||
+        !std::isfinite(grid->isovalue))
+      throw std::invalid_argument("dense volume meshing grid is invalid");
+    size_t grid_cells = static_cast<size_t>(grid->dimensions[0]);
+    if (grid_cells > std::numeric_limits<size_t>::max() /
+                         static_cast<size_t>(grid->dimensions[1]))
+      throw std::overflow_error("dense volume meshing cell overflow");
+    grid_cells *= static_cast<size_t>(grid->dimensions[1]);
+    if (grid_cells > std::numeric_limits<size_t>::max() /
+                         static_cast<size_t>(grid->dimensions[2]))
+      throw std::overflow_error("dense volume meshing cell overflow");
+    grid_cells *= static_cast<size_t>(grid->dimensions[2]);
+    if (grid->active.size() != grid_cells ||
+        grid->values.size() != grid_cells || grid_cells == 0 ||
+        grid_cells >
+            static_cast<size_t>(std::numeric_limits<int>::max()))
       throw std::invalid_argument(
-          "dense volume meshing leaf order is not a permutation");
-    seen[leaf] = 1;
+          "dense volume meshing arrays are malformed");
+    const size_t grid_leaves = grid_cells / 512;
+    if (grid->leaf_order.size() != grid_leaves)
+      throw std::invalid_argument(
+          "dense volume meshing leaf order is malformed");
+    std::vector<unsigned char> seen(grid_leaves, 0);
+    for (int leaf : grid->leaf_order) {
+      if (leaf < 0 || static_cast<size_t>(leaf) >= grid_leaves ||
+          seen[leaf])
+        throw std::invalid_argument(
+            "dense volume meshing leaf order is not a permutation");
+      seen[leaf] = 1;
+    }
+    if (cell_count > std::numeric_limits<size_t>::max() - grid_cells ||
+        leaf_count > std::numeric_limits<size_t>::max() - grid_leaves)
+      throw std::overflow_error("dense volume meshing batch overflow");
+    BatchGrid &entry = batch[grid_index];
+    entry.packed = {
+        make_int3(grid->minimum[0], grid->minimum[1],
+                  grid->minimum[2]),
+        make_int3(grid->dimensions[0], grid->dimensions[1],
+                  grid->dimensions[2]),
+        make_int3(grid->dimensions[0] / 8,
+                  grid->dimensions[1] / 8,
+                  grid->dimensions[2] / 8),
+        grid->isovalue};
+    entry.cell_offset = cell_count;
+    entry.cell_count = grid_cells;
+    entry.leaf_offset = leaf_count;
+    entry.leaf_count = grid_leaves;
+    cell_count += grid_cells;
+    leaf_count += grid_leaves;
   }
+  if (grids.empty())
+    return;
 
   Runtime &state = runtime();
   std::lock_guard<std::mutex> lock(state.mutex);
   state.ensure_stream();
-  state.active.ensure(cell_count * sizeof(unsigned char),
-                      "allocate dense volume activity");
-  state.values.ensure(cell_count * sizeof(double),
-                      "allocate dense volume values");
-  state.intersection.ensure(cell_count * sizeof(int),
-                            "allocate dense volume intersections");
-  state.flags.ensure(cell_count * sizeof(unsigned short),
-                     "allocate dense volume flags");
-  state.leaf_order.ensure(leaf_count * sizeof(int),
-                          "allocate dense volume leaf order");
-  state.leaf_ranks.ensure(leaf_count * sizeof(int),
-                          "allocate dense volume leaf ranks");
-  state.point_counts.ensure(cell_count * sizeof(unsigned int),
-                            "allocate dense volume point counts");
-  state.point_offsets.ensure(cell_count * sizeof(unsigned int),
-                             "allocate dense volume point offsets");
-  state.quad_counts.ensure(cell_count * sizeof(unsigned int),
-                           "allocate dense volume quad counts");
-  state.quad_offsets.ensure(cell_count * sizeof(unsigned int),
-                            "allocate dense volume quad offsets");
-  state.host_active.ensure(cell_count * sizeof(unsigned char),
-                           "allocate host dense volume activity");
-  state.host_values.ensure(cell_count * sizeof(double),
-                           "allocate host dense volume values");
-  state.host_leaf_order.ensure(leaf_count * sizeof(int),
-                               "allocate host dense volume leaf order");
-  state.host_leaf_ranks.ensure(leaf_count * sizeof(int),
-                               "allocate host dense volume leaf ranks");
-  std::copy(grid.active.begin(), grid.active.end(),
-            state.host_active.as<unsigned char>());
-  std::copy(grid.values.begin(), grid.values.end(),
-            state.host_values.as<double>());
-  std::copy(grid.leaf_order.begin(), grid.leaf_order.end(),
-            state.host_leaf_order.as<int>());
-  for (size_t rank = 0; rank < leaf_count; ++rank)
-    state.host_leaf_ranks.as<int>()[grid.leaf_order[rank]] =
-        static_cast<int>(rank);
-  cuda_memory::check(
-      cudaMemcpyAsync(state.active.as<unsigned char>(),
-                      state.host_active.as<unsigned char>(),
-                      cell_count * sizeof(unsigned char),
-                      cudaMemcpyHostToDevice, state.stream),
-      "copy dense volume activity");
-  cuda_memory::check(
-      cudaMemcpyAsync(state.values.as<double>(),
-                      state.host_values.as<double>(),
-                      cell_count * sizeof(double),
-                      cudaMemcpyHostToDevice, state.stream),
-      "copy dense volume values");
-  cuda_memory::check(
-      cudaMemcpyAsync(state.leaf_order.as<int>(),
-                      state.host_leaf_order.as<int>(),
-                      leaf_count * sizeof(int), cudaMemcpyHostToDevice,
-                      state.stream),
-      "copy dense volume leaf order");
-  cuda_memory::check(
-      cudaMemcpyAsync(state.leaf_ranks.as<int>(),
-                      state.host_leaf_ranks.as<int>(),
-                      leaf_count * sizeof(int), cudaMemcpyHostToDevice,
-                      state.stream),
-      "copy dense volume leaf ranks");
+#define ENSURE(buffer, bytes, message) state.buffer.ensure(bytes, message)
+  ENSURE(active, cell_count * sizeof(unsigned char),
+         "allocate batched dense volume activity");
+  ENSURE(values, cell_count * sizeof(double),
+         "allocate batched dense volume values");
+  ENSURE(intersection, cell_count * sizeof(int),
+         "allocate batched dense volume intersections");
+  ENSURE(flags, cell_count * sizeof(unsigned short),
+         "allocate batched dense volume flags");
+  ENSURE(leaf_order, leaf_count * sizeof(int),
+         "allocate batched dense volume leaf order");
+  ENSURE(leaf_ranks, leaf_count * sizeof(int),
+         "allocate batched dense volume leaf ranks");
+  ENSURE(point_counts, cell_count * sizeof(unsigned int),
+         "allocate batched dense volume point counts");
+  ENSURE(point_offsets, cell_count * sizeof(unsigned int),
+         "allocate batched dense volume point offsets");
+  ENSURE(quad_counts, cell_count * sizeof(unsigned int),
+         "allocate batched dense volume quad counts");
+  ENSURE(quad_offsets, cell_count * sizeof(unsigned int),
+         "allocate batched dense volume quad offsets");
+  ENSURE(host_active, cell_count * sizeof(unsigned char),
+         "allocate host batched dense volume activity");
+  ENSURE(host_values, cell_count * sizeof(double),
+         "allocate host batched dense volume values");
+  ENSURE(host_leaf_order, leaf_count * sizeof(int),
+         "allocate host batched dense volume leaf order");
+  ENSURE(host_leaf_ranks, leaf_count * sizeof(int),
+         "allocate host batched dense volume leaf ranks");
+  ENSURE(host_totals, grids.size() * 4 * sizeof(unsigned int),
+         "allocate host batched dense volume totals");
+#undef ENSURE
+
+  for (size_t grid_index = 0; grid_index < grids.size(); ++grid_index) {
+    const DenseVolumeMeshingGrid &grid = *grids[grid_index];
+    const BatchGrid &entry = batch[grid_index];
+    std::copy(grid.active.begin(), grid.active.end(),
+              state.host_active.as<unsigned char>() +
+                  entry.cell_offset);
+    std::copy(grid.values.begin(), grid.values.end(),
+              state.host_values.as<double>() + entry.cell_offset);
+    for (size_t rank = 0; rank < entry.leaf_count; ++rank) {
+      const int local = grid.leaf_order[rank];
+      state.host_leaf_order.as<int>()[entry.leaf_offset + rank] =
+          local;
+      state.host_leaf_ranks.as<int>()[entry.leaf_offset + local] =
+          static_cast<int>(rank);
+    }
+  }
+  const auto copy_to_device = [&](void *destination, const void *source,
+                                  size_t bytes, const char *message) {
+    cuda_memory::check(
+        cudaMemcpyAsync(destination, source, bytes,
+                        cudaMemcpyHostToDevice, state.stream),
+        message);
+  };
+  copy_to_device(state.active.as<unsigned char>(),
+                 state.host_active.as<unsigned char>(),
+                 cell_count * sizeof(unsigned char),
+                 "copy batched dense volume activity");
+  copy_to_device(state.values.as<double>(),
+                 state.host_values.as<double>(),
+                 cell_count * sizeof(double),
+                 "copy batched dense volume values");
+  copy_to_device(state.leaf_order.as<int>(),
+                 state.host_leaf_order.as<int>(),
+                 leaf_count * sizeof(int),
+                 "copy batched dense volume leaf order");
+  copy_to_device(state.leaf_ranks.as<int>(),
+                 state.host_leaf_ranks.as<int>(),
+                 leaf_count * sizeof(int),
+                 "copy batched dense volume leaf ranks");
   cuda_memory::check(
       cudaMemsetAsync(state.intersection.as<int>(), 0,
                       cell_count * sizeof(int), state.stream),
-      "clear dense volume intersections");
+      "clear batched dense volume intersections");
 
-  const PackedGrid packed{
-      make_int3(grid.minimum[0], grid.minimum[1], grid.minimum[2]),
-      make_int3(grid.dimensions[0], grid.dimensions[1],
-                grid.dimensions[2]),
-      make_int3(grid.dimensions[0] / 8, grid.dimensions[1] / 8,
-                grid.dimensions[2] / 8),
-      grid.isovalue};
+  size_t scan_bytes = 0;
+  for (const BatchGrid &entry : batch) {
+    size_t bytes = 0;
+    cuda_memory::check(
+        cub::DeviceScan::ExclusiveSum(
+            nullptr, bytes,
+            state.point_counts.as<unsigned int>() + entry.cell_offset,
+            state.point_offsets.as<unsigned int>() + entry.cell_offset,
+            static_cast<int>(entry.cell_count), state.stream),
+        "size batched dense volume scan");
+    scan_bytes = std::max(scan_bytes, bytes);
+  }
+  state.scan_storage.ensure(scan_bytes,
+                            "allocate batched dense volume scan storage");
   constexpr int threads = 128;
-  const int blocks =
-      static_cast<int>((cell_count + threads - 1) / threads);
-  identify_intersections_kernel<<<blocks, threads, 0, state.stream>>>(
-      packed, cell_count, state.active.as<unsigned char>(),
-      state.values.as<double>(), state.intersection.as<int>());
-  cuda_memory::check(cudaGetLastError(),
-                     "identify dense volume intersections");
-  compute_surface_flags_kernel<<<blocks, threads, 0, state.stream>>>(
-      packed, cell_count, state.intersection.as<int>(),
-      state.values.as<double>(), state.leaf_order.as<int>(),
-      state.flags.as<unsigned short>(),
-      state.point_counts.as<unsigned int>(),
-      state.quad_counts.as<unsigned int>());
-  cuda_memory::check(cudaGetLastError(),
-                     "compute dense volume surface flags");
-
-  size_t point_scan_bytes = 0, quad_scan_bytes = 0;
-  cuda_memory::check(
-      cub::DeviceScan::ExclusiveSum(
-          nullptr, point_scan_bytes,
-          state.point_counts.as<unsigned int>(),
-          state.point_offsets.as<unsigned int>(),
-          static_cast<int>(cell_count), state.stream),
-      "size dense volume point scan");
-  cuda_memory::check(
-      cub::DeviceScan::ExclusiveSum(
-          nullptr, quad_scan_bytes,
-          state.quad_counts.as<unsigned int>(),
-          state.quad_offsets.as<unsigned int>(),
-          static_cast<int>(cell_count), state.stream),
-      "size dense volume quad scan");
-  state.scan_storage.ensure(std::max(point_scan_bytes, quad_scan_bytes),
-                            "allocate dense volume scan storage");
-  cuda_memory::check(
-      cub::DeviceScan::ExclusiveSum(
-          state.scan_storage.as<void>(), point_scan_bytes,
-          state.point_counts.as<unsigned int>(),
-          state.point_offsets.as<unsigned int>(),
-          static_cast<int>(cell_count), state.stream),
-      "scan dense volume point counts");
-  unsigned int point_total_parts[2] = {0, 0};
-  cuda_memory::check(
-      cudaMemcpyAsync(point_total_parts,
-                      state.point_offsets.as<unsigned int>() +
-                          cell_count - 1,
-                      sizeof(unsigned int), cudaMemcpyDeviceToHost,
-                      state.stream),
-      "copy dense volume final point offset");
-  cuda_memory::check(
-      cudaMemcpyAsync(point_total_parts + 1,
-                      state.point_counts.as<unsigned int>() +
-                          cell_count - 1,
-                      sizeof(unsigned int), cudaMemcpyDeviceToHost,
-                      state.stream),
-      "copy dense volume final point count");
-  cuda_memory::check(
-      cub::DeviceScan::ExclusiveSum(
-          state.scan_storage.as<void>(), quad_scan_bytes,
-          state.quad_counts.as<unsigned int>(),
-          state.quad_offsets.as<unsigned int>(),
-          static_cast<int>(cell_count), state.stream),
-      "scan dense volume quad counts");
-  unsigned int quad_total_parts[2] = {0, 0};
-  cuda_memory::check(
-      cudaMemcpyAsync(quad_total_parts,
-                      state.quad_offsets.as<unsigned int>() +
-                          cell_count - 1,
-                      sizeof(unsigned int), cudaMemcpyDeviceToHost,
-                      state.stream),
-      "copy dense volume final quad offset");
-  cuda_memory::check(
-      cudaMemcpyAsync(quad_total_parts + 1,
-                      state.quad_counts.as<unsigned int>() +
-                          cell_count - 1,
-                      sizeof(unsigned int), cudaMemcpyDeviceToHost,
-                      state.stream),
-      "copy dense volume final quad count");
-  cuda_memory::check(cudaStreamSynchronize(state.stream),
-                     "wait for dense volume counts");
-  const size_t point_count = static_cast<size_t>(point_total_parts[0]) +
-                             point_total_parts[1];
-  const size_t quad_count = static_cast<size_t>(quad_total_parts[0]) +
-                            quad_total_parts[1];
-  if (point_count > static_cast<size_t>(std::numeric_limits<int>::max()) ||
-      quad_count > static_cast<size_t>(std::numeric_limits<int>::max()))
-    throw std::overflow_error("dense volume output overflow");
-  state.points.ensure(point_count * sizeof(float3),
-                      "allocate dense volume points");
-  state.quads.ensure(quad_count * sizeof(int4),
-                     "allocate dense volume quads");
-  state.host_points.ensure(point_count * sizeof(float3),
-                           "allocate host dense volume points");
-  state.host_quads.ensure(quad_count * sizeof(int4),
-                          "allocate host dense volume quads");
-  if (point_count > 0) {
-    compute_points_kernel<<<blocks, threads, 0, state.stream>>>(
-        packed, cell_count, state.values.as<double>(),
-        state.leaf_order.as<int>(),
-        state.flags.as<unsigned short>(),
-        state.point_offsets.as<unsigned int>(),
-        state.points.as<float3>());
+  unsigned int *host_totals = state.host_totals.as<unsigned int>();
+  for (size_t grid_index = 0; grid_index < batch.size(); ++grid_index) {
+    const BatchGrid &entry = batch[grid_index];
+    const int blocks = static_cast<int>(
+        (entry.cell_count + threads - 1) / threads);
+    unsigned char *active = state.active.as<unsigned char>() +
+                            entry.cell_offset;
+    double *values = state.values.as<double>() + entry.cell_offset;
+    int *intersection = state.intersection.as<int>() + entry.cell_offset;
+    unsigned short *flags = state.flags.as<unsigned short>() +
+                            entry.cell_offset;
+    unsigned int *point_counts =
+        state.point_counts.as<unsigned int>() + entry.cell_offset;
+    unsigned int *point_offsets =
+        state.point_offsets.as<unsigned int>() + entry.cell_offset;
+    unsigned int *quad_counts =
+        state.quad_counts.as<unsigned int>() + entry.cell_offset;
+    unsigned int *quad_offsets =
+        state.quad_offsets.as<unsigned int>() + entry.cell_offset;
+    int *leaf_order = state.leaf_order.as<int>() + entry.leaf_offset;
+    identify_intersections_kernel<<<blocks, threads, 0, state.stream>>>(
+        entry.packed, entry.cell_count, active, values, intersection);
     cuda_memory::check(cudaGetLastError(),
-                       "compute dense volume points");
+                       "identify batched dense volume intersections");
+    compute_surface_flags_kernel<<<blocks, threads, 0, state.stream>>>(
+        entry.packed, entry.cell_count, intersection, values, leaf_order,
+        flags, point_counts, quad_counts);
+    cuda_memory::check(cudaGetLastError(),
+                       "compute batched dense volume surface flags");
+    size_t bytes = scan_bytes;
+    cuda_memory::check(
+        cub::DeviceScan::ExclusiveSum(
+            state.scan_storage.as<void>(), bytes, point_counts,
+            point_offsets, static_cast<int>(entry.cell_count),
+            state.stream),
+        "scan batched dense volume point counts");
+    cuda_memory::check(
+        cudaMemcpyAsync(host_totals + grid_index * 4,
+                        point_offsets + entry.cell_count - 1,
+                        sizeof(unsigned int), cudaMemcpyDeviceToHost,
+                        state.stream),
+        "copy batched dense volume final point offset");
+    cuda_memory::check(
+        cudaMemcpyAsync(host_totals + grid_index * 4 + 1,
+                        point_counts + entry.cell_count - 1,
+                        sizeof(unsigned int), cudaMemcpyDeviceToHost,
+                        state.stream),
+        "copy batched dense volume final point count");
+    bytes = scan_bytes;
+    cuda_memory::check(
+        cub::DeviceScan::ExclusiveSum(
+            state.scan_storage.as<void>(), bytes, quad_counts,
+            quad_offsets, static_cast<int>(entry.cell_count),
+            state.stream),
+        "scan batched dense volume quad counts");
+    cuda_memory::check(
+        cudaMemcpyAsync(host_totals + grid_index * 4 + 2,
+                        quad_offsets + entry.cell_count - 1,
+                        sizeof(unsigned int), cudaMemcpyDeviceToHost,
+                        state.stream),
+        "copy batched dense volume final quad offset");
+    cuda_memory::check(
+        cudaMemcpyAsync(host_totals + grid_index * 4 + 3,
+                        quad_counts + entry.cell_count - 1,
+                        sizeof(unsigned int), cudaMemcpyDeviceToHost,
+                        state.stream),
+        "copy batched dense volume final quad count");
+  }
+  cuda_memory::check(cudaStreamSynchronize(state.stream),
+                     "wait for batched dense volume counts");
+
+  size_t point_count = 0, quad_count = 0;
+  for (size_t grid_index = 0; grid_index < batch.size(); ++grid_index) {
+    BatchGrid &entry = batch[grid_index];
+    entry.point_count =
+        static_cast<size_t>(host_totals[grid_index * 4]) +
+        host_totals[grid_index * 4 + 1];
+    entry.quad_count =
+        static_cast<size_t>(host_totals[grid_index * 4 + 2]) +
+        host_totals[grid_index * 4 + 3];
+    if (entry.point_count >
+            static_cast<size_t>(std::numeric_limits<int>::max()) ||
+        entry.quad_count >
+            static_cast<size_t>(std::numeric_limits<int>::max()) ||
+        point_count > std::numeric_limits<size_t>::max() -
+                          entry.point_count ||
+        quad_count > std::numeric_limits<size_t>::max() -
+                         entry.quad_count)
+      throw std::overflow_error("batched dense volume output overflow");
+    entry.point_output_offset = point_count;
+    entry.quad_output_offset = quad_count;
+    point_count += entry.point_count;
+    quad_count += entry.quad_count;
+  }
+  state.points.ensure(point_count * sizeof(float3),
+                      "allocate batched dense volume points");
+  state.quads.ensure(quad_count * sizeof(int4),
+                     "allocate batched dense volume quads");
+  state.host_points.ensure(point_count * sizeof(float3),
+                           "allocate host batched dense volume points");
+  state.host_quads.ensure(quad_count * sizeof(int4),
+                          "allocate host batched dense volume quads");
+  for (const BatchGrid &entry : batch) {
+    const int blocks = static_cast<int>(
+        (entry.cell_count + threads - 1) / threads);
+    if (entry.point_count > 0) {
+      compute_points_kernel<<<blocks, threads, 0, state.stream>>>(
+          entry.packed, entry.cell_count,
+          state.values.as<double>() + entry.cell_offset,
+          state.leaf_order.as<int>() + entry.leaf_offset,
+          state.flags.as<unsigned short>() + entry.cell_offset,
+          state.point_offsets.as<unsigned int>() + entry.cell_offset,
+          state.points.as<float3>() + entry.point_output_offset);
+      cuda_memory::check(cudaGetLastError(),
+                         "compute batched dense volume points");
+    }
+    if (entry.quad_count > 0) {
+      compute_quads_kernel<<<blocks, threads, 0, state.stream>>>(
+          entry.packed, entry.cell_count,
+          state.leaf_order.as<int>() + entry.leaf_offset,
+          state.leaf_ranks.as<int>() + entry.leaf_offset,
+          state.flags.as<unsigned short>() + entry.cell_offset,
+          state.point_offsets.as<unsigned int>() + entry.cell_offset,
+          state.quad_offsets.as<unsigned int>() + entry.cell_offset,
+          state.quads.as<int4>() + entry.quad_output_offset);
+      cuda_memory::check(cudaGetLastError(),
+                         "compute batched dense volume quads");
+    }
+  }
+  if (point_count > 0) {
     cuda_memory::check(
         cudaMemcpyAsync(state.host_points.as<float3>(),
                         state.points.as<float3>(),
                         point_count * sizeof(float3),
                         cudaMemcpyDeviceToHost, state.stream),
-        "copy dense volume points");
+        "copy batched dense volume points");
   }
   if (quad_count > 0) {
-    compute_quads_kernel<<<blocks, threads, 0, state.stream>>>(
-        packed, cell_count, state.leaf_order.as<int>(),
-        state.leaf_ranks.as<int>(),
-        state.flags.as<unsigned short>(),
-        state.point_offsets.as<unsigned int>(),
-        state.quad_offsets.as<unsigned int>(), state.quads.as<int4>());
-    cuda_memory::check(cudaGetLastError(),
-                       "compute dense volume quads");
     cuda_memory::check(
         cudaMemcpyAsync(state.host_quads.as<int4>(),
                         state.quads.as<int4>(),
                         quad_count * sizeof(int4),
                         cudaMemcpyDeviceToHost, state.stream),
-        "copy dense volume quads");
+        "copy batched dense volume quads");
   }
   cuda_memory::check(cudaStreamSynchronize(state.stream),
-                     "wait for dense volume meshing");
-  grid.points.resize(point_count * 3);
-  grid.quads.resize(quad_count * 4);
-  std::copy_n(state.host_points.as<float>(),
-              point_count * 3, grid.points.begin());
-  std::copy_n(state.host_quads.as<int>(),
-              quad_count * 4, grid.quads.begin());
+                     "wait for batched dense volume meshing");
+  for (size_t grid_index = 0; grid_index < grids.size(); ++grid_index) {
+    DenseVolumeMeshingGrid &grid = *grids[grid_index];
+    const BatchGrid &entry = batch[grid_index];
+    grid.points.resize(entry.point_count * 3);
+    grid.quads.resize(entry.quad_count * 4);
+    if (entry.point_count > 0) {
+      std::copy_n(state.host_points.as<float>() +
+                      entry.point_output_offset * 3,
+                  entry.point_count * 3, grid.points.begin());
+    }
+    if (entry.quad_count > 0) {
+      std::copy_n(state.host_quads.as<int>() +
+                      entry.quad_output_offset * 4,
+                  entry.quad_count * 4, grid.quads.begin());
+    }
+  }
 }
 
 } // namespace neural_acd
