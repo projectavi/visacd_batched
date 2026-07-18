@@ -62,6 +62,11 @@ constexpr size_t kCandidateAttemptMultiplier = 5;
 
 enum class ProfileStage {
   preprocess,
+  preprocess_copy,
+  preprocess_marshal,
+  preprocess_sdf,
+  preprocess_surface,
+  preprocess_output,
   flat_surfaces,
   components_gpu,
   components_cpu,
@@ -112,11 +117,16 @@ public:
     if (!enabled_)
       return;
     static const array<const char *, kProfileStageCount> names = {
-        "preprocess",       "flat_surfaces",   "components_gpu",
-        "components_cpu",  "intersections",   "selection_hulls",
-        "hausdorff",        "candidates",      "plane_scoring",
-        "plane_selection", "clip_prepare",    "split_fused",
-        "clip_construct",  "child_cage",      "final_hulls_cpu",
+        "preprocess",         "preprocess_copy",
+        "preprocess_marshal", "preprocess_sdf",
+        "preprocess_surface", "preprocess_output",
+        "flat_surfaces",      "components_gpu",
+        "components_cpu",     "intersections",
+        "selection_hulls",    "hausdorff",
+        "candidates",         "plane_scoring",
+        "plane_selection",    "clip_prepare",
+        "split_fused",        "clip_construct",
+        "child_cage",         "final_hulls_cpu",
         "merges"};
 
     ostringstream output;
@@ -172,6 +182,33 @@ private:
   size_t items_;
   chrono::steady_clock::time_point start_;
 };
+
+void profiled_manifold_preprocess(Mesh &mesh, double scale,
+                                  double level_set,
+                                  StageProfiler &profiler) {
+  if (!profiler.enabled()) {
+    manifold_preprocess(mesh, scale, level_set);
+    return;
+  }
+
+  ManifoldPreprocessMetrics metrics;
+  manifold_preprocess(mesh, scale, level_set, &metrics);
+  profiler.record(ProfileStage::preprocess_copy,
+                  chrono::nanoseconds(metrics.copy_input_ns),
+                  metrics.input_triangles);
+  profiler.record(ProfileStage::preprocess_marshal,
+                  chrono::nanoseconds(metrics.marshal_input_ns),
+                  metrics.input_triangles);
+  profiler.record(ProfileStage::preprocess_sdf,
+                  chrono::nanoseconds(metrics.mesh_to_sdf_ns),
+                  metrics.active_voxels);
+  profiler.record(ProfileStage::preprocess_surface,
+                  chrono::nanoseconds(metrics.volume_to_mesh_ns),
+                  metrics.active_voxels);
+  profiler.record(ProfileStage::preprocess_output,
+                  chrono::nanoseconds(metrics.marshal_output_ns),
+                  metrics.output_triangles);
+}
 
 struct PartCache {
   optional<Mesh> hull;
@@ -911,22 +948,23 @@ void validate_parameters(const MeshList &meshes, double concavity,
   }
 }
 
-void initialize_state(Mesh mesh, size_t mesh_index, BatchState &state) {
+void initialize_state(Mesh mesh, size_t mesh_index, BatchState &state,
+                      StageProfiler &profiler) {
   state.original_bbox = mesh.normalize();
   log(mesh_index, "Preprocessing mesh (" + to_string(mesh.vertices.size()) +
                       " verts)...");
 
   Mesh original_mesh = mesh.copy();
-  manifold_preprocess(mesh, 30, 0.55 / 30);
+  profiled_manifold_preprocess(mesh, 30, 0.55 / 30, profiler);
   if (mesh.vertices.size() > 15000) {
     mesh = original_mesh.copy();
-    manifold_preprocess(mesh, 20, 0.55 / 20);
+    profiled_manifold_preprocess(mesh, 20, 0.55 / 20, profiler);
   }
   log(mesh_index,
       "Remeshed to " + to_string(mesh.vertices.size()) + " verts.");
 
   state.cage = mesh.copy();
-  manifold_preprocess(state.cage, 40, 0.03);
+  profiled_manifold_preprocess(state.cage, 40, 0.03, profiler);
 
   state.parts.push_back(move(mesh));
 }
@@ -1471,9 +1509,9 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
                 [&, intersections, remaining, part_index]() {
                   {
                     StageTimer timer(profiler, ProfileStage::child_cage, 1);
-                    manifold_preprocess(
+                    profiled_manifold_preprocess(
                         intersections->pending_parts[part_index].cage, 40,
-                        0.02);
+                        0.02, profiler);
                   }
                   if (remaining->fetch_sub(1) == 1)
                     coordinator.enqueue_intersections(intersections);
@@ -1537,7 +1575,7 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
       {
         StageTimer timer(profiler, ProfileStage::preprocess, 1);
         initialize_state(move(meshes[state_index]), state_index,
-                         states[state_index]);
+                         states[state_index], profiler);
       }
       if (config.use_flat_surfaces) {
         auto surfaces = make_shared<FlatSurfaceWork>();
