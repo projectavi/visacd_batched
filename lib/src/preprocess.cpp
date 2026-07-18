@@ -17,6 +17,7 @@
 #include <preprocess.hpp>
 #include <preprocess_cuda.hpp>
 #include <preprocess_expand_cuda.hpp>
+#include <preprocess_mesh_cuda.hpp>
 #include <preprocess_renormalize_cuda.hpp>
 #include <preprocess_surface_post_cuda.hpp>
 #include <string>
@@ -1414,6 +1415,120 @@ bool meshes_match_exactly(const Mesh &first, const Mesh &second) {
   return first.triangles == second.triangles;
 }
 
+bool volume_to_mesh_cuda(const DoubleGrid &grid, double isovalue,
+                         vector<Vec3s> &points,
+                         vector<Vec4I> &quads) {
+  using TreeType = DoubleGrid::TreeType;
+  using LeafType = TreeType::LeafNodeType;
+  CoordBBox active_bounds;
+  if (!grid.tree().evalActiveVoxelBoundingBox(active_bounds)) {
+    points.clear();
+    quads.clear();
+    return true;
+  }
+  Coord minimum = active_bounds.min().offsetBy(-2);
+  Coord maximum = active_bounds.max().offsetBy(2);
+  minimum &= ~(LeafType::DIM - 1);
+  maximum |= LeafType::DIM - 1;
+  const Coord dimensions = maximum - minimum + Coord(1);
+  size_t cell_count = static_cast<size_t>(dimensions[0]);
+  if (dimensions[0] <= 0 || dimensions[1] <= 0 ||
+      dimensions[2] <= 0 ||
+      cell_count > numeric_limits<size_t>::max() /
+                       static_cast<size_t>(dimensions[1]))
+    return false;
+  cell_count *= static_cast<size_t>(dimensions[1]);
+  if (cell_count > numeric_limits<size_t>::max() /
+                       static_cast<size_t>(dimensions[2]))
+    return false;
+  cell_count *= static_cast<size_t>(dimensions[2]);
+
+  DenseVolumeMeshingGrid dense;
+  for (int axis = 0; axis < 3; ++axis) {
+    dense.minimum[axis] = minimum[axis];
+    dense.dimensions[axis] = dimensions[axis];
+  }
+  dense.isovalue = isovalue;
+  dense.active.resize(cell_count);
+  dense.values.resize(cell_count);
+  using RootChildType = TreeType::RootNodeType::ChildNodeType;
+  using InternalChildType = RootChildType::ChildNodeType;
+  const int root_dimension = RootChildType::DIM;
+  const int internal_dimension = InternalChildType::DIM;
+  const int leaf_dimensions[3] = {
+      static_cast<int>(dimensions[0] / LeafType::DIM),
+      static_cast<int>(dimensions[1] / LeafType::DIM),
+      static_cast<int>(dimensions[2] / LeafType::DIM)};
+  const size_t leaf_count =
+      static_cast<size_t>(leaf_dimensions[0]) * leaf_dimensions[1] *
+      leaf_dimensions[2];
+  dense.leaf_order.resize(leaf_count);
+  for (size_t leaf = 0; leaf < leaf_count; ++leaf)
+    dense.leaf_order[leaf] = static_cast<int>(leaf);
+  const auto leaf_origin = [&](int leaf) {
+    const int yz = leaf_dimensions[1] * leaf_dimensions[2];
+    const int x = leaf / yz;
+    const int remainder = leaf % yz;
+    const int y = remainder / leaf_dimensions[2];
+    const int z = remainder % leaf_dimensions[2];
+    return Coord(minimum[0] + x * LeafType::DIM,
+                 minimum[1] + y * LeafType::DIM,
+                 minimum[2] + z * LeafType::DIM);
+  };
+  const auto traversal_key = [&](int leaf) {
+    const Coord origin = leaf_origin(leaf);
+    const Coord root_origin =
+        origin & ~(root_dimension - 1);
+    const Coord internal_origin =
+        origin & ~(internal_dimension - 1);
+    array<int, 9> key{};
+    for (int axis = 0; axis < 3; ++axis) {
+      key[axis] = root_origin[axis];
+      key[3 + axis] =
+          (internal_origin[axis] - root_origin[axis]) /
+          internal_dimension;
+      key[6 + axis] =
+          (origin[axis] - internal_origin[axis]) / LeafType::DIM;
+    }
+    return key;
+  };
+  sort(dense.leaf_order.begin(), dense.leaf_order.end(),
+       [&](int first, int second) {
+         return traversal_key(first) < traversal_key(second);
+       });
+  tree::ValueAccessor<const TreeType> accessor(grid.tree());
+  size_t offset = 0;
+  Coord coordinate;
+  for (int x = minimum[0]; x <= maximum[0]; ++x) {
+    coordinate[0] = x;
+    for (int y = minimum[1]; y <= maximum[1]; ++y) {
+      coordinate[1] = y;
+      for (int z = minimum[2]; z <= maximum[2]; ++z, ++offset) {
+        coordinate[2] = z;
+        dense.values[offset] = accessor.getValue(coordinate);
+        dense.active[offset] = accessor.isValueOn(coordinate) ? 1 : 0;
+      }
+    }
+  }
+  mesh_dense_volume_cuda(dense);
+  if (dense.points.size() % 3 != 0 || dense.quads.size() % 4 != 0)
+    throw logic_error("CUDA volume meshing output is malformed");
+  points.resize(dense.points.size() / 3);
+  for (size_t index = 0; index < points.size(); ++index) {
+    points[index] = Vec3s(dense.points[index * 3],
+                          dense.points[index * 3 + 1],
+                          dense.points[index * 3 + 2]);
+  }
+  quads.resize(dense.quads.size() / 4);
+  for (size_t index = 0; index < quads.size(); ++index) {
+    quads[index] = Vec4I(dense.quads[index * 4],
+                         dense.quads[index * 4 + 1],
+                         dense.quads[index * 4 + 2],
+                         dense.quads[index * 4 + 3]);
+  }
+  return true;
+}
+
 } // namespace
 
 vector<SurfaceVoxelRecord>
@@ -1548,7 +1663,30 @@ bool sdf_manifold(Mesh &input, Mesh &output, double scale, double level_set,
   vector<Vec3I> newTriangles;
   vector<Vec4I> newQuads;
   const auto meshing_start = PreprocessClock::now();
-  tools::volumeToMesh(*sgrid, newPoints, newTriangles, newQuads, level_set*scale);
+  bool cuda_meshed = false;
+  if (use_cuda &&
+      environment_enabled("VISACD_ENABLE_CUDA_PREPROCESS_MESH")) {
+    try {
+      cuda_meshed = volume_to_mesh_cuda(
+          *sgrid, level_set * scale, newPoints, newQuads);
+    } catch (const exception &error) {
+      if (environment_enabled("VISACD_PREPROCESS_MESH_TRACE"))
+        cerr << "[visacd volume mesh] fallback=" << error.what()
+             << '\n';
+      cuda_meshed = false;
+    } catch (...) {
+      if (environment_enabled("VISACD_PREPROCESS_MESH_TRACE"))
+        cerr << "[visacd volume mesh] fallback=unknown exception\n";
+      cuda_meshed = false;
+    }
+  }
+  if (!cuda_meshed) {
+    newPoints.clear();
+    newTriangles.clear();
+    newQuads.clear();
+    tools::volumeToMesh(*sgrid, newPoints, newTriangles, newQuads,
+                        level_set * scale);
+  }
   if (metrics)
     metrics->volume_to_mesh_ns = elapsed_ns(meshing_start);
 
