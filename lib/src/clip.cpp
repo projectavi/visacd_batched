@@ -199,7 +199,6 @@ MeshList clip_impl(const Mesh &mesh, Plane plane, int *&pos_proj,
   vector<Vec3D> overlap;
   vector<array<int, 3>> border_triangles, final_triangles;
   vector<pair<int, int>> border_edges;
-  map<int, int> border_map;
   vector<Vec3D> final_border;
   vector<bool> pos_map, neg_map;
 
@@ -208,8 +207,10 @@ MeshList clip_impl(const Mesh &mesh, Plane plane, int *&pos_proj,
   pos_map.resize(N, false);
   neg_map.resize(N, false);
 
-  map<pair<int, int>, int> edge_map;
-  map<int, int> vertex_map;
+  ClipEdgeMap edge_map;
+  unordered_map<int, int> vertex_map;
+  edge_map.reserve(mesh.triangles.size());
+  vertex_map.reserve(mesh.vertices.size());
 
   for (int i = 0; i < (int)mesh.triangles.size(); i++) {
     int id0, id1, id2;

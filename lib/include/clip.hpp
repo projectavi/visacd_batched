@@ -3,8 +3,8 @@
 #include <clip_batch.hpp>
 #include <core.hpp>
 #include <limits>
-#include <unordered_map>
 #include <map>
+#include <unordered_map>
 
 namespace neural_acd {
 
@@ -24,7 +24,18 @@ inline bool same_point_detect(Vec3D p0, Vec3D p1, float eps = 1e-5) {
   return false;
 }
 
-inline void add_point(std::map<int, int> &vertex_map,
+struct ClipEdgeHash {
+  size_t operator()(const std::pair<int, int> &edge) const noexcept {
+    const size_t first = std::hash<int>{}(edge.first);
+    const size_t second = std::hash<int>{}(edge.second);
+    return first ^ (second + 0x9e3779b9u + (first << 6) + (first >> 2));
+  }
+};
+
+using ClipEdgeMap =
+    std::unordered_map<std::pair<int, int>, int, ClipEdgeHash>;
+
+inline void add_point(std::unordered_map<int, int> &vertex_map,
                       std::vector<Vec3D> &border, Vec3D pt, int id, int &idx) {
   if (vertex_map.find(id) == vertex_map.end()) {
     int flag = -1;
@@ -45,7 +56,7 @@ inline void add_point(std::map<int, int> &vertex_map,
   }
 }
 
-inline void add_edge_point(std::map<std::pair<int, int>, int> &edge_map,
+inline void add_edge_point(ClipEdgeMap &edge_map,
                            std::vector<Vec3D> &border, Vec3D pt, int id1,
                            int id2, int &idx) {
   std::pair<int, int> edge1 = std::make_pair(id1, id2);
