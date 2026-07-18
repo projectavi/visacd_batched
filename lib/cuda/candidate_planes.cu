@@ -1,6 +1,9 @@
 #include <algorithm>
 #include <candidate_planes.hpp>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cub/cub.cuh>
 #include <cuda_buffer.hpp>
 #include <cuda_runtime.h>
 #include <device_mesh.hpp>
@@ -47,6 +50,17 @@ struct PackedCandidateJob {
   int job_index;
 };
 
+struct ClipSideData {
+  short sides[3];
+};
+
+struct ClipIntersectionRecord {
+  int triangle_index;
+  unsigned short intersection_mask;
+  unsigned short padding;
+  double intersections[9];
+};
+
 struct PackedSplitJob {
   const double3 *vertices;
   const float3 *float_vertices;
@@ -55,7 +69,10 @@ struct PackedSplitJob {
   const double4 *candidates;
   const double4 *flat_planes;
   float *scores;
-  ClipTriangleData *clip_outputs;
+  ClipSideData *clip_sides;
+  ClipIntersectionRecord *clip_intersections;
+  unsigned char *clip_flags;
+  int clip_offset;
   int vertex_count;
   int edge_count;
   int triangle_count;
@@ -364,8 +381,8 @@ __device__ bool split_segment_intersection(double3 first, double3 second,
          intersection.z <= fmax(first.z + eps, second.z + eps);
 }
 
-__device__ void split_store_intersection(ClipTriangleData &output, int edge,
-                                         double3 point) {
+__device__ void split_store_intersection(ClipIntersectionRecord &output,
+                                         int edge, double3 point) {
   output.intersections[edge * 3] = point.x;
   output.intersections[edge * 3 + 1] = point.y;
   output.intersections[edge * 3 + 2] = point.z;
@@ -388,18 +405,45 @@ __global__ void prepare_selected_clips_kernel(
     const double3 points[3] = {job.vertices[triangle.x],
                                job.vertices[triangle.y],
                                job.vertices[triangle.z]};
-    ClipTriangleData output;
-    output.sides[0] = split_point_side(points[0], plane);
-    output.sides[1] = split_point_side(points[1], plane);
-    output.sides[2] = split_point_side(points[2], plane);
-    if (output.sides[0] == 0 && output.sides[1] == 0 &&
-        output.sides[2] == 0) {
+    ClipSideData sides;
+    sides.sides[0] = split_point_side(points[0], plane);
+    sides.sides[1] = split_point_side(points[1], plane);
+    sides.sides[2] = split_point_side(points[2], plane);
+    if (sides.sides[0] == 0 && sides.sides[1] == 0 &&
+        sides.sides[2] == 0) {
       const short side =
           split_coplanar_side(points[0], points[1], points[2], plane);
-      output.sides[0] = side;
-      output.sides[1] = side;
-      output.sides[2] = side;
+      sides.sides[0] = side;
+      sides.sides[1] = side;
+      sides.sides[2] = side;
     }
+    job.clip_sides[local_triangle] = sides;
+    const short sum = sides.sides[0] + sides.sides[1] + sides.sides[2];
+    const bool positive_side =
+        sum == 3 || sum == 2 ||
+        (sum == 1 &&
+         ((sides.sides[0] == 1 && sides.sides[1] == 0 &&
+           sides.sides[2] == 0) ||
+          (sides.sides[0] == 0 && sides.sides[1] == 1 &&
+           sides.sides[2] == 0) ||
+          (sides.sides[0] == 0 && sides.sides[1] == 0 &&
+           sides.sides[2] == 1)));
+    const bool negative_side =
+        sum == -3 || sum == -2 ||
+        (sum == -1 &&
+         ((sides.sides[0] == -1 && sides.sides[1] == 0 &&
+           sides.sides[2] == 0) ||
+          (sides.sides[0] == 0 && sides.sides[1] == -1 &&
+           sides.sides[2] == 0) ||
+          (sides.sides[0] == 0 && sides.sides[1] == 0 &&
+           sides.sides[2] == -1)));
+    if (positive_side || negative_side) {
+      job.clip_flags[local_triangle] = 0;
+      continue;
+    }
+
+    ClipIntersectionRecord output{};
+    output.triangle_index = job.clip_offset + local_triangle;
     double3 intersection;
     if (split_segment_intersection(points[0], points[1], plane,
                                    intersection)) {
@@ -416,7 +460,8 @@ __global__ void prepare_selected_clips_kernel(
       output.intersection_mask |= 4u;
       split_store_intersection(output, 2, intersection);
     }
-    job.clip_outputs[local_triangle] = output;
+    job.clip_intersections[local_triangle] = output;
+    job.clip_flags[local_triangle] = 1;
   }
 }
 
@@ -439,7 +484,12 @@ struct CandidatePlaneRuntime::Impl {
   DeviceBuffer flat_planes;
   DeviceBuffer scores;
   DeviceBuffer selected_planes;
+  DeviceBuffer clip_sides;
   DeviceBuffer clip_outputs;
+  DeviceBuffer compact_clip_outputs;
+  DeviceBuffer clip_flags;
+  DeviceBuffer compact_clip_count;
+  DeviceBuffer clip_select_temp;
   DeviceBuffer plane_counts;
   DeviceBuffer attempt_counts;
   PinnedBuffer host_vertices;
@@ -452,7 +502,9 @@ struct CandidatePlaneRuntime::Impl {
   PinnedBuffer host_planes;
   PinnedBuffer host_flat_planes;
   PinnedBuffer host_selected_planes;
-  PinnedBuffer host_clip_outputs;
+  PinnedBuffer host_clip_sides;
+  PinnedBuffer host_compact_clip_outputs;
+  PinnedBuffer host_compact_clip_count;
   PinnedBuffer host_plane_counts;
   PinnedBuffer host_attempt_counts;
 
@@ -515,7 +567,13 @@ struct CandidatePlaneRuntime::Impl {
     include(flat_planes, flat_plane_count, sizeof(double4));
     include(scores, score_count, sizeof(float));
     include(selected_planes, job_count, sizeof(double4));
-    include(clip_outputs, clip_triangle_count, sizeof(ClipTriangleData));
+    include(clip_sides, clip_triangle_count, sizeof(ClipSideData));
+    include(clip_outputs, clip_triangle_count,
+            sizeof(ClipIntersectionRecord));
+    include(compact_clip_outputs, clip_triangle_count,
+            sizeof(ClipIntersectionRecord));
+    include(clip_flags, clip_triangle_count, sizeof(unsigned char));
+    include(compact_clip_count, 1, sizeof(int));
     return result;
   }
 };
@@ -965,6 +1023,10 @@ void run_split_wave(const std::vector<SplitPlaneInput> &inputs, size_t begin,
                                  "Fused split score count overflow");
     max_plane_count = std::max(max_plane_count, input_plane_capacity);
   }
+  if (clip_triangle_count >
+      static_cast<size_t>(std::numeric_limits<int>::max())) {
+    throw std::overflow_error("Fused split packed clip count exceeds limits");
+  }
 
   runtime.ensure_stream();
   runtime.vertices.ensure(
@@ -1011,10 +1073,26 @@ void run_split_wave(const std::vector<SplitPlaneInput> &inputs, size_t begin,
       checked_multiply(job_count, sizeof(double4),
                        "Fused split selection allocation overflow"),
       "cudaMalloc fused split selected planes");
+  runtime.clip_sides.ensure(
+      checked_multiply(clip_triangle_count, sizeof(ClipSideData),
+                       "Fused split clip side allocation overflow"),
+      "cudaMalloc fused split clip sides");
   runtime.clip_outputs.ensure(
-      checked_multiply(clip_triangle_count, sizeof(ClipTriangleData),
+      checked_multiply(clip_triangle_count,
+                       sizeof(ClipIntersectionRecord),
                        "Fused split clip allocation overflow"),
-      "cudaMalloc fused split clip outputs");
+      "cudaMalloc fused split clip intersections");
+  runtime.compact_clip_outputs.ensure(
+      checked_multiply(clip_triangle_count,
+                       sizeof(ClipIntersectionRecord),
+                       "Fused split compact clip allocation overflow"),
+      "cudaMalloc fused split compact clip intersections");
+  runtime.clip_flags.ensure(
+      checked_multiply(clip_triangle_count, sizeof(unsigned char),
+                       "Fused split clip flag allocation overflow"),
+      "cudaMalloc fused split clip flags");
+  runtime.compact_clip_count.ensure(
+      sizeof(int), "cudaMalloc fused split compact clip count");
   runtime.plane_counts.ensure(job_count * sizeof(int),
                               "cudaMalloc fused split candidate counts");
   runtime.attempt_counts.ensure(job_count * sizeof(int),
@@ -1041,9 +1119,14 @@ void run_split_wave(const std::vector<SplitPlaneInput> &inputs, size_t begin,
   runtime.host_selected_planes.ensure(
       job_count * sizeof(double4),
       "cudaMallocHost fused split selected planes");
-  runtime.host_clip_outputs.ensure(
-      clip_triangle_count * sizeof(ClipTriangleData),
-      "cudaMallocHost fused split clip outputs");
+  runtime.host_clip_sides.ensure(
+      clip_triangle_count * sizeof(ClipSideData),
+      "cudaMallocHost fused split clip sides");
+  runtime.host_compact_clip_outputs.ensure(
+      clip_triangle_count * sizeof(ClipIntersectionRecord),
+      "cudaMallocHost fused split compact clip intersections");
+  runtime.host_compact_clip_count.ensure(
+      sizeof(int), "cudaMallocHost fused split compact clip count");
   runtime.host_plane_counts.ensure(
       job_count * sizeof(int),
       "cudaMallocHost fused split candidate counts");
@@ -1156,7 +1239,10 @@ void run_split_wave(const std::vector<SplitPlaneInput> &inputs, size_t begin,
         runtime.planes.as<double4>() + candidate_offset,
         flat_planes,
         runtime.scores.as<float>() + score_offset,
-        runtime.clip_outputs.as<ClipTriangleData>() + clip_offset,
+        runtime.clip_sides.as<ClipSideData>() + clip_offset,
+        runtime.clip_outputs.as<ClipIntersectionRecord>() + clip_offset,
+        runtime.clip_flags.as<unsigned char>() + clip_offset,
+        static_cast<int>(clip_offset),
         static_cast<int>(input.mesh->vertices.size()),
         static_cast<int>(input.mesh->intersecting_edges.size()),
         static_cast<int>(input.mesh->triangles.size()),
@@ -1226,10 +1312,12 @@ void run_split_wave(const std::vector<SplitPlaneInput> &inputs, size_t begin,
                              job_count * sizeof(PackedSplitJob),
                              cudaMemcpyHostToDevice, runtime.stream),
              "copy fused split jobs");
-  check_cuda(cudaMemsetAsync(runtime.clip_outputs.as<ClipTriangleData>(), 0,
-                             clip_triangle_count * sizeof(ClipTriangleData),
-                             runtime.stream),
-             "clear fused split clip outputs");
+  if (clip_triangle_count) {
+    check_cuda(cudaMemsetAsync(runtime.clip_flags.as<unsigned char>(), 0,
+                               clip_triangle_count * sizeof(unsigned char),
+                               runtime.stream),
+               "clear fused split clip flags");
+  }
 
   constexpr int block_size = 256;
   const double normal_epsilon =
@@ -1263,6 +1351,30 @@ void run_split_wave(const std::vector<SplitPlaneInput> &inputs, size_t begin,
       runtime.selected_planes.as<double4>(), static_cast<int>(job_count));
   check_cuda(cudaGetLastError(), "launch fused clip preparation");
 
+  if (clip_triangle_count) {
+    size_t select_temp_bytes = 0;
+    check_cuda(cub::DeviceSelect::Flagged(
+                   nullptr, select_temp_bytes,
+                   runtime.clip_outputs.as<ClipIntersectionRecord>(),
+                   runtime.clip_flags.as<unsigned char>(),
+                   runtime.compact_clip_outputs
+                       .as<ClipIntersectionRecord>(),
+                   runtime.compact_clip_count.as<int>(),
+                   static_cast<int>(clip_triangle_count), runtime.stream),
+               "query compact clip selection storage");
+    runtime.clip_select_temp.ensure(
+        select_temp_bytes, "cudaMalloc compact clip selection storage");
+    check_cuda(cub::DeviceSelect::Flagged(
+                   runtime.clip_select_temp.as<void>(), select_temp_bytes,
+                   runtime.clip_outputs.as<ClipIntersectionRecord>(),
+                   runtime.clip_flags.as<unsigned char>(),
+                   runtime.compact_clip_outputs
+                       .as<ClipIntersectionRecord>(),
+                   runtime.compact_clip_count.as<int>(),
+                   static_cast<int>(clip_triangle_count), runtime.stream),
+               "compact clip intersections");
+  }
+
   check_cuda(cudaMemcpyAsync(runtime.host_plane_counts.as<int>(),
                              runtime.plane_counts.as<int>(),
                              job_count * sizeof(int), cudaMemcpyDeviceToHost,
@@ -1278,21 +1390,61 @@ void run_split_wave(const std::vector<SplitPlaneInput> &inputs, size_t begin,
                              job_count * sizeof(double4),
                              cudaMemcpyDeviceToHost, runtime.stream),
              "copy fused split selected planes");
-  check_cuda(cudaMemcpyAsync(
-                 runtime.host_clip_outputs.as<ClipTriangleData>(),
-                 runtime.clip_outputs.as<ClipTriangleData>(),
-                 clip_triangle_count * sizeof(ClipTriangleData),
-                 cudaMemcpyDeviceToHost, runtime.stream),
-             "copy fused split clip outputs");
+  if (clip_triangle_count) {
+    check_cuda(cudaMemcpyAsync(runtime.host_clip_sides.as<ClipSideData>(),
+                               runtime.clip_sides.as<ClipSideData>(),
+                               clip_triangle_count * sizeof(ClipSideData),
+                               cudaMemcpyDeviceToHost, runtime.stream),
+               "copy fused split clip sides");
+    check_cuda(cudaMemcpyAsync(runtime.host_compact_clip_count.as<int>(),
+                               runtime.compact_clip_count.as<int>(),
+                               sizeof(int), cudaMemcpyDeviceToHost,
+                               runtime.stream),
+               "copy fused split compact clip count");
+  }
   check_cuda(cudaStreamSynchronize(runtime.stream),
-             "synchronize fused split pipeline");
+             "synchronize fused split compact count");
+
+  const int compact_clip_count =
+      clip_triangle_count ? *runtime.host_compact_clip_count.as<int>() : 0;
+  if (compact_clip_count < 0 ||
+      static_cast<size_t>(compact_clip_count) > clip_triangle_count) {
+    throw std::runtime_error(
+        "Fused split kernel returned an invalid compact clip count");
+  }
+  if (std::getenv("VISACD_CLIP_COMPACTION_DIAGNOSTICS")) {
+    const size_t previous_bytes =
+        clip_triangle_count * sizeof(ClipTriangleData);
+    const size_t compact_bytes =
+        clip_triangle_count * sizeof(ClipSideData) +
+        static_cast<size_t>(compact_clip_count) *
+            sizeof(ClipIntersectionRecord);
+    std::fprintf(stderr,
+                 "[visacd compact clip] triangles=%zu crossings=%d "
+                 "d2h_bytes=%zu previous_bytes=%zu\n",
+                 clip_triangle_count, compact_clip_count, compact_bytes,
+                 previous_bytes);
+  }
+  if (compact_clip_count) {
+    check_cuda(cudaMemcpyAsync(
+                   runtime.host_compact_clip_outputs
+                       .as<ClipIntersectionRecord>(),
+                   runtime.compact_clip_outputs
+                       .as<ClipIntersectionRecord>(),
+                   static_cast<size_t>(compact_clip_count) *
+                       sizeof(ClipIntersectionRecord),
+                   cudaMemcpyDeviceToHost, runtime.stream),
+               "copy fused split compact clip intersections");
+    check_cuda(cudaStreamSynchronize(runtime.stream),
+               "synchronize fused split compact intersections");
+  }
 
   const int *host_counts = runtime.host_plane_counts.as<int>();
   const int *host_attempts = runtime.host_attempt_counts.as<int>();
   const double4 *host_selected =
       runtime.host_selected_planes.as<double4>();
-  const ClipTriangleData *host_clips =
-      runtime.host_clip_outputs.as<ClipTriangleData>();
+  const ClipSideData *host_clip_sides =
+      runtime.host_clip_sides.as<ClipSideData>();
   for (const SplitOutputRange &output : outputs) {
     const int candidate_count = host_counts[output.job_index];
     const int attempts = host_attempts[output.job_index];
@@ -1317,9 +1469,44 @@ void run_split_wave(const std::vector<SplitPlaneInput> &inputs, size_t begin,
     *output.input.selected_plane =
         Plane(selected.x, selected.y, selected.z, selected.w);
     const size_t triangle_count = output.input.mesh->triangles.size();
-    output.input.prepared_clip->assign(
-        host_clips + output.clip_offset,
-        host_clips + output.clip_offset + triangle_count);
+    output.input.prepared_clip->resize(triangle_count);
+    for (size_t triangle = 0; triangle < triangle_count; ++triangle) {
+      ClipTriangleData &clip = (*output.input.prepared_clip)[triangle];
+      const ClipSideData &sides =
+          host_clip_sides[output.clip_offset + triangle];
+      clip.sides[0] = sides.sides[0];
+      clip.sides[1] = sides.sides[1];
+      clip.sides[2] = sides.sides[2];
+    }
+  }
+
+  const ClipIntersectionRecord *host_intersections =
+      runtime.host_compact_clip_outputs.as<ClipIntersectionRecord>();
+  size_t output_index = 0;
+  for (int compact = 0; compact < compact_clip_count; ++compact) {
+    const ClipIntersectionRecord &record = host_intersections[compact];
+    if (record.triangle_index < 0)
+      throw std::runtime_error("Compact clip record has a negative index");
+    const size_t triangle_index =
+        static_cast<size_t>(record.triangle_index);
+    while (output_index < outputs.size() &&
+           triangle_index >=
+               outputs[output_index].clip_offset +
+                   outputs[output_index].input.mesh->triangles.size()) {
+      ++output_index;
+    }
+    if (output_index >= outputs.size() ||
+        triangle_index < outputs[output_index].clip_offset ||
+        outputs[output_index].input.prepared_clip->empty()) {
+      throw std::runtime_error("Compact clip record has an invalid owner");
+    }
+    ClipTriangleData &clip =
+        (*outputs[output_index].input.prepared_clip)
+            [triangle_index - outputs[output_index].clip_offset];
+    clip.intersection_mask = record.intersection_mask;
+    std::copy(std::begin(record.intersections),
+              std::end(record.intersections),
+              std::begin(clip.intersections));
   }
 }
 
@@ -1383,6 +1570,10 @@ void generate_score_select_clip_batch(
         next_clip_triangles = checked_add(
             clip_triangles, input.mesh->triangles.size(),
             "Fused split wave clip count overflow");
+        if (next_clip_triangles >
+            static_cast<size_t>(std::numeric_limits<int>::max())) {
+          break;
+        }
         next_samples = checked_add(samples, input.sample_count,
                                    "Fused split wave sample count overflow");
         next_candidates =
