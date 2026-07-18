@@ -17,8 +17,10 @@
 #include <preprocess.hpp>
 #include <preprocess_cuda.hpp>
 #include <preprocess_expand_cuda.hpp>
+#include <preprocess_renormalize_cuda.hpp>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 using namespace openvdb;
@@ -518,6 +520,171 @@ DenseNarrowbandCudaBatcher &dense_narrowband_cuda_batcher() {
   return batcher;
 }
 
+struct SparseRenormalizeBatchRequest {
+  SparseRenormalizeGrid *grid = nullptr;
+  bool done = false;
+  exception_ptr error;
+};
+
+class SparseRenormalizeCudaBatcher {
+public:
+  void renormalize(SparseRenormalizeGrid &grid) {
+    auto request = make_shared<SparseRenormalizeBatchRequest>();
+    request->grid = &grid;
+    bool leader = false;
+    {
+      lock_guard<mutex> lock(mutex_);
+      queue_.push_back(request);
+      if (!processing_) {
+        processing_ = true;
+        leader = true;
+      }
+      condition_.notify_all();
+    }
+    if (!leader) {
+      unique_lock<mutex> lock(mutex_);
+      condition_.wait(lock, [&]() { return request->done; });
+      if (request->error)
+        rethrow_exception(request->error);
+      return;
+    }
+
+    while (true) {
+      vector<shared_ptr<SparseRenormalizeBatchRequest>> batch;
+      {
+        unique_lock<mutex> lock(mutex_);
+        condition_.wait_for(lock, chrono::microseconds(250), [&]() {
+          return queue_.size() >= 32;
+        });
+        const size_t count = min<size_t>(200, queue_.size());
+        batch.reserve(count);
+        for (size_t index = 0; index < count; ++index) {
+          batch.push_back(move(queue_.front()));
+          queue_.pop_front();
+        }
+      }
+      exception_ptr error;
+      try {
+        vector<SparseRenormalizeGrid *> grids;
+        grids.reserve(batch.size());
+        size_t leaf_count = 0;
+        for (const auto &pending : batch) {
+          grids.push_back(pending->grid);
+          leaf_count += pending->grid->active.size() /
+                        NarrowbandLeaf::SIZE;
+        }
+        if (environment_enabled(
+                "VISACD_PREPROCESS_RENORMALIZE_TRACE")) {
+          cerr << "[visacd renormalize] meshes=" << batch.size()
+               << " leaves=" << leaf_count << '\n';
+        }
+        renormalize_sparse_cuda_batch(grids);
+      } catch (...) {
+        error = current_exception();
+      }
+      bool finished = false;
+      {
+        lock_guard<mutex> lock(mutex_);
+        for (const auto &pending : batch) {
+          pending->error = error;
+          pending->done = true;
+        }
+        if (queue_.empty()) {
+          processing_ = false;
+          finished = true;
+        }
+        condition_.notify_all();
+      }
+      if (finished)
+        break;
+    }
+    if (request->error)
+      rethrow_exception(request->error);
+  }
+
+private:
+  mutex mutex_;
+  condition_variable condition_;
+  deque<shared_ptr<SparseRenormalizeBatchRequest>> queue_;
+  bool processing_ = false;
+};
+
+SparseRenormalizeCudaBatcher &sparse_renormalize_cuda_batcher() {
+  static SparseRenormalizeCudaBatcher batcher;
+  return batcher;
+}
+
+bool renormalize_sparse_cuda(
+    NarrowbandTree &distance_tree,
+    const vector<NarrowbandLeaf *> &nodes, double voxel_size) {
+  if (nodes.empty())
+    return true;
+  if (nodes.size() >
+      static_cast<size_t>(numeric_limits<int>::max()))
+    return false;
+  SparseRenormalizeGrid grid;
+  grid.voxel_size = voxel_size;
+  const size_t cell_count =
+      nodes.size() * static_cast<size_t>(NarrowbandLeaf::SIZE);
+  const size_t neighbour_count = nodes.size() * 6;
+  grid.active.resize(cell_count);
+  grid.values.resize(cell_count);
+  grid.neighbour_indices.resize(neighbour_count, -1);
+  grid.neighbour_values.resize(neighbour_count);
+
+  unordered_map<const NarrowbandLeaf *, int> leaf_indices;
+  leaf_indices.reserve(nodes.size());
+  for (size_t leaf = 0; leaf < nodes.size(); ++leaf)
+    leaf_indices.emplace(nodes[leaf], static_cast<int>(leaf));
+
+  tree::ValueAccessor<NarrowbandTree> accessor(distance_tree);
+  const int axis[6] = {0, 0, 1, 1, 2, 2};
+  const int direction[6] = {-1, 1, -1, 1, -1, 1};
+  for (size_t leaf = 0; leaf < nodes.size(); ++leaf) {
+    const NarrowbandLeaf &node = *nodes[leaf];
+    const size_t cell_offset =
+        leaf * static_cast<size_t>(NarrowbandLeaf::SIZE);
+    copy_n(node.buffer().data(), NarrowbandLeaf::SIZE,
+           grid.values.begin() + cell_offset);
+    const auto &mask = node.getValueMask();
+    for (Index position = 0; position < NarrowbandLeaf::SIZE;
+         ++position) {
+      grid.active[cell_offset + position] =
+          mask.isOn(position) ? 1 : 0;
+    }
+    for (int neighbour = 0; neighbour < 6; ++neighbour) {
+      Coord origin = node.origin();
+      origin[axis[neighbour]] +=
+          direction[neighbour] * NarrowbandLeaf::DIM;
+      const NarrowbandLeaf *adjacent =
+          accessor.probeConstLeaf(origin);
+      const auto found = leaf_indices.find(adjacent);
+      const size_t packed = leaf * 6 + neighbour;
+      if (adjacent) {
+        if (found == leaf_indices.end())
+          throw logic_error(
+              "Sparse renormalization leaf topology diverged");
+        grid.neighbour_indices[packed] = found->second;
+      } else {
+        grid.neighbour_values[packed] =
+            accessor.getValue(origin);
+      }
+    }
+  }
+
+  sparse_renormalize_cuda_batcher().renormalize(grid);
+  for (size_t leaf = 0; leaf < nodes.size(); ++leaf) {
+    NarrowbandLeaf &node = *nodes[leaf];
+    double *values = node.buffer().data();
+    const size_t cell_offset =
+        leaf * static_cast<size_t>(NarrowbandLeaf::SIZE);
+    for (auto iterator = node.cbeginValueOn(); iterator; ++iterator)
+      values[iterator.pos()] =
+          grid.values[cell_offset + iterator.pos()];
+  }
+  return true;
+}
+
 bool expand_narrowband_dense(
     NarrowbandTree &distance_tree, NarrowbandIndexTree &index_tree,
     const Mesh &source_mesh, double scale, double exterior_width,
@@ -869,22 +1036,45 @@ DoubleGrid::Ptr signed_distance_field_from_surface(
   nodes.clear();
   nodes.reserve(distance_tree.leafCount());
   distance_tree.getNodes(nodes);
-  unique_ptr<ValueType[]> buffer(
-      new ValueType[LeafNodeType::SIZE * nodes.size()]);
   const ValueType offset = ValueType(0.8 * voxel_size);
   const tbb::blocked_range<size_t> final_node_range(0, nodes.size());
-  tbb::parallel_for(
-      final_node_range,
-      tools::mesh_to_volume_internal::OffsetValues<TreeType>(nodes,
-                                                               -offset));
-  tbb::parallel_for(
-      final_node_range,
-      tools::mesh_to_volume_internal::Renormalize<TreeType>(
-          distance_tree, nodes, buffer.get(), voxel_size));
-  tbb::parallel_for(
-      final_node_range,
-      tools::mesh_to_volume_internal::MinCombine<TreeType>(nodes,
-                                                            buffer.get()));
+  bool cuda_renormalized = false;
+  if (environment_enabled(
+          "VISACD_ENABLE_CUDA_PREPROCESS_RENORMALIZE")) {
+    try {
+      cuda_renormalized = renormalize_sparse_cuda(
+          distance_tree, nodes, voxel_size);
+    } catch (const exception &error) {
+      if (environment_enabled(
+              "VISACD_PREPROCESS_RENORMALIZE_TRACE")) {
+        cerr << "[visacd renormalize] fallback=" << error.what()
+             << '\n';
+      }
+      cuda_renormalized = false;
+    } catch (...) {
+      if (environment_enabled(
+              "VISACD_PREPROCESS_RENORMALIZE_TRACE")) {
+        cerr << "[visacd renormalize] fallback=unknown exception\n";
+      }
+      cuda_renormalized = false;
+    }
+  }
+  if (!cuda_renormalized) {
+    unique_ptr<ValueType[]> buffer(
+        new ValueType[LeafNodeType::SIZE * nodes.size()]);
+    tbb::parallel_for(
+        final_node_range,
+        tools::mesh_to_volume_internal::OffsetValues<TreeType>(
+            nodes, -offset));
+    tbb::parallel_for(
+        final_node_range,
+        tools::mesh_to_volume_internal::Renormalize<TreeType>(
+            distance_tree, nodes, buffer.get(), voxel_size));
+    tbb::parallel_for(
+        final_node_range,
+        tools::mesh_to_volume_internal::MinCombine<TreeType>(
+            nodes, buffer.get()));
+  }
   tbb::parallel_for(
       final_node_range,
       tools::mesh_to_volume_internal::OffsetValues<TreeType>(

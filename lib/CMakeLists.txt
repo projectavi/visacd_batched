@@ -63,6 +63,7 @@ set_source_files_properties(
     ${CMAKE_CURRENT_SOURCE_DIR}/cuda/preprocess_cuda.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/cuda/preprocess_cuda_batch.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/cuda/preprocess_expand_cuda.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/cuda/preprocess_renormalize_cuda.cu
     PROPERTIES COMPILE_OPTIONS "--fmad=false"
 )
 
