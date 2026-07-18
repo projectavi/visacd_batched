@@ -9,6 +9,7 @@
 #include <openvdb/tools/VolumeToMesh.h>
 #include <openvdb/util/Util.h>
 #include <preprocess.hpp>
+#include <preprocess_cuda.hpp>
 #include <string>
 #include <vector>
 
@@ -28,6 +29,67 @@ long long elapsed_ns(PreprocessClock::time_point start) {
 }
 
 } // namespace
+
+vector<SurfaceVoxelRecord>
+reference_surface_voxelization(const Mesh &input, double scale) {
+  vector<Vec3s> points;
+  vector<Vec3I> triangles;
+  points.reserve(input.vertices.size());
+  triangles.reserve(input.triangles.size());
+  for (const Vec3D &vertex : input.vertices) {
+    points.push_back({static_cast<float>(vertex[0] * scale),
+                      static_cast<float>(vertex[1] * scale),
+                      static_cast<float>(vertex[2] * scale)});
+  }
+  for (const array<int, 3> &triangle : input.triangles) {
+    triangles.push_back({static_cast<unsigned int>(triangle[0]),
+                         static_cast<unsigned int>(triangle[1]),
+                         static_cast<unsigned int>(triangle[2])});
+  }
+  if (points.empty() || triangles.empty())
+    return {};
+
+  using TreeType = DoubleGrid::TreeType;
+  using IntTreeType = TreeType::ValueConverter<Int32>::Type;
+  using VoxelizationData =
+      tools::mesh_to_volume_internal::VoxelizationData<TreeType>;
+  using DataTable =
+      tbb::enumerable_thread_specific<typename VoxelizationData::Ptr>;
+  using Adapter = tools::QuadAndTriangleDataAdapter<Vec3s, Vec3I>;
+  using Voxelizer =
+      tools::mesh_to_volume_internal::VoxelizePolygons<TreeType, Adapter>;
+
+  Adapter adapter(points, triangles);
+  DataTable data;
+  tbb::parallel_for(tbb::blocked_range<size_t>(0, adapter.polygonCount()),
+                    Voxelizer(data, adapter));
+
+  TreeType distance_tree(numeric_limits<double>::max());
+  IntTreeType index_tree(Int32(util::INVALID_IDX));
+  for (auto iterator = data.begin(); iterator != data.end(); ++iterator) {
+    VoxelizationData &item = **iterator;
+    tools::mesh_to_volume_internal::combineData(
+        distance_tree, index_tree, item.distTree, item.indexTree);
+  }
+
+  tree::ValueAccessor<const IntTreeType> index_accessor(index_tree);
+  vector<SurfaceVoxelRecord> records;
+  records.reserve(distance_tree.activeVoxelCount());
+  for (auto iterator = distance_tree.cbeginValueOn(); iterator; ++iterator) {
+    const Coord coordinate = iterator.getCoord();
+    records.push_back({coordinate.x(), coordinate.y(), coordinate.z(),
+                       *iterator, index_accessor.getValue(coordinate)});
+  }
+  sort(records.begin(), records.end(), [](const auto &first,
+                                          const auto &second) {
+    if (first.x != second.x)
+      return first.x < second.x;
+    if (first.y != second.y)
+      return first.y < second.y;
+    return first.z < second.z;
+  });
+  return records;
+}
 
 void sdf_manifold(Mesh &input, Mesh &output, double scale, double level_set,
                   ManifoldPreprocessMetrics *metrics) {

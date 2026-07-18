@@ -56,6 +56,14 @@ FetchContent_MakeAvailable(eigen)
 file(GLOB visacd_CPP "src/*.cpp")
 file(GLOB visacd_CUDA "cuda/*.cu")
 
+# OpenVDB 8.2 evaluates mesh voxel distances with unfused host double
+# arithmetic. Keep the CUDA equivalence path on the same operation model so
+# exact distance and closest-primitive ties can be reproduced.
+set_source_files_properties(
+    ${CMAKE_CURRENT_SOURCE_DIR}/cuda/preprocess_cuda.cu
+    PROPERTIES COMPILE_OPTIONS "--fmad=false"
+)
+
 # Filter out .cu files that should only be PTX (not linked)
 list(FILTER visacd_CUDA EXCLUDE REGEX "ray_segments.cu")
 

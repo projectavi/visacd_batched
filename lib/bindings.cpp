@@ -1,5 +1,7 @@
 #include <config.hpp>
 #include <core.hpp>
+#include <preprocess_cuda.hpp>
+#include <chrono>
 #include <cstring>
 #include <iostream>
 #include <process.hpp>
@@ -108,6 +110,91 @@ PYBIND11_MODULE(visacd, m)
     });
 
     m.def("set_seed", &neural_acd::set_seed, py::arg("seed"));
+
+    m.def("_verify_preprocess_voxelization",
+          [](neural_acd::Mesh mesh, double scale,
+             double memory_fraction) {
+              mesh.normalize();
+              const auto reference_start =
+                  std::chrono::steady_clock::now();
+              const auto reference =
+                  neural_acd::reference_surface_voxelization(mesh, scale);
+              const double reference_ms =
+                  std::chrono::duration<double, std::milli>(
+                      std::chrono::steady_clock::now() - reference_start)
+                      .count();
+              static thread_local neural_acd::ManifoldCudaRuntime runtime;
+              auto candidate = runtime.voxelize_surface(
+                  mesh, scale, memory_fraction);
+
+              size_t coordinate_mismatches = 0;
+              size_t distance_mismatches = 0;
+              size_t triangle_mismatches = 0;
+              unsigned long long maximum_ulp_difference = 0;
+              double maximum_absolute_difference = 0.0;
+              const size_t common =
+                  std::min(reference.size(), candidate.records.size());
+              for (size_t index = 0; index < common; ++index) {
+                  const auto &expected = reference[index];
+                  const auto &actual = candidate.records[index];
+                  if (expected.x != actual.x || expected.y != actual.y ||
+                      expected.z != actual.z) {
+                      ++coordinate_mismatches;
+                      continue;
+                  }
+                  if (std::memcmp(&expected.squared_distance,
+                                  &actual.squared_distance,
+                                  sizeof(double)) != 0) {
+                      ++distance_mismatches;
+                      unsigned long long expected_bits = 0;
+                      unsigned long long actual_bits = 0;
+                      std::memcpy(&expected_bits,
+                                  &expected.squared_distance,
+                                  sizeof(expected_bits));
+                      std::memcpy(&actual_bits, &actual.squared_distance,
+                                  sizeof(actual_bits));
+                      const unsigned long long ulp_difference =
+                          expected_bits > actual_bits
+                              ? expected_bits - actual_bits
+                              : actual_bits - expected_bits;
+                      maximum_ulp_difference = std::max(
+                          maximum_ulp_difference, ulp_difference);
+                      maximum_absolute_difference = std::max(
+                          maximum_absolute_difference,
+                          std::abs(expected.squared_distance -
+                                   actual.squared_distance));
+                  }
+                  if (expected.triangle_index != actual.triangle_index)
+                      ++triangle_mismatches;
+              }
+              coordinate_mismatches +=
+                  reference.size() > common
+                      ? reference.size() - common
+                      : candidate.records.size() - common;
+
+              py::dict result;
+              result["supported"] = candidate.supported;
+              result["fallback_reason"] = candidate.fallback_reason;
+              result["reference_voxels"] = reference.size();
+              result["candidate_voxels"] = candidate.records.size();
+              result["candidate_evaluations"] =
+                  candidate.candidate_voxels;
+              result["coordinate_mismatches"] = coordinate_mismatches;
+              result["distance_mismatches"] = distance_mismatches;
+              result["triangle_mismatches"] = triangle_mismatches;
+              result["maximum_ulp_difference"] =
+                  maximum_ulp_difference;
+              result["maximum_absolute_difference"] =
+                  maximum_absolute_difference;
+              result["exact"] =
+                  candidate.supported && coordinate_mismatches == 0 &&
+                  distance_mismatches == 0 && triangle_mismatches == 0;
+              result["reference_ms"] = reference_ms;
+              result["cuda_ms"] = candidate.elapsed_ms;
+              return result;
+          },
+          py::arg("mesh"), py::arg("scale"),
+          py::arg("memory_fraction") = 0.7);
 
     m.attr("config") =
         py::cast(&neural_acd::config, py::return_value_policy::reference);

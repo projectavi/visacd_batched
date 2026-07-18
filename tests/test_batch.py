@@ -214,6 +214,28 @@ class BatchGpuTests(unittest.TestCase):
             signed_distances = (vertices - first) @ normal
             self.assertLessEqual(signed_distances.max(), tolerance)
 
+    def test_cuda_surface_voxelization_matches_openvdb(self):
+        for sample in ("cow.obj", "KitchenPot.obj", "armadillo.obj"):
+            mesh = load_sample(sample)
+            for scale in (20.0, 30.0, 40.0):
+                with self.subTest(sample=sample, scale=scale):
+                    comparison = visacd._verify_preprocess_voxelization(
+                        mesh, scale
+                    )
+                    self.assertTrue(comparison["supported"])
+                    self.assertTrue(comparison["exact"])
+                    self.assertEqual(
+                        comparison["coordinate_mismatches"], 0
+                    )
+                    self.assertEqual(comparison["distance_mismatches"], 0)
+                    self.assertEqual(comparison["triangle_mismatches"], 0)
+
+        fallback = visacd._verify_preprocess_voxelization(
+            load_cow(), 30.0, 1e-12
+        )
+        self.assertFalse(fallback["supported"])
+        self.assertIn("memory budget", fallback["fallback_reason"])
+
     def test_flat_surface_pipeline_is_repeatable(self):
         def run(
             max_batch_size,
