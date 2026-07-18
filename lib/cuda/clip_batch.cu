@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <clip_batch.hpp>
+#include <cuda_buffer.hpp>
 #include <cuda_runtime.h>
 #include <device_mesh.hpp>
 #include <limits>
@@ -18,64 +19,8 @@ void check_cuda(cudaError_t result, const char *operation) {
   }
 }
 
-class DeviceBuffer {
-public:
-  ~DeviceBuffer() {
-    if (data_)
-      cudaFree(data_);
-  }
-
-  DeviceBuffer() = default;
-  DeviceBuffer(const DeviceBuffer &) = delete;
-  DeviceBuffer &operator=(const DeviceBuffer &) = delete;
-
-  void ensure(size_t bytes, const char *operation) {
-    if (bytes <= capacity_)
-      return;
-    if (data_)
-      check_cuda(cudaFree(data_), "cudaFree clip buffer");
-    data_ = nullptr;
-    capacity_ = 0;
-    check_cuda(cudaMalloc(&data_, bytes), operation);
-    capacity_ = bytes;
-  }
-
-  template <typename T> T *as() const { return static_cast<T *>(data_); }
-  size_t capacity() const { return capacity_; }
-
-private:
-  void *data_ = nullptr;
-  size_t capacity_ = 0;
-};
-
-class PinnedBuffer {
-public:
-  ~PinnedBuffer() {
-    if (data_)
-      cudaFreeHost(data_);
-  }
-
-  PinnedBuffer() = default;
-  PinnedBuffer(const PinnedBuffer &) = delete;
-  PinnedBuffer &operator=(const PinnedBuffer &) = delete;
-
-  void ensure(size_t bytes, const char *operation) {
-    if (bytes <= capacity_)
-      return;
-    if (data_)
-      check_cuda(cudaFreeHost(data_), "cudaFreeHost clip buffer");
-    data_ = nullptr;
-    capacity_ = 0;
-    check_cuda(cudaMallocHost(&data_, bytes), operation);
-    capacity_ = bytes;
-  }
-
-  template <typename T> T *as() const { return static_cast<T *>(data_); }
-
-private:
-  void *data_ = nullptr;
-  size_t capacity_ = 0;
-};
+using cuda_memory::DeviceBuffer;
+using cuda_memory::PinnedBuffer;
 
 struct PackedClipJob {
   const double3 *vertices;
@@ -271,6 +216,7 @@ struct ClipBatchRuntime::Impl {
       check_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
                  "cudaStreamCreateWithFlags clip batch");
     }
+    DeviceBuffer::set_allocation_stream(stream);
   }
 
   size_t growth(size_t jobs_count, size_t triangle_count) const {

@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cmath>
+#include <cuda_buffer.hpp>
 #include <cuda_runtime.h>
 #include <limits>
 #include <memory>
@@ -32,63 +33,8 @@ size_t checked_multiply(size_t first, size_t second, const char *message) {
   return first * second;
 }
 
-class DeviceBuffer {
-public:
-  ~DeviceBuffer() {
-    if (data_)
-      cudaFree(data_);
-  }
-
-  DeviceBuffer() = default;
-  DeviceBuffer(const DeviceBuffer &) = delete;
-  DeviceBuffer &operator=(const DeviceBuffer &) = delete;
-
-  void ensure(size_t bytes, const char *operation) {
-    if (bytes <= capacity_)
-      return;
-    if (data_)
-      check_cuda(cudaFree(data_), "cudaFree merge-cost buffer");
-    data_ = nullptr;
-    capacity_ = 0;
-    check_cuda(cudaMalloc(&data_, bytes), operation);
-    capacity_ = bytes;
-  }
-
-  template <typename T> T *as() const { return static_cast<T *>(data_); }
-
-private:
-  void *data_ = nullptr;
-  size_t capacity_ = 0;
-};
-
-class PinnedBuffer {
-public:
-  ~PinnedBuffer() {
-    if (data_)
-      cudaFreeHost(data_);
-  }
-
-  PinnedBuffer() = default;
-  PinnedBuffer(const PinnedBuffer &) = delete;
-  PinnedBuffer &operator=(const PinnedBuffer &) = delete;
-
-  void ensure(size_t bytes, const char *operation) {
-    if (bytes <= capacity_)
-      return;
-    if (data_)
-      check_cuda(cudaFreeHost(data_), "cudaFreeHost merge-cost buffer");
-    data_ = nullptr;
-    capacity_ = 0;
-    check_cuda(cudaMallocHost(&data_, bytes), operation);
-    capacity_ = bytes;
-  }
-
-  template <typename T> T *as() const { return static_cast<T *>(data_); }
-
-private:
-  void *data_ = nullptr;
-  size_t capacity_ = 0;
-};
+using cuda_memory::DeviceBuffer;
+using cuda_memory::PinnedBuffer;
 
 struct PackedProximityJob {
   const double3 *first;
@@ -207,6 +153,7 @@ struct MergeCostBatchRuntime::Impl {
       check_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
                  "cudaStreamCreateWithFlags merge costs");
     }
+    DeviceBuffer::set_allocation_stream(stream);
   }
 };
 

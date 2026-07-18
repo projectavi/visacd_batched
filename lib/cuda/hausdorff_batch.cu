@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cfloat>
+#include <cuda_buffer.hpp>
 #include <cuda_runtime.h>
 #include <device_mesh.hpp>
 #include <hausdorff_batch.hpp>
@@ -175,63 +176,8 @@ __global__ void reduce_jobs_kernel(const double *query_distances,
     results[job_index] = partial[0];
 }
 
-class DeviceBuffer {
-public:
-  ~DeviceBuffer() {
-    if (data_)
-      cudaFree(data_);
-  }
-
-  DeviceBuffer(const DeviceBuffer &) = delete;
-  DeviceBuffer &operator=(const DeviceBuffer &) = delete;
-  DeviceBuffer() = default;
-
-  void ensure(size_t bytes, const char *operation) {
-    if (bytes <= capacity_)
-      return;
-    if (data_)
-      check_cuda(cudaFree(data_), "cudaFree Hausdorff device buffer");
-    data_ = nullptr;
-    capacity_ = 0;
-    check_cuda(cudaMalloc(&data_, bytes), operation);
-    capacity_ = bytes;
-  }
-
-  template <typename T> T *as() const { return static_cast<T *>(data_); }
-
-private:
-  void *data_ = nullptr;
-  size_t capacity_ = 0;
-};
-
-class PinnedBuffer {
-public:
-  ~PinnedBuffer() {
-    if (data_)
-      cudaFreeHost(data_);
-  }
-
-  PinnedBuffer(const PinnedBuffer &) = delete;
-  PinnedBuffer &operator=(const PinnedBuffer &) = delete;
-  PinnedBuffer() = default;
-
-  void ensure(size_t bytes, const char *operation) {
-    if (bytes <= capacity_)
-      return;
-    if (data_)
-      check_cuda(cudaFreeHost(data_), "cudaFreeHost Hausdorff buffer");
-    data_ = nullptr;
-    capacity_ = 0;
-    check_cuda(cudaMallocHost(&data_, bytes), operation);
-    capacity_ = bytes;
-  }
-
-  template <typename T> T *as() const { return static_cast<T *>(data_); }
-
-private:
-  void *data_ = nullptr;
-  size_t capacity_ = 0;
-};
+using cuda_memory::DeviceBuffer;
+using cuda_memory::PinnedBuffer;
 
 size_t checked_add(size_t first, size_t second, const char *message) {
   if (second > std::numeric_limits<size_t>::max() - first)
@@ -292,6 +238,7 @@ struct HausdorffRuntime::Impl {
       check_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
                  "cudaStreamCreateWithFlags Hausdorff");
     }
+    DeviceBuffer::set_allocation_stream(stream);
   }
 };
 

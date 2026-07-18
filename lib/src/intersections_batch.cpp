@@ -3,6 +3,7 @@
 #include <condition_variable>
 #include <core.hpp>
 #include <cstdlib>
+#include <cuda_buffer.hpp>
 #include <cuda_runtime.h>
 #include <deque>
 #include <dlfcn.h>
@@ -121,39 +122,7 @@ size_t configured_max_concurrency() {
   return static_cast<size_t>(parsed);
 }
 
-class DeviceBuffer {
-public:
-  DeviceBuffer() = default;
-  ~DeviceBuffer() {
-    if (data_)
-      cudaFree(data_);
-  }
-
-  DeviceBuffer(const DeviceBuffer &) = delete;
-  DeviceBuffer &operator=(const DeviceBuffer &) = delete;
-
-  void ensure(size_t bytes) {
-    if (bytes <= capacity_)
-      return;
-    if (data_) {
-      CUCHK(cudaFree(data_));
-      data_ = nullptr;
-      capacity_ = 0;
-    }
-    CUCHK(cudaMalloc(&data_, bytes));
-    capacity_ = bytes;
-  }
-
-  template <typename T> T *as() const { return static_cast<T *>(data_); }
-  CUdeviceptr device_ptr() const {
-    return reinterpret_cast<CUdeviceptr>(data_);
-  }
-  size_t capacity() const { return capacity_; }
-
-private:
-  void *data_ = nullptr;
-  size_t capacity_ = 0;
-};
+using cuda_memory::DeviceBuffer;
 
 struct OptixSlot {
   cudaStream_t stream = nullptr;
@@ -420,6 +389,8 @@ struct OptixJob {
     if (word_count == 0)
       return;
 
+    DeviceBuffer::set_allocation_stream(stream);
+
     slot.points.ensure(sizeof(float) * h_points.size());
     d_points = slot.points.as<float>();
     if (!h_new_mask.empty()) {
@@ -575,6 +546,7 @@ struct OptixJob {
   void allocate_compacted_segments() {
     if (accepted_count == 0)
       return;
+    DeviceBuffer::set_allocation_stream(stream);
     slot.compacted_segments.ensure(sizeof(unsigned int) * accepted_count);
     d_compacted_segments = slot.compacted_segments.as<unsigned int>();
   }

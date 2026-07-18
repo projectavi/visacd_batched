@@ -1,3 +1,4 @@
+#include <cuda_buffer.hpp>
 #include <cuda_runtime.h>
 #include <device_mesh.hpp>
 #include <limits>
@@ -44,30 +45,7 @@ size_t mesh_bytes(const Mesh &mesh) {
       "Device mesh bytes overflow");
 }
 
-template <typename T> class DeviceArray {
-public:
-  DeviceArray() = default;
-  ~DeviceArray() {
-    if (data_)
-      cudaFree(data_);
-  }
-
-  DeviceArray(const DeviceArray &) = delete;
-  DeviceArray &operator=(const DeviceArray &) = delete;
-
-  void allocate(size_t count, const char *operation) {
-    if (count == 0)
-      return;
-    check_cuda(cudaMalloc(&data_, checked_multiply(count, sizeof(T),
-                                                   "Device array overflow")),
-               operation);
-  }
-
-  T *get() const { return data_; }
-
-private:
-  T *data_ = nullptr;
-};
+using cuda_memory::DeviceBuffer;
 
 __global__ void convert_vertices_kernel(const double3 *input, float3 *output,
                                         size_t count) {
@@ -83,10 +61,10 @@ __global__ void convert_vertices_kernel(const double3 *input, float3 *output,
 } // namespace
 
 struct DeviceMesh::Impl {
-  DeviceArray<double3> vertices;
-  DeviceArray<float3> float_vertices;
-  DeviceArray<int3> triangles;
-  DeviceArray<uint2> edges;
+  DeviceBuffer vertices;
+  DeviceBuffer float_vertices;
+  DeviceBuffer triangles;
+  DeviceBuffer edges;
   size_t vertex_count = 0;
   size_t triangle_count = 0;
   size_t edge_count = 0;
@@ -116,6 +94,7 @@ struct DeviceMeshRuntime::Impl {
       check_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
                  "cudaStreamCreateWithFlags device mesh upload");
     }
+    DeviceBuffer::set_allocation_stream(stream);
   }
 };
 
@@ -162,22 +141,33 @@ DeviceMeshRuntime::try_upload(const Mesh &mesh, double memory_fraction) {
   device.vertex_count = mesh.vertices.size();
   device.triangle_count = mesh.triangles.size();
   device.edge_count = mesh.intersecting_edges.size();
-  device.vertices.allocate(device.vertex_count,
-                           "cudaMalloc device mesh vertices");
-  device.float_vertices.allocate(device.vertex_count,
-                                 "cudaMalloc device mesh float vertices");
-  device.triangles.allocate(device.triangle_count,
-                            "cudaMalloc device mesh triangles");
-  device.edges.allocate(device.edge_count, "cudaMalloc device mesh edges");
+  device.vertices.ensure(
+      checked_multiply(device.vertex_count, sizeof(double3),
+                       "Device mesh vertex allocation overflow"),
+      "allocate device mesh vertices");
+  device.float_vertices.ensure(
+      checked_multiply(device.vertex_count, sizeof(float3),
+                       "Device mesh float vertex allocation overflow"),
+      "allocate device mesh float vertices");
+  device.triangles.ensure(
+      checked_multiply(device.triangle_count, sizeof(int3),
+                       "Device mesh triangle allocation overflow"),
+      "allocate device mesh triangles");
+  if (device.edge_count) {
+    device.edges.ensure(
+        checked_multiply(device.edge_count, sizeof(uint2),
+                         "Device mesh edge allocation overflow"),
+        "allocate device mesh edges");
+  }
   check_cuda(cudaEventCreateWithFlags(&device.ready_event,
                                       cudaEventDisableTiming),
              "cudaEventCreate device mesh");
 
-  check_cuda(cudaMemcpyAsync(device.vertices.get(), mesh.vertices.data(),
+  check_cuda(cudaMemcpyAsync(device.vertices.as<double3>(), mesh.vertices.data(),
                              device.vertex_count * sizeof(double3),
                              cudaMemcpyHostToDevice, impl_->stream),
              "copy device mesh vertices");
-  check_cuda(cudaMemcpyAsync(device.triangles.get(), mesh.triangles.data(),
+  check_cuda(cudaMemcpyAsync(device.triangles.as<int3>(), mesh.triangles.data(),
                              device.triangle_count * sizeof(int3),
                              cudaMemcpyHostToDevice, impl_->stream),
              "copy device mesh triangles");
@@ -185,9 +175,10 @@ DeviceMeshRuntime::try_upload(const Mesh &mesh, double memory_fraction) {
     device.staging_edges.reserve(device.edge_count);
     for (const auto &edge : mesh.intersecting_edges)
       device.staging_edges.push_back(make_uint2(edge.first, edge.second));
-    check_cuda(cudaMemcpyAsync(device.edges.get(), device.staging_edges.data(),
-                               device.edge_count * sizeof(uint2),
-                               cudaMemcpyHostToDevice, impl_->stream),
+    check_cuda(cudaMemcpyAsync(
+                   device.edges.as<uint2>(), device.staging_edges.data(),
+                   device.edge_count * sizeof(uint2), cudaMemcpyHostToDevice,
+                   impl_->stream),
                "copy device mesh edges");
   }
 
@@ -195,7 +186,7 @@ DeviceMeshRuntime::try_upload(const Mesh &mesh, double memory_fraction) {
   const int blocks = static_cast<int>(
       (device.vertex_count + block_size - 1) / block_size);
   convert_vertices_kernel<<<blocks, block_size, 0, impl_->stream>>>(
-      device.vertices.get(), device.float_vertices.get(),
+      device.vertices.as<double3>(), device.float_vertices.as<float3>(),
       device.vertex_count);
   check_cuda(cudaGetLastError(), "launch device mesh vertex conversion");
   check_cuda(cudaEventRecord(device.ready_event, impl_->stream),
@@ -205,10 +196,10 @@ DeviceMeshRuntime::try_upload(const Mesh &mesh, double memory_fraction) {
 
 DeviceMeshView device_mesh_view(const DeviceMesh &mesh) {
   const DeviceMesh::Impl &device = *mesh.impl_;
-  return {reinterpret_cast<const double *>(device.vertices.get()),
-          reinterpret_cast<const float *>(device.float_vertices.get()),
-          reinterpret_cast<const int *>(device.triangles.get()),
-          reinterpret_cast<const unsigned int *>(device.edges.get()),
+  return {reinterpret_cast<const double *>(device.vertices.as<double3>()),
+          reinterpret_cast<const float *>(device.float_vertices.as<float3>()),
+          reinterpret_cast<const int *>(device.triangles.as<int3>()),
+          reinterpret_cast<const unsigned int *>(device.edges.as<uint2>()),
           device.vertex_count,
           device.triangle_count,
           device.edge_count,

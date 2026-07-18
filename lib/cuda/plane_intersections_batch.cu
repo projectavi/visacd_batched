@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cstring>
+#include <cuda_buffer.hpp>
 #include <cuda_runtime.h>
 #include <device_mesh.hpp>
 #include <limits>
@@ -75,66 +76,8 @@ __global__ void plane_score_packed_kernel(
     scores[plane_idx] = partial_scores[0];
 }
 
-class DeviceBuffer {
-public:
-  DeviceBuffer() = default;
-  ~DeviceBuffer() {
-    if (data_)
-      cudaFree(data_);
-  }
-
-  DeviceBuffer(const DeviceBuffer &) = delete;
-  DeviceBuffer &operator=(const DeviceBuffer &) = delete;
-
-  void ensure(size_t bytes, const char *operation) {
-    if (bytes <= capacity_)
-      return;
-    if (data_) {
-      check_cuda(cudaFree(data_), "cudaFree pooled device buffer");
-      data_ = nullptr;
-      capacity_ = 0;
-    }
-    check_cuda(cudaMalloc(&data_, bytes), operation);
-    capacity_ = bytes;
-  }
-
-  template <typename T> T *as() const { return static_cast<T *>(data_); }
-  size_t capacity() const { return capacity_; }
-
-private:
-  void *data_ = nullptr;
-  size_t capacity_ = 0;
-};
-
-class PinnedBuffer {
-public:
-  PinnedBuffer() = default;
-  ~PinnedBuffer() {
-    if (data_)
-      cudaFreeHost(data_);
-  }
-
-  PinnedBuffer(const PinnedBuffer &) = delete;
-  PinnedBuffer &operator=(const PinnedBuffer &) = delete;
-
-  void ensure(size_t bytes, const char *operation) {
-    if (bytes <= capacity_)
-      return;
-    if (data_) {
-      check_cuda(cudaFreeHost(data_), "cudaFreeHost pooled buffer");
-      data_ = nullptr;
-      capacity_ = 0;
-    }
-    check_cuda(cudaMallocHost(&data_, bytes), operation);
-    capacity_ = bytes;
-  }
-
-  template <typename T> T *as() const { return static_cast<T *>(data_); }
-
-private:
-  void *data_ = nullptr;
-  size_t capacity_ = 0;
-};
+using cuda_memory::DeviceBuffer;
+using cuda_memory::PinnedBuffer;
 
 size_t growth_bytes(const DeviceBuffer &buffer, size_t requested) {
   return requested > buffer.capacity() ? requested - buffer.capacity() : 0;
@@ -173,6 +116,7 @@ struct PlaneScoringRuntime::Impl {
       check_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
                  "cudaStreamCreateWithFlags plane scoring");
     }
+    DeviceBuffer::set_allocation_stream(stream);
   }
 
   size_t additional_device_bytes(size_t num_planes, size_t num_points,

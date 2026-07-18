@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <convex_hull_batch.hpp>
+#include <cuda_buffer.hpp>
 #include <cuda_runtime.h>
 #include <deque>
 #include <device_mesh.hpp>
@@ -35,56 +36,8 @@ size_t checked_multiply(size_t first, size_t second, const char *message) {
   return first * second;
 }
 
-class DeviceBuffer {
-public:
-  ~DeviceBuffer() {
-    if (data_)
-      cudaFree(data_);
-  }
-
-  void ensure(size_t bytes, const char *operation) {
-    if (bytes <= capacity_)
-      return;
-    if (data_)
-      check_cuda(cudaFree(data_), "cudaFree hull buffer");
-    data_ = nullptr;
-    capacity_ = 0;
-    check_cuda(cudaMalloc(&data_, bytes), operation);
-    capacity_ = bytes;
-  }
-
-  template <typename T> T *as() const { return static_cast<T *>(data_); }
-  size_t capacity() const { return capacity_; }
-
-private:
-  void *data_ = nullptr;
-  size_t capacity_ = 0;
-};
-
-class PinnedBuffer {
-public:
-  ~PinnedBuffer() {
-    if (data_)
-      cudaFreeHost(data_);
-  }
-
-  void ensure(size_t bytes, const char *operation) {
-    if (bytes <= capacity_)
-      return;
-    if (data_)
-      check_cuda(cudaFreeHost(data_), "cudaFreeHost hull buffer");
-    data_ = nullptr;
-    capacity_ = 0;
-    check_cuda(cudaMallocHost(&data_, bytes), operation);
-    capacity_ = bytes;
-  }
-
-  template <typename T> T *as() const { return static_cast<T *>(data_); }
-
-private:
-  void *data_ = nullptr;
-  size_t capacity_ = 0;
-};
+using cuda_memory::DeviceBuffer;
+using cuda_memory::PinnedBuffer;
 
 struct PackedAssignmentJob {
   const double3 *vertices;
@@ -540,6 +493,7 @@ struct ConvexHullBatchRuntime::Impl {
       check_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
                  "cudaStreamCreateWithFlags hull");
     }
+    DeviceBuffer::set_allocation_stream(stream);
   }
 
   size_t growth(size_t vertex_count, size_t face_count,
