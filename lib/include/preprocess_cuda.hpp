@@ -2,6 +2,7 @@
 
 #include <core.hpp>
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -28,6 +29,7 @@ struct SurfaceVoxelizationInput {
   const Mesh *mesh = nullptr;
   double scale = 1.0;
   SurfaceVoxelizationResult *result = nullptr;
+  std::function<void()> completion;
 };
 
 class ManifoldCudaRuntime {

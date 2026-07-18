@@ -2,6 +2,8 @@
 #include <cuda_runtime.h>
 #include <preprocess_cuda.hpp>
 
+#include <cub/cub.cuh>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -33,6 +35,14 @@ struct PackedSeedVoxel {
   int3 coordinate;
   int global_triangle_index;
   int mesh_index;
+};
+
+struct CompactSurfaceRecord {
+  double squared_distance;
+  int x;
+  int y;
+  int z;
+  int triangle_index;
 };
 
 struct PreparedSurface {
@@ -138,6 +148,59 @@ __device__ size_t dense_offset(int x, int y, int z,
              grid.dimensions.z +
          static_cast<size_t>(z - grid.minimum.z);
 }
+
+__global__ void build_cell_metadata_kernel(
+    const unsigned long long *distance_bits, const PackedGrid *grids,
+    int grid_count, int blocks_per_grid, int *cell_mesh_indices,
+    unsigned int *active_counts) {
+  const int mesh_index = static_cast<int>(blockIdx.x) / blocks_per_grid;
+  if (mesh_index >= grid_count)
+    return;
+  const int mesh_block = static_cast<int>(blockIdx.x) % blocks_per_grid;
+  const PackedGrid grid = grids[mesh_index];
+  unsigned int active = 0;
+  for (size_t local =
+           static_cast<size_t>(mesh_block) * blockDim.x + threadIdx.x;
+       local < grid.cells;
+       local += static_cast<size_t>(blocks_per_grid) * blockDim.x) {
+    const size_t offset = grid.cell_offset + local;
+    cell_mesh_indices[offset] = mesh_index;
+    if (distance_bits[offset] != ~0ULL)
+      ++active;
+  }
+  if (active != 0)
+    atomicAdd(active_counts + mesh_index, active);
+}
+
+struct BuildCompactSurfaceRecord {
+  const unsigned long long *distance_bits;
+  const int *triangle_indices;
+  const PackedGrid *grids;
+  const int *cell_mesh_indices;
+
+  __device__ CompactSurfaceRecord operator()(int offset) const {
+    const int mesh_index = cell_mesh_indices[offset];
+    const PackedGrid grid = grids[mesh_index];
+    size_t local = static_cast<size_t>(offset) - grid.cell_offset;
+    const int z = static_cast<int>(local % grid.dimensions.z);
+    local /= grid.dimensions.z;
+    const int y = static_cast<int>(local % grid.dimensions.y);
+    const int x = static_cast<int>(local / grid.dimensions.y);
+    const unsigned long long bits = distance_bits[offset];
+    const bool active = bits != ~0ULL;
+    return {active ? __longlong_as_double(static_cast<long long>(bits))
+                   : 0.0,
+            grid.minimum.x + x, grid.minimum.y + y,
+            grid.minimum.z + z,
+            active ? triangle_indices[offset] : -1};
+  }
+};
+
+struct IsActiveSurfaceRecord {
+  __device__ bool operator()(const CompactSurfaceRecord &record) const {
+    return record.triangle_index >= 0;
+  }
+};
 
 __global__ void find_seed_voxels_kernel(
     const float3 *vertices, const int3 *triangles,
@@ -441,6 +504,7 @@ bool append_counts(const PreparedSurface &surface,
       next.triangles >
           static_cast<size_t>(std::numeric_limits<int>::max()) ||
       !checked_add(current.cells, surface.grid.cells, next.cells) ||
+      next.cells > static_cast<size_t>(std::numeric_limits<int>::max()) ||
       !checked_add(current.candidates, surface.candidate_voxels,
                    next.candidates) ||
       next.candidates > std::numeric_limits<unsigned int>::max()) {
@@ -467,6 +531,11 @@ size_t packed_bytes(const PackedCounts &counts) {
   include(counts.meshes, sizeof(PackedGrid));
   include(counts.cells, sizeof(unsigned long long));
   include(counts.cells, sizeof(int));
+  include(counts.cells, sizeof(CompactSurfaceRecord));
+  include(counts.cells, sizeof(int));
+  include(counts.cells, sizeof(CompactSurfaceRecord));
+  include(counts.meshes, sizeof(unsigned int));
+  include(1, sizeof(int));
   include(counts.candidates, sizeof(PackedSeedVoxel));
   include(1, sizeof(unsigned int));
   return total;
@@ -486,12 +555,18 @@ struct ManifoldCudaBatchRuntime::Impl {
   DeviceBuffer triangle_indices;
   DeviceBuffer seeds;
   DeviceBuffer seed_count;
+  DeviceBuffer compact_records;
+  DeviceBuffer compact_count;
+  DeviceBuffer active_counts;
+  DeviceBuffer cell_mesh_indices;
+  DeviceBuffer select_temp;
   PinnedBuffer host_vertices;
   PinnedBuffer host_triangles;
   PinnedBuffer host_triangle_mesh_indices;
   PinnedBuffer host_grids;
-  PinnedBuffer host_distance_bits;
-  PinnedBuffer host_triangle_indices;
+  PinnedBuffer host_compact_records;
+  PinnedBuffer host_compact_count;
+  PinnedBuffer host_active_counts;
 
   ~Impl() {
     if (stream)
@@ -552,6 +627,17 @@ void run_wave(const std::vector<SurfaceVoxelizationInput> &inputs,
                        "allocate batched manifold seeds");
   runtime.seed_count.ensure(sizeof(unsigned int),
                             "allocate batched manifold seed count");
+  runtime.compact_records.ensure(
+      counts.cells * sizeof(CompactSurfaceRecord),
+      "allocate compact batched manifold records");
+  runtime.compact_count.ensure(sizeof(int),
+                               "allocate compact manifold record count");
+  runtime.active_counts.ensure(
+      counts.meshes * sizeof(unsigned int),
+      "allocate batched manifold active counts");
+  runtime.cell_mesh_indices.ensure(
+      counts.cells * sizeof(int),
+      "allocate batched manifold cell owners");
   runtime.host_vertices.ensure(counts.vertices * sizeof(float3),
                                "allocate host batched manifold vertices");
   runtime.host_triangles.ensure(
@@ -562,12 +648,11 @@ void run_wave(const std::vector<SurfaceVoxelizationInput> &inputs,
       "allocate host batched manifold triangle owners");
   runtime.host_grids.ensure(counts.meshes * sizeof(PackedGrid),
                             "allocate host batched manifold grids");
-  runtime.host_distance_bits.ensure(
-      counts.cells * sizeof(unsigned long long),
-      "allocate host batched manifold distances");
-  runtime.host_triangle_indices.ensure(
-      counts.cells * sizeof(int),
-      "allocate host batched manifold triangle indices");
+  runtime.host_compact_count.ensure(
+      sizeof(int), "allocate host compact manifold record count");
+  runtime.host_active_counts.ensure(
+      counts.meshes * sizeof(unsigned int),
+      "allocate host batched manifold active counts");
 
   float3 *host_vertices = runtime.host_vertices.as<float3>();
   int3 *host_triangles = runtime.host_triangles.as<int3>();
@@ -640,6 +725,15 @@ void run_wave(const std::vector<SurfaceVoxelizationInput> &inputs,
       cudaMemsetAsync(runtime.seed_count.as<unsigned int>(), 0,
                       sizeof(unsigned int), runtime.stream),
       "initialize batched manifold seed count");
+  cuda_memory::check(
+      cudaMemsetAsync(runtime.active_counts.as<unsigned int>(), 0,
+                      counts.meshes * sizeof(unsigned int),
+                      runtime.stream),
+      "initialize batched manifold active counts");
+  cuda_memory::check(
+      cudaMemsetAsync(runtime.compact_count.as<int>(), 0, sizeof(int),
+                      runtime.stream),
+      "initialize compact manifold record count");
 
   constexpr int threads = 128;
   find_seed_voxels_kernel<<<counts.triangles, threads, 0, runtime.stream>>>(
@@ -693,18 +787,89 @@ void run_wave(const std::vector<SurfaceVoxelizationInput> &inputs,
   cuda_memory::check(cudaGetLastError(),
                      "launch batched manifold triangle voxelization");
 
+  constexpr int cell_blocks_per_grid = 4;
+  const int cell_blocks =
+      static_cast<int>(counts.meshes) * cell_blocks_per_grid;
+  build_cell_metadata_kernel<<<cell_blocks, threads, 0, runtime.stream>>>(
+      runtime.distance_bits.as<unsigned long long>(),
+      runtime.grids.as<PackedGrid>(), static_cast<int>(counts.meshes),
+      cell_blocks_per_grid, runtime.cell_mesh_indices.as<int>(),
+      runtime.active_counts.as<unsigned int>());
+  cuda_memory::check(cudaGetLastError(),
+                     "count active batched manifold voxels");
+
+  using CellIterator = cub::CountingInputIterator<int>;
+  using RecordIterator = cub::TransformInputIterator<
+      CompactSurfaceRecord, BuildCompactSurfaceRecord, CellIterator>;
+  BuildCompactSurfaceRecord record_builder{
+      runtime.distance_bits.as<unsigned long long>(),
+      runtime.triangle_indices.as<int>(),
+      runtime.grids.as<PackedGrid>(),
+      runtime.cell_mesh_indices.as<int>()};
+  RecordIterator records(CellIterator(0), record_builder);
+  size_t select_temp_bytes = 0;
   cuda_memory::check(
-      cudaMemcpyAsync(runtime.host_distance_bits.as<unsigned long long>(),
-                      runtime.distance_bits.as<unsigned long long>(),
-                      counts.cells * sizeof(unsigned long long),
+      cub::DeviceSelect::If(
+          nullptr, select_temp_bytes, records,
+          runtime.compact_records.as<CompactSurfaceRecord>(),
+          runtime.compact_count.as<int>(), static_cast<int>(counts.cells),
+          IsActiveSurfaceRecord{}, runtime.stream),
+      "query batched manifold compaction storage");
+  runtime.select_temp.ensure(select_temp_bytes,
+                             "allocate batched manifold compaction storage");
+  cuda_memory::check(
+      cub::DeviceSelect::If(
+          runtime.select_temp.as<void>(), select_temp_bytes, records,
+          runtime.compact_records.as<CompactSurfaceRecord>(),
+          runtime.compact_count.as<int>(), static_cast<int>(counts.cells),
+          IsActiveSurfaceRecord{}, runtime.stream),
+      "compact active batched manifold voxels");
+  cuda_memory::check(
+      cudaMemcpyAsync(runtime.host_compact_count.as<int>(),
+                      runtime.compact_count.as<int>(), sizeof(int),
                       cudaMemcpyDeviceToHost, runtime.stream),
-      "copy batched manifold distances");
+      "copy compact batched manifold record count");
   cuda_memory::check(
-      cudaMemcpyAsync(runtime.host_triangle_indices.as<int>(),
-                      runtime.triangle_indices.as<int>(),
-                      counts.cells * sizeof(int), cudaMemcpyDeviceToHost,
-                      runtime.stream),
-      "copy batched manifold triangle indices");
+      cudaMemcpyAsync(runtime.host_active_counts.as<unsigned int>(),
+                      runtime.active_counts.as<unsigned int>(),
+                      counts.meshes * sizeof(unsigned int),
+                      cudaMemcpyDeviceToHost, runtime.stream),
+      "copy batched manifold active counts");
+  cuda_memory::check(cudaStreamSynchronize(runtime.stream),
+                     "wait for batched manifold compaction counts");
+
+  const int compact_count = *runtime.host_compact_count.as<int>();
+  if (compact_count < 0 ||
+      static_cast<size_t>(compact_count) > counts.cells) {
+    throw std::runtime_error(
+        "batched manifold compaction returned an invalid count");
+  }
+  size_t counted_records = 0;
+  const unsigned int *host_active_counts =
+      runtime.host_active_counts.as<unsigned int>();
+  for (size_t relative = 0; relative < counts.meshes; ++relative) {
+    if (!checked_add(counted_records, host_active_counts[relative],
+                     counted_records)) {
+      throw std::overflow_error(
+          "batched manifold active record count overflows");
+    }
+  }
+  if (counted_records != static_cast<size_t>(compact_count)) {
+    throw std::runtime_error(
+        "batched manifold active counts are out of sync");
+  }
+  runtime.host_compact_records.ensure(
+      counted_records * sizeof(CompactSurfaceRecord),
+      "allocate host compact batched manifold records");
+  if (counted_records != 0) {
+    cuda_memory::check(
+        cudaMemcpyAsync(
+            runtime.host_compact_records.as<CompactSurfaceRecord>(),
+            runtime.compact_records.as<CompactSurfaceRecord>(),
+            counted_records * sizeof(CompactSurfaceRecord),
+            cudaMemcpyDeviceToHost, runtime.stream),
+        "copy compact batched manifold records");
+  }
   cuda_memory::check(cudaEventRecord(runtime.finished, runtime.stream),
                      "record batched manifold finish");
   cuda_memory::check(cudaEventSynchronize(runtime.finished),
@@ -714,40 +879,35 @@ void run_wave(const std::vector<SurfaceVoxelizationInput> &inputs,
       cudaEventElapsedTime(&milliseconds, runtime.started, runtime.finished),
       "time batched manifold preprocessing");
 
-  const unsigned long long *host_distances =
-      runtime.host_distance_bits.as<unsigned long long>();
-  const int *host_indices = runtime.host_triangle_indices.as<int>();
+  const CompactSurfaceRecord *host_records =
+      runtime.host_compact_records.as<CompactSurfaceRecord>();
+  size_t record_offset = 0;
   for (size_t relative = 0; relative < end - begin; ++relative) {
     const PreparedSurface &surface = prepared[begin + relative];
-    const PackedGrid &grid = host_grids[relative];
     SurfaceVoxelizationResult &result =
         *inputs[surface.input_index].result;
     result.records.clear();
-    result.records.reserve(grid.cells / 8);
-    for (int x = 0; x < grid.dimensions.x; ++x) {
-      for (int y = 0; y < grid.dimensions.y; ++y) {
-        for (int z = 0; z < grid.dimensions.z; ++z) {
-          const size_t offset =
-              grid.cell_offset +
-              (static_cast<size_t>(x) * grid.dimensions.y + y) *
-                  grid.dimensions.z +
-              z;
-          if (host_distances[offset] ==
-              std::numeric_limits<unsigned long long>::max()) {
-            continue;
-          }
-          double distance = 0.0;
-          const unsigned long long bits = host_distances[offset];
-          std::memcpy(&distance, &bits, sizeof(distance));
-          result.records.push_back(
-              {grid.minimum.x + x, grid.minimum.y + y,
-               grid.minimum.z + z, distance, host_indices[offset]});
-        }
-      }
+    const size_t active_count = host_active_counts[relative];
+    result.records.reserve(active_count);
+    for (size_t index = 0; index < active_count; ++index) {
+      const CompactSurfaceRecord &record =
+          host_records[record_offset + index];
+      result.records.push_back(
+          {record.x, record.y, record.z, record.squared_distance,
+           record.triangle_index});
     }
+    record_offset += active_count;
     result.supported = true;
     result.fallback_reason.clear();
     result.elapsed_ms = milliseconds;
+  }
+  if (record_offset != counted_records)
+    throw std::logic_error("batched manifold record split is out of sync");
+  for (size_t index = begin; index < end; ++index) {
+    const SurfaceVoxelizationInput &input =
+        inputs[prepared[index].input_index];
+    if (input.completion)
+      input.completion();
   }
 }
 
@@ -772,8 +932,11 @@ void voxelize_surfaces_batch(
     }
     *input.result = SurfaceVoxelizationResult{};
     PreparedSurface surface;
-    if (prepare_surface(input, index, surface))
+    if (prepare_surface(input, index, surface)) {
       prepared.push_back(surface);
+    } else if (input.completion) {
+      input.completion();
+    }
   }
   if (prepared.empty())
     return;
@@ -809,6 +972,10 @@ void voxelize_surfaces_batch(
           *inputs[prepared[begin].input_index].result;
       set_fallback(result,
                    "CUDA preprocessing memory budget exceeded");
+      const SurfaceVoxelizationInput &input =
+          inputs[prepared[begin].input_index];
+      if (input.completion)
+        input.completion();
       ++begin;
       continue;
     }
