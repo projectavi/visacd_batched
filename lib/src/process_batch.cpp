@@ -234,11 +234,13 @@ struct FinalizeWork {
 struct HullWork {
   size_t state_index;
   vector<size_t> part_indices;
+  size_t estimated_size = 0;
 };
 
 struct FlatSurfaceWork {
   size_t state_index;
   vector<Surface> surfaces;
+  size_t estimated_size = 0;
 };
 
 struct MergeWork {
@@ -276,6 +278,8 @@ constexpr size_t kGpuWorkKindCount =
 
 struct GpuWork {
   GpuWorkKind kind;
+  size_t lane = 0;
+  bool shared_memory_budget = false;
   vector<shared_ptr<IntersectionWork>> intersections;
   vector<shared_ptr<SplitWork>> planes;
   vector<shared_ptr<HausdorffWork>> hausdorff;
@@ -284,6 +288,127 @@ struct GpuWork {
   vector<shared_ptr<FlatSurfaceWork>> flat_surfaces;
   vector<shared_ptr<MergeWork>> merges;
 };
+
+size_t saturating_add(size_t first, size_t second) {
+  return second > numeric_limits<size_t>::max() - first
+             ? numeric_limits<size_t>::max()
+             : first + second;
+}
+
+size_t saturating_multiply(size_t value, size_t multiplier) {
+  return value != 0 &&
+                 multiplier > numeric_limits<size_t>::max() / value
+             ? numeric_limits<size_t>::max()
+             : value * multiplier;
+}
+
+size_t mesh_work_size(const Mesh &mesh) {
+  size_t size = mesh.vertices.size();
+  size = saturating_add(
+      size, saturating_multiply(mesh.triangles.size(), size_t{3}));
+  return saturating_add(
+      size, saturating_multiply(mesh.intersecting_edges.size(), size_t{2}));
+}
+
+size_t work_size_bucket(size_t size) {
+  size_t bucket = 0;
+  while (size > 1) {
+    size >>= 1;
+    ++bucket;
+  }
+  return bucket;
+}
+
+bool work_bucketing_enabled() {
+  const char *disabled = getenv("VISACD_DISABLE_WORK_BUCKETING");
+  return !disabled || !*disabled || string(disabled) == "0";
+}
+
+bool double_buffering_enabled() {
+  const char *disabled = getenv("VISACD_DISABLE_DOUBLE_BUFFERING");
+  return !disabled || !*disabled || string(disabled) == "0";
+}
+
+template <typename Work, typename SizeFunction>
+void bucket_work(vector<shared_ptr<Work>> &work,
+                 SizeFunction size_function) {
+  if (work.size() < 2 || !work_bucketing_enabled())
+    return;
+  stable_sort(work.begin(), work.end(), [&](const auto &first,
+                                            const auto &second) {
+    return work_size_bucket(size_function(*first)) >
+           work_size_bucket(size_function(*second));
+  });
+}
+
+template <typename Work, typename SizeFunction>
+bool queue_spans_work_size_buckets(
+    const deque<shared_ptr<Work>> &work, SizeFunction size_function) {
+  if (work.size() < 2)
+    return false;
+  const size_t first_bucket = work_size_bucket(size_function(*work.front()));
+  for (size_t index = 1; index < work.size(); ++index) {
+    if (work_size_bucket(size_function(*work[index])) != first_bucket)
+      return true;
+  }
+  return false;
+}
+
+template <typename Work>
+void split_work_wave(vector<shared_ptr<Work>> &work,
+                     deque<shared_ptr<Work>> &queue, bool split) {
+  if (!split || work.size() < 2)
+    return;
+  const size_t wave_size = (work.size() + 1) / 2;
+  for (size_t index = wave_size; index < work.size(); ++index)
+    queue.push_back(move(work[index]));
+  work.resize(wave_size);
+}
+
+size_t intersection_work_size(const IntersectionWork &work) {
+  size_t size = 0;
+  for (const auto &request : work.requests) {
+    if (request.first)
+      size = saturating_add(size, mesh_work_size(*request.first));
+    if (request.second)
+      size = saturating_add(size, mesh_work_size(*request.second));
+  }
+  return size;
+}
+
+size_t split_work_size(const SplitWork &work) {
+  return saturating_add(mesh_work_size(work.part),
+                        work.sampled_edges.size());
+}
+
+size_t hausdorff_work_size(const HausdorffWork &work) {
+  size_t size = 0;
+  for (const PreparedHausdorffJob &job : work.jobs) {
+    for (const PreparedHausdorffDirection &direction : job.directions) {
+      size = saturating_add(size, direction.queries.size());
+      size = saturating_add(size, direction.candidate_triangles.size());
+      if (direction.target && !direction.target_device)
+        size = saturating_add(size, mesh_work_size(*direction.target));
+    }
+  }
+  return size;
+}
+
+size_t component_work_size(const ComponentWork &work) {
+  size_t size = 0;
+  for (const Mesh &part : work.parts)
+    size = saturating_add(size, mesh_work_size(part));
+  return size;
+}
+
+size_t merge_work_size(const MergeWork &work) {
+  size_t size = 0;
+  if (!work.finalize_work)
+    return size;
+  for (const Mesh &hull : work.finalize_work->hulls)
+    size = saturating_add(size, mesh_work_size(hull));
+  return size;
+}
 
 class PipelineCoordinator {
 public:
@@ -302,12 +427,12 @@ public:
     submit_task(gpu_executor_, move(task), false);
   }
 
-  void complete_gpu_batch(GpuWorkKind kind) {
+  void complete_gpu_batch(GpuWorkKind kind, size_t lane) {
     lock_guard<mutex> lock(mutex_);
     const size_t index = static_cast<size_t>(kind);
-    if (index >= gpu_busy_.size())
+    if (index >= gpu_busy_.size() || lane >= gpu_busy_[index].size())
       return;
-    gpu_busy_[index] = false;
+    gpu_busy_[index][lane] = false;
     condition_.notify_one();
   }
 
@@ -389,13 +514,13 @@ public:
     while (true) {
       condition_.wait(lock, [this]() {
         return error_ || completed() ||
-               (!gpu_busy_[0] && !intersection_queue_.empty()) ||
-               (!gpu_busy_[1] && !plane_queue_.empty()) ||
-               (!gpu_busy_[2] && !hausdorff_queue_.empty()) ||
-               (!gpu_busy_[3] && !component_queue_.empty()) ||
-               (!gpu_busy_[4] && !hull_queue_.empty()) ||
-               (!gpu_busy_[5] && !flat_surface_queue_.empty()) ||
-               (!gpu_busy_[6] && !merge_queue_.empty());
+               (gpu_lane_available(0) && !intersection_queue_.empty()) ||
+               (gpu_lane_available(1) && !plane_queue_.empty()) ||
+               (gpu_lane_available(2) && !hausdorff_queue_.empty()) ||
+               (gpu_lane_available(3) && !component_queue_.empty()) ||
+               (gpu_lane_available(4) && !hull_queue_.empty()) ||
+               (gpu_lane_available(5) && !flat_surface_queue_.empty()) ||
+               (gpu_lane_available(6) && !merge_queue_.empty());
       });
 
       if (error_) {
@@ -419,13 +544,13 @@ public:
       }
 
       const array<bool, kGpuWorkKindCount> available = {
-          !gpu_busy_[0] && !intersection_queue_.empty(),
-          !gpu_busy_[1] && !plane_queue_.empty(),
-          !gpu_busy_[2] && !hausdorff_queue_.empty(),
-          !gpu_busy_[3] && !component_queue_.empty(),
-          !gpu_busy_[4] && !hull_queue_.empty(),
-          !gpu_busy_[5] && !flat_surface_queue_.empty(),
-          !gpu_busy_[6] && !merge_queue_.empty()};
+          gpu_lane_available(0) && !intersection_queue_.empty(),
+          gpu_lane_available(1) && !plane_queue_.empty(),
+          gpu_lane_available(2) && !hausdorff_queue_.empty(),
+          gpu_lane_available(3) && !component_queue_.empty(),
+          gpu_lane_available(4) && !hull_queue_.empty(),
+          gpu_lane_available(5) && !flat_surface_queue_.empty(),
+          gpu_lane_available(6) && !merge_queue_.empty()};
       size_t selected = 0;
       for (; selected < available.size(); ++selected) {
         const size_t candidate =
@@ -436,85 +561,133 @@ public:
         }
       }
       next_gpu_kind_ = (selected + 1) % available.size();
-      gpu_busy_[selected] = true;
+      const size_t free_lanes = free_gpu_lanes(selected);
+      const bool joining_split_wave = gpu_split_pending_[selected];
+      const size_t lane = first_free_gpu_lane(selected);
+      gpu_busy_[selected][lane] = true;
+      const bool split_wave =
+          !joining_split_wave && free_lanes > 1 &&
+          double_buffer_worthwhile(selected);
+      gpu_split_pending_[selected] = split_wave;
+      const bool shared_memory_budget =
+          gpu_lane_limit(selected) > 1 &&
+          (split_wave || joining_split_wave);
 
       if (selected == 0) {
         GpuWork result{GpuWorkKind::intersections};
+        result.lane = lane;
+        result.shared_memory_budget = shared_memory_budget;
         result.intersections.reserve(intersection_queue_.size());
         while (!intersection_queue_.empty()) {
           shared_ptr<IntersectionWork> work =
               move(intersection_queue_.front());
           intersection_queue_.pop_front();
-          intersection_request_count_ -= work->requests.size();
           result.intersections.push_back(move(work));
         }
+        bucket_work(result.intersections, intersection_work_size);
+        split_work_wave(result.intersections, intersection_queue_,
+                        split_wave);
+        for (const auto &work : result.intersections)
+          intersection_request_count_ -= work->requests.size();
         return result;
       }
 
       if (selected == 1) {
         GpuWork result{GpuWorkKind::planes};
+        result.lane = lane;
+        result.shared_memory_budget = shared_memory_budget;
         result.planes.reserve(plane_queue_.size());
         while (!plane_queue_.empty()) {
           result.planes.push_back(move(plane_queue_.front()));
           plane_queue_.pop_front();
         }
+        bucket_work(result.planes, split_work_size);
+        split_work_wave(result.planes, plane_queue_, split_wave);
         return result;
       }
 
       if (selected == 2) {
         GpuWork result{GpuWorkKind::hausdorff};
+        result.lane = lane;
+        result.shared_memory_budget = shared_memory_budget;
         result.hausdorff.reserve(hausdorff_queue_.size());
         while (!hausdorff_queue_.empty()) {
           shared_ptr<HausdorffWork> work = move(hausdorff_queue_.front());
           hausdorff_queue_.pop_front();
-          hausdorff_request_count_ -= work->jobs.size();
           result.hausdorff.push_back(move(work));
         }
+        bucket_work(result.hausdorff, hausdorff_work_size);
+        split_work_wave(result.hausdorff, hausdorff_queue_, split_wave);
+        for (const auto &work : result.hausdorff)
+          hausdorff_request_count_ -= work->jobs.size();
         return result;
       }
 
       if (selected == 3) {
         GpuWork result{GpuWorkKind::components};
+        result.lane = lane;
+        result.shared_memory_budget = shared_memory_budget;
         result.components.reserve(component_queue_.size());
         while (!component_queue_.empty()) {
           shared_ptr<ComponentWork> work = move(component_queue_.front());
           component_queue_.pop_front();
-          component_request_count_ -= work->parts.size();
           result.components.push_back(move(work));
         }
+        bucket_work(result.components, component_work_size);
+        split_work_wave(result.components, component_queue_, split_wave);
+        for (const auto &work : result.components)
+          component_request_count_ -= work->parts.size();
         return result;
       }
 
       if (selected == 4) {
         GpuWork result{GpuWorkKind::hulls};
+        result.lane = lane;
+        result.shared_memory_budget = shared_memory_budget;
         result.hulls.reserve(hull_queue_.size());
         while (!hull_queue_.empty()) {
           shared_ptr<HullWork> work = move(hull_queue_.front());
           hull_queue_.pop_front();
-          hull_request_count_ -= work->part_indices.size();
           result.hulls.push_back(move(work));
         }
+        bucket_work(result.hulls, [](const HullWork &work) {
+          return work.estimated_size;
+        });
+        split_work_wave(result.hulls, hull_queue_, split_wave);
+        for (const auto &work : result.hulls)
+          hull_request_count_ -= work->part_indices.size();
         return result;
       }
 
       if (selected == 5) {
         GpuWork result{GpuWorkKind::flat_surfaces};
+        result.lane = lane;
+        result.shared_memory_budget = shared_memory_budget;
         result.flat_surfaces.reserve(flat_surface_queue_.size());
         while (!flat_surface_queue_.empty()) {
           result.flat_surfaces.push_back(move(flat_surface_queue_.front()));
           flat_surface_queue_.pop_front();
-          --flat_surface_request_count_;
         }
+        bucket_work(result.flat_surfaces, [](const FlatSurfaceWork &work) {
+          return work.estimated_size;
+        });
+        split_work_wave(result.flat_surfaces, flat_surface_queue_,
+                        split_wave);
+        flat_surface_request_count_ -= result.flat_surfaces.size();
         return result;
       }
 
       GpuWork result{GpuWorkKind::merges};
+      result.lane = lane;
+      result.shared_memory_budget = shared_memory_budget;
       result.merges.reserve(merge_queue_.size());
       while (!merge_queue_.empty()) {
         result.merges.push_back(move(merge_queue_.front()));
         merge_queue_.pop_front();
-        --merge_request_count_;
       }
+      bucket_work(result.merges, merge_work_size);
+      split_work_wave(result.merges, merge_queue_, split_wave);
+      merge_request_count_ -= result.merges.size();
       return result;
     }
   }
@@ -559,20 +732,83 @@ private:
     return completed_states_ == total_states_ && active_tasks_ == 0;
   }
 
+  size_t gpu_lane_limit(size_t kind) const {
+    return kind == static_cast<size_t>(GpuWorkKind::intersections) ||
+                   !double_buffering_enabled()
+               ? 1
+               : 2;
+  }
+
+  bool double_buffer_worthwhile(size_t kind) const {
+    if (!double_buffering_enabled())
+      return false;
+    switch (static_cast<GpuWorkKind>(kind)) {
+    case GpuWorkKind::intersections:
+      return queue_spans_work_size_buckets(
+          intersection_queue_, intersection_work_size);
+    case GpuWorkKind::planes:
+      return queue_spans_work_size_buckets(plane_queue_, split_work_size);
+    case GpuWorkKind::hausdorff:
+      return queue_spans_work_size_buckets(
+          hausdorff_queue_, hausdorff_work_size);
+    case GpuWorkKind::components:
+      return queue_spans_work_size_buckets(
+          component_queue_, component_work_size);
+    case GpuWorkKind::hulls:
+      return queue_spans_work_size_buckets(
+          hull_queue_, [](const HullWork &work) {
+            return work.estimated_size;
+          });
+    case GpuWorkKind::flat_surfaces:
+      return queue_spans_work_size_buckets(
+          flat_surface_queue_, [](const FlatSurfaceWork &work) {
+            return work.estimated_size;
+          });
+    case GpuWorkKind::merges:
+      return queue_spans_work_size_buckets(merge_queue_, merge_work_size);
+    case GpuWorkKind::complete:
+      return false;
+    }
+    return false;
+  }
+
+  size_t free_gpu_lanes(size_t kind) const {
+    size_t free = 0;
+    for (size_t lane = 0; lane < gpu_lane_limit(kind); ++lane) {
+      if (!gpu_busy_[kind][lane])
+        ++free;
+    }
+    return free;
+  }
+
+  bool gpu_lane_available(size_t kind) const {
+    const size_t free_lanes = free_gpu_lanes(kind);
+    return free_lanes == gpu_lane_limit(kind) ||
+           (free_lanes != 0 && gpu_split_pending_[kind]);
+  }
+
+  size_t first_free_gpu_lane(size_t kind) const {
+    for (size_t lane = 0; lane < gpu_lane_limit(kind); ++lane) {
+      if (!gpu_busy_[kind][lane])
+        return lane;
+    }
+    throw logic_error("No free GPU work lane");
+  }
+
   bool gpu_batch_ready() const {
-    return (!gpu_busy_[0] &&
+    return (gpu_lane_available(0) &&
             intersection_request_count_ >= gpu_batch_threshold_) ||
-           (!gpu_busy_[1] &&
+           (gpu_lane_available(1) &&
             plane_queue_.size() >= gpu_batch_threshold_) ||
-           (!gpu_busy_[2] &&
+           (gpu_lane_available(2) &&
             hausdorff_request_count_ >= gpu_batch_threshold_) ||
-           (!gpu_busy_[3] &&
+           (gpu_lane_available(3) &&
             component_request_count_ >= gpu_batch_threshold_) ||
-           (!gpu_busy_[4] &&
+           (gpu_lane_available(4) &&
             hull_request_count_ >= gpu_batch_threshold_) ||
-           (!gpu_busy_[5] &&
+           (gpu_lane_available(5) &&
             flat_surface_request_count_ >= gpu_batch_threshold_) ||
-           (!gpu_busy_[6] &&
+           (gpu_lane_available(6) &&
             merge_request_count_ >= gpu_batch_threshold_);
   }
 
@@ -592,7 +828,9 @@ private:
     hull_request_count_ = 0;
     flat_surface_request_count_ = 0;
     merge_request_count_ = 0;
-    gpu_busy_.fill(false);
+    for (auto &lanes : gpu_busy_)
+      lanes.fill(false);
+    gpu_split_pending_.fill(false);
     condition_.notify_all();
   }
 
@@ -624,7 +862,8 @@ private:
   size_t active_tasks_ = 0;
   size_t completed_states_ = 0;
   size_t next_gpu_kind_ = 0;
-  array<bool, kGpuWorkKindCount> gpu_busy_{};
+  array<array<bool, 2>, kGpuWorkKindCount> gpu_busy_{};
+  array<bool, kGpuWorkKindCount> gpu_split_pending_{};
   mutex mutex_;
   condition_variable condition_;
   exception_ptr error_;
@@ -803,13 +1042,13 @@ struct PersistentBatchResources {
 
   unique_ptr<OptixRuntime> optix;
   string optix_key;
-  CandidatePlaneRuntime candidate_planes;
-  HausdorffRuntime hausdorff;
+  array<CandidatePlaneRuntime, 2> candidate_planes;
+  array<HausdorffRuntime, 2> hausdorff;
   DeviceMeshRuntime device_meshes;
-  ComponentBatchRuntime component_batch;
-  ConvexHullBatchRuntime convex_hulls;
-  FlatSurfaceBatchRuntime flat_surfaces;
-  MergeBatchRuntime merges;
+  array<ComponentBatchRuntime, 2> component_batch;
+  array<ConvexHullBatchRuntime, 2> convex_hulls;
+  array<FlatSurfaceBatchRuntime, 2> flat_surfaces;
+  array<MergeBatchRuntime, 2> merges;
 
   void configure_executors(size_t cpu_threads, size_t gpu_threads) {
     if (!executor || executor_threads != cpu_threads) {
@@ -871,13 +1110,13 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
       config.batch_memory_fraction /
       static_cast<double>(gpu_host_threads);
   OptixRuntime &optix = resources.configured_optix();
-  CandidatePlaneRuntime &candidate_planes = resources.candidate_planes;
-  HausdorffRuntime &hausdorff = resources.hausdorff;
+  auto &candidate_planes = resources.candidate_planes;
+  auto &hausdorff = resources.hausdorff;
   DeviceMeshRuntime &device_meshes = resources.device_meshes;
-  ComponentBatchRuntime &component_batch = resources.component_batch;
-  ConvexHullBatchRuntime &convex_hulls = resources.convex_hulls;
-  FlatSurfaceBatchRuntime &flat_surfaces = resources.flat_surfaces;
-  MergeBatchRuntime &merges = resources.merges;
+  auto &component_batch = resources.component_batch;
+  auto &convex_hulls = resources.convex_hulls;
+  auto &flat_surfaces = resources.flat_surfaces;
+  auto &merges = resources.merges;
 
   const uint32_t batch_seed = random_engine();
   for (size_t i = 0; i < states.size(); ++i) {
@@ -1113,6 +1352,9 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
             if (!cache.hull) {
               cache.hull.emplace();
               hull_work->part_indices.push_back(part_index);
+              hull_work->estimated_size = saturating_add(
+                  hull_work->estimated_size,
+                  mesh_work_size(state.parts[part_index]));
             }
           }
           if (!hull_work->part_indices.empty()) {
@@ -1285,6 +1527,7 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
       if (config.use_flat_surfaces) {
         auto surfaces = make_shared<FlatSurfaceWork>();
         surfaces->state_index = state_index;
+        surfaces->estimated_size = mesh_work_size(states[state_index].cage);
         coordinator.enqueue_flat_surfaces(move(surfaces));
       } else {
         schedule_initial_components(state_index);
@@ -1297,6 +1540,11 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
       GpuWork gpu_work = coordinator.wait_for_gpu_work();
       if (gpu_work.kind == GpuWorkKind::complete)
         break;
+      const size_t gpu_lane = gpu_work.lane;
+      const double work_memory_fraction =
+          gpu_work.shared_memory_budget
+              ? gpu_memory_fraction * 0.5
+              : gpu_memory_fraction;
 
       if (gpu_work.kind == GpuWorkKind::flat_surfaces) {
         vector<FlatSurfaceBatchInput> inputs;
@@ -1313,15 +1561,17 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
                             &work->surfaces});
         }
         coordinator.submit_gpu(
-            [&, inputs = move(inputs),
+            [&, lane = gpu_lane,
+              memory_fraction = work_memory_fraction,
+              inputs = move(inputs),
               works = move(gpu_work.flat_surfaces)]() mutable {
               try {
                 {
                   StageTimer timer(profiler, ProfileStage::flat_surfaces,
                                    inputs.size());
                   extract_flat_surfaces_batch(
-                      inputs, flat_surfaces, configured_batch_size(),
-                      gpu_memory_fraction, &executor);
+                      inputs, flat_surfaces[lane], configured_batch_size(),
+                      memory_fraction, &executor);
                 }
                 for (shared_ptr<FlatSurfaceWork> &work : works) {
                   BatchState &state = states[work->state_index];
@@ -1336,10 +1586,10 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
                   schedule_initial_components(work->state_index);
                 }
                 coordinator.complete_gpu_batch(
-                    GpuWorkKind::flat_surfaces);
+                    GpuWorkKind::flat_surfaces, lane);
               } catch (...) {
                 coordinator.complete_gpu_batch(
-                    GpuWorkKind::flat_surfaces);
+                    GpuWorkKind::flat_surfaces, lane);
                 throw;
               }
             });
@@ -1365,15 +1615,17 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
                &state.random_engine});
         }
         coordinator.submit_gpu(
-            [&, inputs = move(inputs),
+            [&, lane = gpu_lane,
+             memory_fraction = work_memory_fraction,
+             inputs = move(inputs),
              works = move(gpu_work.merges)]() mutable {
               try {
                 {
                   StageTimer timer(profiler, ProfileStage::merges,
                                    inputs.size());
                   merge_convex_hulls_batch(
-                      inputs, merges, configured_batch_size(),
-                      gpu_memory_fraction, &executor);
+                      inputs, merges[lane], configured_batch_size(),
+                      memory_fraction, &executor);
                 }
                 for (shared_ptr<MergeWork> &work : works) {
                   const size_t remaining =
@@ -1386,9 +1638,11 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
                   finish_state(move(work->finalize_work),
                                work->final_concavity);
                 }
-                coordinator.complete_gpu_batch(GpuWorkKind::merges);
+                coordinator.complete_gpu_batch(GpuWorkKind::merges,
+                                               lane);
               } catch (...) {
-                coordinator.complete_gpu_batch(GpuWorkKind::merges);
+                coordinator.complete_gpu_batch(GpuWorkKind::merges,
+                                               lane);
                 throw;
               }
             });
@@ -1410,7 +1664,9 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
         }
 
         coordinator.submit_gpu(
-            [&, requests = move(requests),
+            [&, lane = gpu_lane,
+             memory_fraction = work_memory_fraction,
+             requests = move(requests),
              works = move(gpu_work.intersections)]() mutable {
               try {
                 vector<vector<pair<unsigned int, unsigned int>>> edges;
@@ -1419,7 +1675,7 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
                                    requests.size());
                   edges = compute_intersection_matrices(
                       requests, optix, configured_batch_size(),
-                      gpu_memory_fraction, &executor);
+                      memory_fraction, &executor);
                 }
                 append_intersections(requests, edges, executor);
 
@@ -1442,10 +1698,10 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
                   schedule_advance(work->state_index);
                 }
                 coordinator.complete_gpu_batch(
-                    GpuWorkKind::intersections);
+                    GpuWorkKind::intersections, lane);
               } catch (...) {
                 coordinator.complete_gpu_batch(
-                    GpuWorkKind::intersections);
+                    GpuWorkKind::intersections, lane);
                 throw;
               }
             });
@@ -1477,21 +1733,25 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
           }
         }
         coordinator.submit_gpu(
-            [&, inputs = move(inputs),
+            [&, lane = gpu_lane,
+             memory_fraction = work_memory_fraction,
+             inputs = move(inputs),
              works = move(gpu_work.hulls)]() mutable {
               try {
                 {
                   StageTimer timer(profiler, ProfileStage::selection_hulls,
                                    inputs.size());
                   compute_convex_hulls_batch(
-                      inputs, convex_hulls, configured_batch_size(),
-                      gpu_memory_fraction);
+                      inputs, convex_hulls[lane], configured_batch_size(),
+                      memory_fraction);
                 }
                 for (shared_ptr<HullWork> &work : works)
                   schedule_advance(work->state_index);
-                coordinator.complete_gpu_batch(GpuWorkKind::hulls);
+                coordinator.complete_gpu_batch(GpuWorkKind::hulls,
+                                               lane);
               } catch (...) {
-                coordinator.complete_gpu_batch(GpuWorkKind::hulls);
+                coordinator.complete_gpu_batch(GpuWorkKind::hulls,
+                                               lane);
                 throw;
               }
             });
@@ -1562,15 +1822,17 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
             jobs.push_back(&job);
         }
         coordinator.submit_gpu(
-            [&, jobs = move(jobs),
+            [&, lane = gpu_lane,
+             memory_fraction = work_memory_fraction,
+             jobs = move(jobs),
              works = move(gpu_work.hausdorff)]() mutable {
               try {
                 {
                   StageTimer timer(profiler, ProfileStage::hausdorff,
                                    jobs.size());
                   evaluate_hausdorff_batch(
-                      jobs, hausdorff, configured_batch_size(),
-                      gpu_memory_fraction);
+                      jobs, hausdorff[lane], configured_batch_size(),
+                      memory_fraction);
                 }
 
                 for (shared_ptr<HausdorffWork> &work : works) {
@@ -1615,10 +1877,10 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
                       move(work->finalize_work), final_concavity);
                 }
                 coordinator.complete_gpu_batch(
-                    GpuWorkKind::hausdorff);
+                    GpuWorkKind::hausdorff, lane);
               } catch (...) {
                 coordinator.complete_gpu_batch(
-                    GpuWorkKind::hausdorff);
+                    GpuWorkKind::hausdorff, lane);
                 throw;
               }
             });
@@ -1641,23 +1903,25 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
           }
         }
         coordinator.submit_gpu(
-            [&, inputs = move(inputs),
+            [&, lane = gpu_lane,
+             memory_fraction = work_memory_fraction,
+             inputs = move(inputs),
              works = move(gpu_work.components)]() mutable {
               try {
                 {
                   StageTimer timer(profiler, ProfileStage::components_gpu,
                                    inputs.size());
                   separate_components_batch(
-                      inputs, component_batch, configured_batch_size(),
-                      gpu_memory_fraction);
+                      inputs, component_batch[lane],
+                      configured_batch_size(), memory_fraction);
                 }
                 for (shared_ptr<ComponentWork> &work : works)
                   schedule_components(move(work));
                 coordinator.complete_gpu_batch(
-                    GpuWorkKind::components);
+                    GpuWorkKind::components, lane);
               } catch (...) {
                 coordinator.complete_gpu_batch(
-                    GpuWorkKind::components);
+                    GpuWorkKind::components, lane);
                 throw;
               }
             });
@@ -1688,15 +1952,17 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
              &split->candidate_attempts});
       }
       coordinator.submit_gpu(
-          [&, candidate_inputs = move(candidate_inputs),
+          [&, lane = gpu_lane,
+           memory_fraction = work_memory_fraction,
+           candidate_inputs = move(candidate_inputs),
            splits = move(gpu_work.planes)]() mutable {
             try {
               {
                 StageTimer timer(profiler, ProfileStage::split_fused,
                                  candidate_inputs.size());
                 generate_score_select_clip_batch(
-                    candidate_inputs, candidate_planes,
-                    configured_batch_size(), gpu_memory_fraction);
+                    candidate_inputs, candidate_planes[lane],
+                    configured_batch_size(), memory_fraction);
               }
 
               for (shared_ptr<SplitWork> &split : splits) {
@@ -1711,9 +1977,11 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
                 }
                 schedule_clip(move(split));
               }
-              coordinator.complete_gpu_batch(GpuWorkKind::planes);
+              coordinator.complete_gpu_batch(GpuWorkKind::planes,
+                                             lane);
             } catch (...) {
-              coordinator.complete_gpu_batch(GpuWorkKind::planes);
+              coordinator.complete_gpu_batch(GpuWorkKind::planes,
+                                             lane);
               throw;
             }
           });
