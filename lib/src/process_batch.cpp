@@ -1832,19 +1832,19 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
   if (batched_cuda_preprocessing_enabled()) {
     vector<shared_ptr<PreprocessWork>> initial_work(states.size());
     executor.parallel_for(states.size(), [&](size_t state_index) {
-        Mesh mesh = move(meshes[state_index]);
-        states[state_index].original_bbox = mesh.normalize();
-        log(state_index,
-            "Preprocessing mesh (" + to_string(mesh.vertices.size()) +
-                " verts)...");
-        auto work = make_shared<PreprocessWork>();
-        work->purpose = PreprocessPurpose::initial;
-        work->state_index = state_index;
-        work->scale = 30.0;
-        work->level_set = 0.55 / 30.0;
-        work->retry_source = mesh.copy();
-        work->mesh = move(mesh);
-        initial_work[state_index] = move(work);
+      Mesh mesh = move(meshes[state_index]);
+      states[state_index].original_bbox = mesh.normalize();
+      log(state_index,
+          "Preprocessing mesh (" + to_string(mesh.vertices.size()) +
+              " verts)...");
+      auto work = make_shared<PreprocessWork>();
+      work->purpose = PreprocessPurpose::initial;
+      work->state_index = state_index;
+      work->scale = 30.0;
+      work->level_set = 0.55 / 30.0;
+      work->retry_source = mesh.copy();
+      work->mesh = move(mesh);
+      initial_work[state_index] = move(work);
     });
     for (shared_ptr<PreprocessWork> &work : initial_work)
       coordinator.enqueue_preprocess(move(work));
