@@ -3,6 +3,7 @@
 #include <core.hpp>
 #include <cstddef>
 #include <memory>
+#include <vector>
 
 namespace neural_acd {
 
@@ -33,6 +34,8 @@ private:
   std::unique_ptr<Impl> impl_;
 
   friend DeviceMeshView device_mesh_view(const DeviceMesh &);
+  friend std::shared_ptr<DeviceMesh> try_make_device_mesh_from_quads(
+      const float *, size_t, const int *, size_t, double, void *, double);
   friend class DeviceMeshRuntime;
 };
 
@@ -48,6 +51,13 @@ public:
 
   std::shared_ptr<DeviceMesh> try_upload(const Mesh &mesh,
                                          double memory_fraction = 0.7);
+  bool try_attach_edges(const std::shared_ptr<DeviceMesh> &device_mesh,
+                        const Mesh &mesh,
+                        double memory_fraction = 0.7);
+  std::shared_ptr<DeviceMesh> try_remap(
+      const std::shared_ptr<DeviceMesh> &source, const Mesh &mesh,
+      const std::vector<int> &source_vertices,
+      double memory_fraction = 0.7);
 
   struct Impl;
 
@@ -57,5 +67,15 @@ private:
 
 DeviceMeshView device_mesh_view(const DeviceMesh &mesh);
 void wait_for_device_mesh(const DeviceMesh &mesh, void *stream);
+
+// Retains CUDA level-set meshing output as a regular DeviceMesh without a
+// device-to-host-to-device round trip. Points are float3 values in scaled
+// preprocessing coordinates and quads are int4 values. The resulting mesh
+// applies the same scale division, quad triangulation, and winding as the
+// exact host output path.
+std::shared_ptr<DeviceMesh> try_make_device_mesh_from_quads(
+    const float *device_points, size_t point_count,
+    const int *device_quads, size_t quad_count, double scale,
+    void *producer_stream, double memory_fraction = 0.7);
 
 } // namespace neural_acd

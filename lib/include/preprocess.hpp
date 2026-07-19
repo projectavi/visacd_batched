@@ -2,12 +2,14 @@
 
 #include <core.hpp>
 #include <cstddef>
+#include <memory>
 #include <string>
 #include <vector>
 
 namespace neural_acd {
 
 struct SurfaceVoxelRecord;
+class DeviceMesh;
 
 struct ManifoldPreprocessMetrics {
   long long copy_input_ns = 0;
@@ -46,6 +48,8 @@ bool manifold_preprocess_cuda_candidate(
 void manifold_preprocess_from_surface_records(
     Mesh &m, const std::vector<SurfaceVoxelRecord> &surface,
     double scale, double level_set,
-    ManifoldPreprocessMetrics *metrics = nullptr);
+    ManifoldPreprocessMetrics *metrics = nullptr,
+    std::shared_ptr<DeviceMesh> *device_mesh = nullptr,
+    double device_memory_fraction = 0.7);
 
 } // namespace neural_acd

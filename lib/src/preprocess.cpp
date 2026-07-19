@@ -1211,8 +1211,12 @@ bool expand_narrowband_dense(
     double interior_width, double voxel_size,
     unsigned int maximum_iterations, bool &renormalized,
     double isovalue, vector<Vec3s> *meshed_points,
-    vector<Vec4I> *meshed_quads) {
+    vector<Vec4I> *meshed_quads,
+    shared_ptr<DeviceMesh> *meshed_device,
+    double device_memory_fraction) {
   renormalized = false;
+  if (meshed_device)
+    meshed_device->reset();
   CoordBBox active_bounds;
   if (!distance_tree.evalActiveVoxelBoundingBox(active_bounds))
     return true;
@@ -1252,6 +1256,9 @@ bool expand_narrowband_dense(
       "VISACD_ENABLE_CUDA_PREPROCESS_RENORMALIZE");
   grid.mesh_output = grid.renormalize && meshed_points && meshed_quads;
   grid.isovalue = isovalue;
+  grid.retain_device_mesh = grid.mesh_output && meshed_device;
+  grid.output_scale = scale;
+  grid.device_memory_fraction = device_memory_fraction;
   grid.active.resize(cell_count);
   grid.inside.resize(cell_count);
   grid.distances.resize(cell_count);
@@ -1352,6 +1359,8 @@ bool expand_narrowband_dense(
           Vec4I(grid.quads[index * 4], grid.quads[index * 4 + 1],
                 grid.quads[index * 4 + 2], grid.quads[index * 4 + 3]);
     }
+    if (meshed_device)
+      *meshed_device = std::move(grid.device_mesh);
     renormalized = true;
     return true;
   }
@@ -1427,7 +1436,8 @@ DoubleGrid::Ptr signed_distance_field_from_surface(
     float interior_band_width, ManifoldPreprocessMetrics *metrics,
     const Mesh &source_mesh, double scale, double meshing_isovalue,
     vector<Vec3s> *resident_points, vector<Vec4I> *resident_quads,
-    bool *resident_meshed) {
+    bool *resident_meshed, shared_ptr<DeviceMesh> *resident_device,
+    double device_memory_fraction) {
   using GridType = DoubleGrid;
   using TreeType = GridType::TreeType;
   using LeafNodeType = TreeType::LeafNodeType;
@@ -1439,6 +1449,8 @@ DoubleGrid::Ptr signed_distance_field_from_surface(
 
   if (resident_meshed)
     *resident_meshed = false;
+  if (resident_device)
+    resident_device->reset();
 
   const auto seed_grid_start = PreprocessClock::now();
   GridType::Ptr distance_grid(
@@ -1611,7 +1623,9 @@ DoubleGrid::Ptr signed_distance_field_from_surface(
             exterior_width, interior_width, voxel_size,
             maximum_iterations, dense_renormalized, meshing_isovalue,
             request_resident_mesh ? resident_points : nullptr,
-            request_resident_mesh ? resident_quads : nullptr);
+            request_resident_mesh ? resident_quads : nullptr,
+            request_resident_mesh ? resident_device : nullptr,
+            device_memory_fraction);
         if (dense_expanded && request_resident_mesh) {
           *resident_meshed = true;
           if (metrics) {
@@ -2023,7 +2037,11 @@ bool sdf_manifold(Mesh &input, Mesh &output, double scale, double level_set,
                   bool use_cuda, string *fallback_reason,
                   ManifoldPreprocessMetrics *metrics,
                   const vector<SurfaceVoxelRecord> *provided_surface =
-                      nullptr) {
+                      nullptr,
+                  shared_ptr<DeviceMesh> *device_mesh = nullptr,
+                  double device_memory_fraction = 0.7) {
+  if (device_mesh)
+    device_mesh->reset();
   const auto marshal_start = PreprocessClock::now();
   vector<Vec3s> points;
   vector<Vec3I> tris;
@@ -2063,7 +2081,8 @@ bool sdf_manifold(Mesh &input, Mesh &output, double scale, double level_set,
         input, scale, level_set * scale,
         use_cuda ? &resident_points : nullptr,
         use_cuda ? &resident_quads : nullptr,
-        use_cuda ? &resident_meshed : nullptr);
+        use_cuda ? &resident_meshed : nullptr,
+        use_cuda ? device_mesh : nullptr, device_memory_fraction);
   } else if (use_cuda) {
     try {
       static thread_local ManifoldCudaRuntime runtime;
@@ -2078,7 +2097,8 @@ bool sdf_manifold(Mesh &input, Mesh &output, double scale, double level_set,
           points, tris, *xform, surface.records,
           static_cast<float>(level_set * scale + 1.0), 3.0f, metrics,
           input, scale, level_set * scale, &resident_points,
-          &resident_quads, &resident_meshed);
+          &resident_quads, &resident_meshed, device_mesh,
+          device_memory_fraction);
     } catch (const exception &error) {
       if (fallback_reason)
         *fallback_reason = error.what();
@@ -2188,7 +2208,9 @@ bool manifold_preprocess_cuda_candidate(
 
 void manifold_preprocess_from_surface_records(
     Mesh &m, const vector<SurfaceVoxelRecord> &surface, double scale,
-    double level_set, ManifoldPreprocessMetrics *metrics) {
+    double level_set, ManifoldPreprocessMetrics *metrics,
+    shared_ptr<DeviceMesh> *device_mesh,
+    double device_memory_fraction) {
   if (metrics)
     *metrics = ManifoldPreprocessMetrics{};
   const auto copy_start = PreprocessClock::now();
@@ -2199,7 +2221,7 @@ void manifold_preprocess_from_surface_records(
   sdf_manifold(
       tmp, output, scale, level_set,
       environment_enabled("VISACD_ENABLE_CUDA_PREPROCESS"), nullptr,
-      metrics, &surface);
+      metrics, &surface, device_mesh, device_memory_fraction);
   m = std::move(output);
 }
 

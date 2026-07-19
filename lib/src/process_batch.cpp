@@ -232,14 +232,20 @@ void profiled_manifold_preprocess(Mesh &mesh, double scale,
                                   StageProfiler &profiler,
                                   const vector<SurfaceVoxelRecord> *surface =
                                       nullptr,
-                                  bool force_cpu = false) {
+                                  bool force_cpu = false,
+                                  shared_ptr<DeviceMesh> *device_mesh = nullptr,
+                                  double device_memory_fraction = 0.7) {
+  if (device_mesh)
+    device_mesh->reset();
   const char *trace_value = getenv("VISACD_PREPROCESS_TRACE");
   const bool trace = trace_value && *trace_value &&
                      string(trace_value) != "0";
   if (!profiler.enabled() && !trace) {
     if (surface) {
       manifold_preprocess_from_surface_records(mesh, *surface, scale,
-                                               level_set);
+                                               level_set, nullptr,
+                                               device_mesh,
+                                               device_memory_fraction);
     } else if (force_cpu) {
       manifold_preprocess_cpu_reference(mesh, scale, level_set);
     } else {
@@ -251,7 +257,9 @@ void profiled_manifold_preprocess(Mesh &mesh, double scale,
   ManifoldPreprocessMetrics metrics;
   if (surface) {
     manifold_preprocess_from_surface_records(mesh, *surface, scale,
-                                             level_set, &metrics);
+                                             level_set, &metrics,
+                                             device_mesh,
+                                             device_memory_fraction);
   } else if (force_cpu) {
     manifold_preprocess_cpu_reference(mesh, scale, level_set, &metrics);
   } else {
@@ -333,6 +341,7 @@ struct BatchState {
   Mesh cage;
   MeshList parts;
   vector<PartCache> part_cache;
+  shared_ptr<DeviceMesh> preprocessed_device;
   vector<double> original_bbox;
   vector<Plane> flat_surface_planes;
   RandomEngine random_engine;
@@ -376,6 +385,7 @@ struct PreprocessWork {
   Mesh mesh;
   Mesh retry_source;
   SurfaceVoxelizationResult surface;
+  shared_ptr<DeviceMesh> device;
   shared_ptr<IntersectionWork> child_intersections;
   shared_ptr<atomic<size_t>> child_remaining;
 };
@@ -392,6 +402,8 @@ struct ComponentWork {
   bool initial = false;
   MeshList parts;
   vector<MeshList> separated;
+  shared_ptr<DeviceMesh> source_device;
+  vector<vector<int>> source_vertex_maps;
   shared_ptr<DeviceMesh> projected_edge_source;
   vector<vector<int>> projected_vertex_maps;
 };
@@ -1648,6 +1660,7 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
     initial->state_index = state_index;
     initial->initial = true;
     initial->parts = move(state.parts);
+    initial->source_device = move(state.preprocessed_device);
     initial->separated.resize(initial->parts.size());
     coordinator.enqueue_components(move(initial));
   };
@@ -1675,6 +1688,21 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
           if (work->initial) {
             state.parts = move(work->parts);
             state.part_cache.resize(state.parts.size());
+            if (work->source_device &&
+                work->source_vertex_maps.size() == state.parts.size()) {
+              for (size_t part_index = 0;
+                   part_index < state.parts.size(); ++part_index) {
+                try {
+                  state.part_cache[part_index].device =
+                      device_meshes.try_remap(
+                          work->source_device, state.parts[part_index],
+                          work->source_vertex_maps[part_index],
+                          config.batch_memory_fraction);
+                } catch (...) {
+                  state.part_cache[part_index].device.reset();
+                }
+              }
+            }
             auto intersections = make_shared<IntersectionWork>();
             intersections->state_index = work->state_index;
             intersections->initial = true;
@@ -1820,7 +1848,8 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
       if (work->surface.supported) {
         profiled_manifold_preprocess(
             work->mesh, work->scale, work->level_set, kind, profiler,
-            &work->surface.records);
+            &work->surface.records, false, &work->device,
+            config.batch_memory_fraction);
       } else {
         profiled_manifold_preprocess(
             work->mesh, work->scale, work->level_set, kind, profiler,
@@ -1869,6 +1898,7 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
               " verts.");
       state.parts.clear();
       state.parts.push_back(move(work->mesh));
+      state.preprocessed_device = move(work->device);
       auto cage = make_shared<PreprocessWork>();
       cage->purpose = PreprocessPurpose::initial_cage;
       cage->state_index = work->state_index;
@@ -2116,6 +2146,25 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
                 for (shared_ptr<IntersectionWork> &work : works) {
                   BatchState &state = states[work->state_index];
                   if (work->initial) {
+                    if (state.parts.size() != state.part_cache.size()) {
+                      throw logic_error(
+                          "Initial resident meshes are out of sync");
+                    }
+                    for (size_t part_index = 0;
+                         part_index < state.parts.size(); ++part_index) {
+                      PartCache &cache = state.part_cache[part_index];
+                      if (!cache.device)
+                        continue;
+                      try {
+                        if (!device_meshes.try_attach_edges(
+                                cache.device, state.parts[part_index],
+                                config.batch_memory_fraction)) {
+                          cache.device.reset();
+                        }
+                      } catch (...) {
+                        cache.device.reset();
+                      }
+                    }
                     log(work->state_index,
                         "Starting decomposition (max parts=" +
                             to_string(num_parts) +
@@ -2342,6 +2391,10 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
                                 : nullptr,
                  projects_edges
                      ? &work->projected_vertex_maps[part_index]
+                     : nullptr,
+                 work->source_device && work->parts.size() == 1 &&
+                         part_index == 0
+                     ? &work->source_vertex_maps
                      : nullptr});
           }
         }

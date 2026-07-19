@@ -1,9 +1,12 @@
 #pragma once
 
 #include <cstddef>
+#include <memory>
 #include <vector>
 
 namespace neural_acd {
+
+class DeviceMesh;
 
 struct DenseVolumeMeshingGrid {
   int minimum[3] = {0, 0, 0};
@@ -16,6 +19,10 @@ struct DenseVolumeMeshingGrid {
   std::vector<int> leaf_order;
   std::vector<float> points;
   std::vector<int> quads;
+  bool retain_device_mesh = false;
+  double output_scale = 1.0;
+  double device_memory_fraction = 0.7;
+  std::shared_ptr<DeviceMesh> device_mesh;
 };
 
 void mesh_dense_volume_cuda(DenseVolumeMeshingGrid &grid);

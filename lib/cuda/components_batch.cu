@@ -514,10 +514,13 @@ void run_wave(const std::vector<ComponentBatchInput> &inputs, size_t begin,
   }
   if (triangle_count == 0) {
     for (size_t index = begin; index < end; ++index) {
-      if (assemble)
+      if (assemble) {
         inputs[index].components->clear();
-      else
+        if (inputs[index].component_vertex_sources)
+          inputs[index].component_vertex_sources->clear();
+      } else {
         inputs[index].labels->clear();
+      }
     }
     return;
   }
@@ -1008,6 +1011,8 @@ void run_wave(const std::vector<ComponentBatchInput> &inputs, size_t begin,
     }
 
     std::vector<MeshList> assembled(wave_size);
+    std::vector<std::vector<std::vector<int>>> assembled_sources(
+        wave_size);
     std::vector<size_t> component_inputs(component_count, wave_size);
     std::vector<size_t> component_locals(component_count, 0);
     for (size_t local = 0; local < wave_size; ++local) {
@@ -1025,6 +1030,7 @@ void run_wave(const std::vector<ComponentBatchInput> &inputs, size_t begin,
       const size_t count =
           static_cast<size_t>(last_component - first_component + 1);
       assembled[local].resize(count);
+      assembled_sources[local].resize(count);
       for (size_t component = 0; component < count; ++component) {
         const size_t global_component =
             static_cast<size_t>(first_component) + component;
@@ -1045,6 +1051,8 @@ void run_wave(const std::vector<ComponentBatchInput> &inputs, size_t begin,
           vertex_offsets[local];
       const Mesh &source = *inputs[begin + local].mesh;
       output.vertices.push_back(source.vertices[source_vertex]);
+      assembled_sources[local][component_locals[component]].push_back(
+          static_cast<int>(source_vertex));
       if (!source.is_new.empty())
         output.is_new.push_back(source.is_new[source_vertex]);
     }
@@ -1089,13 +1097,23 @@ void run_wave(const std::vector<ComponentBatchInput> &inputs, size_t begin,
 
     for (size_t local = 0; local < wave_size; ++local) {
       MeshList filtered;
+      std::vector<std::vector<int>> filtered_sources;
       filtered.reserve(assembled[local].size());
-      for (Mesh &part : assembled[local]) {
+      filtered_sources.reserve(assembled[local].size());
+      for (size_t component = 0;
+           component < assembled[local].size(); ++component) {
+        Mesh &part = assembled[local][component];
         if (std::abs(get_mesh_volume(part)) < 1e-6)
           continue;
         filtered.push_back(std::move(part));
+        filtered_sources.push_back(
+            std::move(assembled_sources[local][component]));
       }
       *inputs[begin + local].components = std::move(filtered);
+      if (inputs[begin + local].component_vertex_sources) {
+        *inputs[begin + local].component_vertex_sources =
+            std::move(filtered_sources);
+      }
     }
     return;
   }

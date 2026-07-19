@@ -1,6 +1,7 @@
 #include <cub/device/device_scan.cuh>
 #include <cuda_buffer.hpp>
 #include <cuda_runtime.h>
+#include <device_mesh.hpp>
 #include <preprocess_mesh_cuda.hpp>
 #include <preprocess_mesh_tables.hpp>
 
@@ -905,6 +906,20 @@ void mesh_dense_volume_cuda_batch_impl(
           state.quads.as<int4>() + entry.quad_output_offset);
       cuda_memory::check(cudaGetLastError(),
                          "compute batched dense volume quads");
+    }
+    DenseVolumeMeshingGrid &grid = *grids[grid_index];
+    grid.device_mesh.reset();
+    if (grid.retain_device_mesh && entry.point_count > 0 &&
+        entry.quad_count > 0) {
+      grid.device_mesh = try_make_device_mesh_from_quads(
+          reinterpret_cast<const float *>(
+              state.points.as<float3>() + entry.point_output_offset),
+          entry.point_count,
+          reinterpret_cast<const int *>(
+              state.quads.as<int4>() + entry.quad_output_offset),
+          entry.quad_count, grid.output_scale,
+          reinterpret_cast<void *>(state.stream),
+          grid.device_memory_fraction);
     }
   }
   if (point_count > 0) {

@@ -1138,6 +1138,9 @@ void expand_narrowband_dense_cuda_batch(
     }
     mesh_grid.isovalue = grid.isovalue;
     mesh_grid.leaf_order = grid.leaf_order;
+    mesh_grid.retain_device_mesh = grid.retain_device_mesh;
+    mesh_grid.output_scale = grid.output_scale;
+    mesh_grid.device_memory_fraction = grid.device_memory_fraction;
     meshing_grids.push_back(&mesh_grid);
     meshing_outputs.push_back(&grid);
     meshing_cell_offsets.push_back(host_grids[input_index].cell_offset);
@@ -1153,6 +1156,8 @@ void expand_narrowband_dense_cuda_batch(
           std::move(meshing_grids[index]->points);
       meshing_outputs[index]->quads =
           std::move(meshing_grids[index]->quads);
+      meshing_outputs[index]->device_mesh =
+          std::move(meshing_grids[index]->device_mesh);
     }
   }
   if (!readback)

@@ -15,6 +15,9 @@ struct ComponentBatchInput {
   MeshList *components = nullptr;
   const DeviceMesh *projected_edge_source = nullptr;
   const std::vector<int> *projected_vertex_map = nullptr;
+  // Optional exact output-vertex to source-vertex maps, one per returned
+  // component in the same order as components.
+  std::vector<std::vector<int>> *component_vertex_sources = nullptr;
 };
 
 class ComponentBatchRuntime {
