@@ -48,6 +48,11 @@ def parse_args():
         default=0,
         help="forced packed wave size; 0 uses memory-aware sizing",
     )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="print summaries without one line per mesh/configuration",
+    )
     return parser.parse_args()
 
 
@@ -74,27 +79,28 @@ def main():
             result = visacd._verify_preprocess_voxelization(
                 mesh, scale, args.memory_fraction
             )
-            print(
-                "mesh={} scale={} supported={} exact={} "
-                "reference_voxels={} candidate_voxels={} "
-                "coordinate_mismatches={} distance_mismatches={} "
-                "triangle_mismatches={} reference_ms={:.3f} "
-                "cuda_ms={:.3f} fallback_reason={}".format(
-                    path,
-                    scale,
-                    result["supported"],
-                    result["exact"],
-                    result["reference_voxels"],
-                    result["candidate_voxels"],
-                    result["coordinate_mismatches"],
-                    result["distance_mismatches"],
-                    result["triangle_mismatches"],
-                    result["reference_ms"],
-                    result["cuda_ms"],
-                    result["fallback_reason"],
-                ),
-                flush=True,
-            )
+            if not args.quiet:
+                print(
+                    "mesh={} scale={} supported={} exact={} "
+                    "reference_voxels={} candidate_voxels={} "
+                    "coordinate_mismatches={} distance_mismatches={} "
+                    "triangle_mismatches={} reference_ms={:.3f} "
+                    "cuda_ms={:.3f} fallback_reason={}".format(
+                        path,
+                        scale,
+                        result["supported"],
+                        result["exact"],
+                        result["reference_voxels"],
+                        result["candidate_voxels"],
+                        result["coordinate_mismatches"],
+                        result["distance_mismatches"],
+                        result["triangle_mismatches"],
+                        result["reference_ms"],
+                        result["cuda_ms"],
+                        result["fallback_reason"],
+                    ),
+                    flush=True,
+                )
             if result["exact"]:
                 exact += 1
             elif not result["supported"]:
@@ -120,26 +126,27 @@ def main():
                 args.memory_fraction,
             )
             for path, result in zip(paths, comparison["cases"]):
-                print(
-                    "packed_mesh={} scale={} supported={} exact={} "
-                    "reference_voxels={} candidate_voxels={} "
-                    "coordinate_mismatches={} distance_mismatches={} "
-                    "triangle_mismatches={} wave_ms={:.3f} "
-                    "fallback_reason={}".format(
-                        path,
-                        scale,
-                        result["supported"],
-                        result["exact"],
-                        result["reference_voxels"],
-                        result["candidate_voxels"],
-                        result["coordinate_mismatches"],
-                        result["distance_mismatches"],
-                        result["triangle_mismatches"],
-                        result["cuda_wave_ms"],
-                        result["fallback_reason"],
-                    ),
-                    flush=True,
-                )
+                if not args.quiet:
+                    print(
+                        "packed_mesh={} scale={} supported={} exact={} "
+                        "reference_voxels={} candidate_voxels={} "
+                        "coordinate_mismatches={} distance_mismatches={} "
+                        "triangle_mismatches={} wave_ms={:.3f} "
+                        "fallback_reason={}".format(
+                            path,
+                            scale,
+                            result["supported"],
+                            result["exact"],
+                            result["reference_voxels"],
+                            result["candidate_voxels"],
+                            result["coordinate_mismatches"],
+                            result["distance_mismatches"],
+                            result["triangle_mismatches"],
+                            result["cuda_wave_ms"],
+                            result["fallback_reason"],
+                        ),
+                        flush=True,
+                    )
                 if result["exact"]:
                     packed_exact += 1
                 elif not result["supported"]:
@@ -172,30 +179,31 @@ def main():
                 result = visacd._verify_manifold_preprocessing(
                     mesh, scale, level_set
                 )
-                print(
-                    "full_mesh={} scale={} level_set={} supported={} "
-                    "exact={} reference_vertices={} candidate_vertices={} "
-                    "reference_triangles={} candidate_triangles={} "
-                    "vertex_mismatches={} triangle_mismatches={} "
-                    "reference_ms={:.3f} candidate_ms={:.3f} "
-                    "fallback_reason={}".format(
-                        path,
-                        scale,
-                        level_set,
-                        result["supported"],
-                        result["exact"],
-                        result["reference_vertices"],
-                        result["candidate_vertices"],
-                        result["reference_triangles"],
-                        result["candidate_triangles"],
-                        result["vertex_mismatches"],
-                        result["triangle_mismatches"],
-                        result["reference_ms"],
-                        result["candidate_ms"],
-                        result["fallback_reason"],
-                    ),
-                    flush=True,
-                )
+                if not args.quiet:
+                    print(
+                        "full_mesh={} scale={} level_set={} supported={} "
+                        "exact={} reference_vertices={} candidate_vertices={} "
+                        "reference_triangles={} candidate_triangles={} "
+                        "vertex_mismatches={} triangle_mismatches={} "
+                        "reference_ms={:.3f} candidate_ms={:.3f} "
+                        "fallback_reason={}".format(
+                            path,
+                            scale,
+                            level_set,
+                            result["supported"],
+                            result["exact"],
+                            result["reference_vertices"],
+                            result["candidate_vertices"],
+                            result["reference_triangles"],
+                            result["candidate_triangles"],
+                            result["vertex_mismatches"],
+                            result["triangle_mismatches"],
+                            result["reference_ms"],
+                            result["candidate_ms"],
+                            result["fallback_reason"],
+                        ),
+                        flush=True,
+                    )
                 if result["exact"]:
                     full_exact += 1
                 elif not result["supported"]:
