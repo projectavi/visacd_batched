@@ -12,6 +12,16 @@ import visacd
 
 ROOT = Path(__file__).resolve().parents[1]
 RUN_GPU_TESTS = os.environ.get("VISACD_RUN_GPU_TESTS") == "1"
+CUDA_PREPROCESS_ENV = (
+    "VISACD_ENABLE_CUDA_PREPROCESS",
+    "VISACD_VERIFY_CUDA_PREPROCESS",
+    "VISACD_ENABLE_CUDA_PREPROCESS_SIGN",
+    "VISACD_ENABLE_CUDA_PREPROCESS_EXPAND",
+    "VISACD_ENABLE_CUDA_PREPROCESS_EXPAND_DENSE",
+    "VISACD_ENABLE_CUDA_PREPROCESS_RENORMALIZE",
+    "VISACD_ENABLE_CUDA_PREPROCESS_MESH",
+    "VISACD_ENABLE_CUDA_PREPROCESS_RESIDENT",
+)
 
 
 def load_sample(name, x_offset=0.0):
@@ -120,12 +130,9 @@ class BatchValidationTests(unittest.TestCase):
 )
 class BatchGpuTests(unittest.TestCase):
     def setUp(self):
-        self.saved_cuda_preprocess = os.environ.get(
-            "VISACD_ENABLE_CUDA_PREPROCESS"
-        )
-        self.saved_cuda_verify = os.environ.get(
-            "VISACD_VERIFY_CUDA_PREPROCESS"
-        )
+        self.saved_cuda_preprocess_env = {
+            name: os.environ.get(name) for name in CUDA_PREPROCESS_ENV
+        }
         self.saved_config = {
             "return_parts": visacd.config.return_parts,
             "score_mode": visacd.config.score_mode,
@@ -143,16 +150,21 @@ class BatchGpuTests(unittest.TestCase):
         visacd.config.batch_cpu_threads = 0
 
     def tearDown(self):
-        for name, value in (
-            ("VISACD_ENABLE_CUDA_PREPROCESS", self.saved_cuda_preprocess),
-            ("VISACD_VERIFY_CUDA_PREPROCESS", self.saved_cuda_verify),
-        ):
+        for name, value in self.saved_cuda_preprocess_env.items():
             if value is None:
                 os.environ.pop(name, None)
             else:
                 os.environ[name] = value
         for name, value in self.saved_config.items():
             setattr(visacd.config, name, value)
+
+    def set_cuda_preprocess_flags(self, *enabled):
+        enabled = set(enabled)
+        for name in CUDA_PREPROCESS_ENV:
+            if name in enabled:
+                os.environ[name] = "1"
+            else:
+                os.environ.pop(name, None)
 
     def run_batch(
         self,
@@ -301,9 +313,48 @@ class BatchGpuTests(unittest.TestCase):
                     self.assertEqual(comparison["vertex_mismatches"], 0)
                     self.assertEqual(comparison["triangle_mismatches"], 0)
 
+    def test_cuda_manifold_preprocessing_stage_variants_match_openvdb(self):
+        variants = {
+            "signed_flood": (
+                "VISACD_ENABLE_CUDA_PREPROCESS_SIGN",
+            ),
+            "sparse_expand": (
+                "VISACD_ENABLE_CUDA_PREPROCESS_EXPAND",
+            ),
+            "sparse_renormalize": (
+                "VISACD_ENABLE_CUDA_PREPROCESS_RENORMALIZE",
+            ),
+            "volume_meshing": (
+                "VISACD_ENABLE_CUDA_PREPROCESS_MESH",
+            ),
+            "resident_dense_chain": (
+                "VISACD_ENABLE_CUDA_PREPROCESS_EXPAND_DENSE",
+                "VISACD_ENABLE_CUDA_PREPROCESS_RENORMALIZE",
+                "VISACD_ENABLE_CUDA_PREPROCESS_MESH",
+                "VISACD_ENABLE_CUDA_PREPROCESS_RESIDENT",
+            ),
+            "complete_cuda_chain": (
+                "VISACD_ENABLE_CUDA_PREPROCESS_SIGN",
+                "VISACD_ENABLE_CUDA_PREPROCESS_EXPAND_DENSE",
+                "VISACD_ENABLE_CUDA_PREPROCESS_RENORMALIZE",
+                "VISACD_ENABLE_CUDA_PREPROCESS_MESH",
+                "VISACD_ENABLE_CUDA_PREPROCESS_RESIDENT",
+            ),
+        }
+        mesh = load_cow()
+        for variant, flags in variants.items():
+            with self.subTest(variant=variant):
+                self.set_cuda_preprocess_flags(*flags)
+                comparison = visacd._verify_manifold_preprocessing(
+                    mesh, 40.0, 0.02
+                )
+                self.assertTrue(comparison["supported"])
+                self.assertTrue(comparison["exact"])
+                self.assertEqual(comparison["vertex_mismatches"], 0)
+                self.assertEqual(comparison["triangle_mismatches"], 0)
+
     def test_cuda_preprocessing_preserves_decomposition_output(self):
-        os.environ.pop("VISACD_ENABLE_CUDA_PREPROCESS", None)
-        os.environ.pop("VISACD_VERIFY_CUDA_PREPROCESS", None)
+        self.set_cuda_preprocess_flags()
         visacd.config.max_batch_size = 0
         visacd.config.batch_cpu_threads = 0
         visacd.set_seed(1234)
@@ -311,7 +362,7 @@ class BatchGpuTests(unittest.TestCase):
             [load_cow(-100.0), load_cow(100.0)], 0.04, 2
         )
 
-        os.environ["VISACD_ENABLE_CUDA_PREPROCESS"] = "1"
+        self.set_cuda_preprocess_flags("VISACD_ENABLE_CUDA_PREPROCESS")
         visacd.set_seed(1234)
         candidate = visacd.process_batch(
             [load_cow(-100.0), load_cow(100.0)], 0.04, 2
@@ -322,9 +373,26 @@ class BatchGpuTests(unittest.TestCase):
         forced_waves = visacd.process_batch(
             [load_cow(-100.0), load_cow(100.0)], 0.04, 2
         )
+        self.set_cuda_preprocess_flags(
+            "VISACD_ENABLE_CUDA_PREPROCESS",
+            "VISACD_ENABLE_CUDA_PREPROCESS_SIGN",
+            "VISACD_ENABLE_CUDA_PREPROCESS_EXPAND_DENSE",
+            "VISACD_ENABLE_CUDA_PREPROCESS_RENORMALIZE",
+            "VISACD_ENABLE_CUDA_PREPROCESS_MESH",
+            "VISACD_ENABLE_CUDA_PREPROCESS_RESIDENT",
+        )
+        visacd.config.max_batch_size = 0
+        visacd.config.batch_cpu_threads = 0
+        visacd.set_seed(1234)
+        complete_cuda_chain = visacd.process_batch(
+            [load_cow(-100.0), load_cow(100.0)], 0.04, 2
+        )
         self.assertEqual(result_digest(reference), result_digest(candidate))
         self.assertEqual(
             result_digest(reference), result_digest(forced_waves)
+        )
+        self.assertEqual(
+            result_digest(reference), result_digest(complete_cuda_chain)
         )
 
     def test_flat_surface_pipeline_is_repeatable(self):
