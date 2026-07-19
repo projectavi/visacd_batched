@@ -42,6 +42,10 @@ CUDA, transfer, and OptiX work can overlap.
   voxelization, exterior tracing and sign propagation, narrow-band expansion,
   renormalization and trimming, and level-set meshing. Initial meshes, initial
   cages, and child cages use the same memory-aware preprocessing scheduler.
+- The complete opt-in dense path retains CUDA meshing output as `DeviceMesh`
+  storage, remaps it through exact connected-component ordering, appends
+  visibility edges in place, and reuses resident initial and cage geometry in
+  later CUDA and OptiX stages.
 - Crossing-triangle records are compacted before transfer. On the representative
   200-mesh benchmark this reduced clip-related device-to-host traffic from
   7.22 MB to 0.65 MB.
@@ -381,7 +385,8 @@ end to end.
 
 | Environment variable | Default | Purpose |
 |---|---|---|
-| `VISACD_ENABLE_CUDA_PREPROCESS` | disabled | Batch surface voxelization for initial meshes, initial cages, and child cages. Unsupported or over-budget waves use the OpenVDB reference path. |
+| `VISACD_ENABLE_CUDA_PREPROCESS` | enabled | Batch surface voxelization for initial meshes, initial cages, and child cages. Set to `0` to select the OpenVDB reference path. Unsupported or over-budget waves fall back automatically. |
+| `VISACD_DISABLE_CUDA_PREPROCESS` | disabled | Set to `1` for an explicit CPU/OpenVDB preprocessing run. An explicitly set `VISACD_ENABLE_CUDA_PREPROCESS` takes precedence. |
 | `VISACD_VERIFY_CUDA_PREPROCESS` | disabled | Compute both complete CUDA-candidate and CPU-reference outputs, accept the candidate only on bit-exact equality, and otherwise use the reference. This intentionally disables packed scheduling. |
 | `VISACD_PREPROCESS_WAVE_SIZE` | `200` | Maximum surface-voxelization items per packed preprocessing wave; memory availability can reduce it. |
 | `VISACD_ENABLE_CUDA_PREPROCESS_SIGN` | disabled | Enable exact CUDA exterior tracing, surface cleanup, leaf sign propagation, internal-node flood, and root flood. |
@@ -389,7 +394,7 @@ end to end.
 | `VISACD_ENABLE_CUDA_PREPROCESS_EXPAND_DENSE` | disabled | Enable the exact dense CUDA narrow-band expansion implementation. |
 | `VISACD_ENABLE_CUDA_PREPROCESS_RENORMALIZE` | disabled | Enable exact CUDA renormalization and narrow-band trimming. |
 | `VISACD_ENABLE_CUDA_PREPROCESS_MESH` | disabled | Enable exact CUDA level-set meshing. |
-| `VISACD_ENABLE_CUDA_PREPROCESS_RESIDENT` | disabled | With dense expansion, renormalization, and meshing enabled, pass dense activity and values directly between those CUDA stages without intermediate host reconstruction. |
+| `VISACD_ENABLE_CUDA_PREPROCESS_RESIDENT` | disabled | With dense expansion, renormalization, and meshing enabled, pass dense data directly between CUDA stages and retain meshed initial/cage geometry for downstream CUDA and OptiX reuse. |
 
 Stage-specific diagnostics are available through
 `VISACD_PREPROCESS_TRACE`, `VISACD_PREPROCESS_SIGN_TRACE`,
@@ -399,7 +404,14 @@ and `VISACD_PREPROCESS_MESH_TRACE`.
 For the currently recommended accelerated preprocessing path:
 
 ```bash
-VISACD_ENABLE_CUDA_PREPROCESS=1 \
+CUDA_VISIBLE_DEVICES=0 \
+python benchmark_parallel.py -n 200 --repeats 4
+```
+
+For a CPU/OpenVDB comparison run:
+
+```bash
+VISACD_DISABLE_CUDA_PREPROCESS=1 \
 CUDA_VISIBLE_DEVICES=0 \
 python benchmark_parallel.py -n 200 --repeats 4
 ```
@@ -452,8 +464,8 @@ comparing steady-state performance.
 
 ### Reference engineering benchmark
 
-The following warm medians compare the previous batch baseline at
-`cbe1e95` with the current throughput implementation. The workload replicated
+The following representative warm results compare the previous batch baseline
+at `cbe1e95` with the current throughput implementation. The workload replicated
 `data/samples/cow.obj`, used `concavity=0.04` and `num_parts=2`, and
 preserved the exact output digest.
 
@@ -463,9 +475,9 @@ Threadripper PRO 9955WX with 32 hardware threads.
 
 | Meshes | Baseline time | Current time | Current throughput | Throughput gain |
 |---:|---:|---:|---:|---:|
-| 1 | 0.3817 s | 0.3203 s | 3.12 meshes/s | 19.2% |
-| 32 | 1.0198 s | 0.8405 s | 38.07 meshes/s | 21.3% |
-| 200 | 4.1619 s | 3.9828 s | 50.22 meshes/s | 4.5% |
+| 1 | 0.3817 s | 0.2912 s | 3.43 meshes/s | 31.1% |
+| 32 | 1.0198 s | 0.8361 s | 38.27 meshes/s | 22.0% |
+| 200 | 4.1619 s | 3.4211 s | 58.46 meshes/s | 21.7% |
 
 These numbers characterize one mesh, configuration, and machine. Real
 throughput depends strongly on topology, remeshing cost, requested part count,
@@ -481,7 +493,7 @@ reference system produced the following exact matching digest:
 |---|---:|---:|---:|
 | OpenVDB reference | 4.0855 s | 48.95 meshes/s | baseline |
 | CUDA surface voxelization, OpenVDB downstream | 3.2754 s | 61.06 meshes/s | +24.7% |
-| Complete exact CUDA dense-resident chain | 4.3881 s | 45.58 meshes/s | -6.9% |
+| Complete exact CUDA dense-resident chain | 4.23 s | 47.30 meshes/s | -3.4% |
 
 The sparse CUDA expansion, sparse renormalization, sign hierarchy, and volume
 meshing paths were also measured separately and did not improve this workload.
@@ -508,8 +520,10 @@ Some structural and downstream boundaries deliberately remain on the CPU:
 - The throughput-positive surface path reads compact surface records back to
   build and prune the sparse OpenVDB topology. The opt-in dense-resident path
   avoids intermediate host reconstruction from expansion through level-set
-  meshing, but the final mesh is still materialized on the host for exact
-  downstream child construction and the public result API.
+  meshing. Its final mesh is materialized on the host for exact downstream
+  child construction and the public result API while an exact device copy is
+  retained in parallel. That device copy is remapped through connected
+  components and reused by hull, Hausdorff, split, and OptiX cage work.
 - Child cap construction uses the existing deterministic CPU constrained
   Delaunay triangulation and first-occurrence vertex ordering.
 - Convex-hull topology defaults to the existing CPU path because the exact GPU
@@ -574,18 +588,30 @@ all production scale/level-set configurations, and packed CUDA waves with:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
-python verify_preprocessing_cuda.py --full-output --packed
+python verify_preprocessing_cuda.py --full-output --packed --quiet
 
 for wave in 1 4 32 200; do
     CUDA_VISIBLE_DEVICES=0 \
     python verify_preprocessing_cuda.py \
-        --packed --max-batch-size "$wave"
+        --packed --quiet --max-batch-size "$wave"
 done
 ```
 
 On the reference build this covered 33 surface cases and 44 complete-remeshing
 cases with zero mismatches or unexpected fallbacks. Packed verification was
 also repeated with automatic, 1, 4, 32, and 200 item waves.
+
+Verify complete decomposition digests for every sample mesh across automatic,
+1, 4, and 32 CPU workers and automatic, 1, 4, 32, and 200 item waves with:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python verify_batch_matrix.py
+```
+
+Run the same 20-case matrix through the complete resident preprocessing chain
+by adding the sign, dense-expansion, renormalization, meshing, and resident
+environment variables shown above. Both matrices produced zero failures and
+the same all-sample reference digest on the validated system.
 
 The current batch rewrite has also been checked with NVIDIA Compute Sanitizer
 memcheck and targeted racecheck runs. A small local memcheck can be reproduced
@@ -598,8 +624,9 @@ compute-sanitizer --tool memcheck \
 
 To exercise the complete opt-in preprocessing chain under the sanitizer, add
 the CUDA preprocessing environment variables shown above. Targeted memcheck
-and racecheck runs of the packed mesher, dense-resident handoff, and complete
-signed-flood hierarchy reported zero errors or hazards on the reference build.
+and racecheck runs of the packed mesher, dense-resident handoff, device
+component remap, resident OptiX reuse, and complete signed-flood hierarchy
+reported zero errors or hazards on the reference build.
 
 ## Troubleshooting
 
@@ -641,6 +668,8 @@ after C++ or CUDA changes with `python -m pip install -e .`.
 | `lib/bindings.cpp` | Python and NumPy bindings. |
 | `tests/test_batch.py` | API, determinism, and GPU integration tests. |
 | `benchmark_parallel.py` | Console batch throughput and digest benchmark. |
+| `verify_batch_matrix.py` | All-sample CPU-thread and GPU-wave digest matrix. |
+| `verify_preprocessing_cuda.py` | Exact OpenVDB surface, packed-wave, and full-remesh verifier. |
 | `decompose.py` | Single-mesh GLB command-line example. |
 | `data/samples/` | Representative meshes for local validation. |
 | `docs/` | Original paper website and visual assets. |
