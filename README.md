@@ -38,6 +38,10 @@ CUDA, transfer, and OptiX work can overlap.
 - Connected-component labeling and compaction, inherited-edge projection,
   Hausdorff evaluation, flat-surface extraction, merge costs, convex-hull
   workloads, and active mesh data have batched GPU paths.
+- Manifold preprocessing has exact CUDA implementations for surface
+  voxelization, exterior tracing and sign propagation, narrow-band expansion,
+  renormalization and trimming, and level-set meshing. Initial meshes, initial
+  cages, and child cages use the same memory-aware preprocessing scheduler.
 - Crossing-triangle records are compacted before transfer. On the representative
   200-mesh benchmark this reduced clip-related device-to-host traffic from
   7.22 MB to 0.65 MB.
@@ -367,6 +371,53 @@ neutral or slower end to end on the reference GPU when competing with the
 other CUDA stages. It remains available for profiling and for larger future
 devices where that balance may change.
 
+### CUDA manifold-preprocessing controls
+
+CUDA preprocessing is split into independently selectable exact stages. The
+surface voxelizer is the throughput-positive path on the reference machine;
+the remaining implementations are retained for profiling and future GPUs but
+are disabled unless explicitly requested because they were neutral or slower
+end to end.
+
+| Environment variable | Default | Purpose |
+|---|---|---|
+| `VISACD_ENABLE_CUDA_PREPROCESS` | disabled | Batch surface voxelization for initial meshes, initial cages, and child cages. Unsupported or over-budget waves use the OpenVDB reference path. |
+| `VISACD_VERIFY_CUDA_PREPROCESS` | disabled | Compute both complete CUDA-candidate and CPU-reference outputs, accept the candidate only on bit-exact equality, and otherwise use the reference. This intentionally disables packed scheduling. |
+| `VISACD_PREPROCESS_WAVE_SIZE` | `200` | Maximum surface-voxelization items per packed preprocessing wave; memory availability can reduce it. |
+| `VISACD_ENABLE_CUDA_PREPROCESS_SIGN` | disabled | Enable exact CUDA exterior tracing, surface cleanup, leaf sign propagation, internal-node flood, and root flood. |
+| `VISACD_ENABLE_CUDA_PREPROCESS_EXPAND` | disabled | Enable the exact sparse CUDA narrow-band expansion implementation. |
+| `VISACD_ENABLE_CUDA_PREPROCESS_EXPAND_DENSE` | disabled | Enable the exact dense CUDA narrow-band expansion implementation. |
+| `VISACD_ENABLE_CUDA_PREPROCESS_RENORMALIZE` | disabled | Enable exact CUDA renormalization and narrow-band trimming. |
+| `VISACD_ENABLE_CUDA_PREPROCESS_MESH` | disabled | Enable exact CUDA level-set meshing. |
+| `VISACD_ENABLE_CUDA_PREPROCESS_RESIDENT` | disabled | With dense expansion, renormalization, and meshing enabled, pass dense activity and values directly between those CUDA stages without intermediate host reconstruction. |
+
+Stage-specific diagnostics are available through
+`VISACD_PREPROCESS_TRACE`, `VISACD_PREPROCESS_SIGN_TRACE`,
+`VISACD_PREPROCESS_EXPAND_TRACE`, `VISACD_PREPROCESS_RENORMALIZE_TRACE`,
+and `VISACD_PREPROCESS_MESH_TRACE`.
+
+For the currently recommended accelerated preprocessing path:
+
+```bash
+VISACD_ENABLE_CUDA_PREPROCESS=1 \
+CUDA_VISIBLE_DEVICES=0 \
+python benchmark_parallel.py -n 200 --repeats 4
+```
+
+For equivalence or architecture experiments, the complete exact CUDA chain can
+be selected with:
+
+```bash
+VISACD_ENABLE_CUDA_PREPROCESS=1 \
+VISACD_ENABLE_CUDA_PREPROCESS_SIGN=1 \
+VISACD_ENABLE_CUDA_PREPROCESS_EXPAND_DENSE=1 \
+VISACD_ENABLE_CUDA_PREPROCESS_RENORMALIZE=1 \
+VISACD_ENABLE_CUDA_PREPROCESS_MESH=1 \
+VISACD_ENABLE_CUDA_PREPROCESS_RESIDENT=1 \
+CUDA_VISIBLE_DEVICES=0 \
+python benchmark_parallel.py -n 200 --repeats 4
+```
+
 ## Benchmarking
 
 `benchmark_parallel.py` submits one complete batch and writes all results to
@@ -420,6 +471,24 @@ These numbers characterize one mesh, configuration, and machine. Real
 throughput depends strongly on topology, remeshing cost, requested part count,
 VRAM, CPU capacity, and the balance between CUDA and OptiX work.
 
+### Preprocessing throughput gate
+
+The preprocessing ports were benchmarked independently before deciding which
+path to recommend. For 200 replicated cows, the second repetition on the same
+reference system produced the following exact matching digest:
+
+| Preprocessing path | Warm time | Throughput | Relative to OpenVDB |
+|---|---:|---:|---:|
+| OpenVDB reference | 4.0855 s | 48.95 meshes/s | baseline |
+| CUDA surface voxelization, OpenVDB downstream | 3.2754 s | 61.06 meshes/s | +24.7% |
+| Complete exact CUDA dense-resident chain | 4.3881 s | 45.58 meshes/s | -6.9% |
+
+The sparse CUDA expansion, sparse renormalization, sign hierarchy, and volume
+meshing paths were also measured separately and did not improve this workload.
+They therefore remain opt-in. This is a throughput decision, not a correctness
+limitation; the experimental paths reproduce the reference topology and
+numerical output exactly on the validated system.
+
 Native stage timings are accumulated task wall times. Parallel tasks overlap,
 so stage values can exceed end-to-end elapsed time and must not be added
 together.
@@ -427,10 +496,20 @@ together.
 ## Exactness boundaries
 
 The rewrite keeps existing numerical behavior and does not introduce
-quality-changing approximations. A few stages remain on the CPU where exact
-topology and ordering are part of the output contract:
+quality-changing approximations. CUDA manifold preprocessing reproduces the
+OpenVDB 8.2 leaf order, signed-flood behavior, ambiguous-face decisions,
+renormalization, trimming, point order, quad order, and final triangle winding.
+Every CUDA stage catches unsupported cases and execution failures and returns
+to the exact OpenVDB implementation. Verification mode additionally treats any
+full-output mismatch as a fallback.
 
-- OpenVDB/manifold preprocessing remains CPU-side.
+Some structural and downstream boundaries deliberately remain on the CPU:
+
+- The throughput-positive surface path reads compact surface records back to
+  build and prune the sparse OpenVDB topology. The opt-in dense-resident path
+  avoids intermediate host reconstruction from expansion through level-set
+  meshing, but the final mesh is still materialized on the host for exact
+  downstream child construction and the public result API.
 - Child cap construction uses the existing deterministic CPU constrained
   Delaunay triangulation and first-occurrence vertex ordering.
 - Convex-hull topology defaults to the existing CPU path because the exact GPU
@@ -486,6 +565,28 @@ The integration suite covers:
 - NumPy input constructors and output buffer views;
 - invalid inputs and configuration ranges.
 
+It also checks every CUDA preprocessing stage against the complete OpenVDB
+result and compares complete seeded decomposition digests with the full CUDA
+initial- and child-cage chain enabled.
+
+Run the standalone exhaustive preprocessing verifier across every sample OBJ,
+all production scale/level-set configurations, and packed CUDA waves with:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+python verify_preprocessing_cuda.py --full-output --packed
+
+for wave in 1 4 32 200; do
+    CUDA_VISIBLE_DEVICES=0 \
+    python verify_preprocessing_cuda.py \
+        --packed --max-batch-size "$wave"
+done
+```
+
+On the reference build this covered 33 surface cases and 44 complete-remeshing
+cases with zero mismatches or unexpected fallbacks. Packed verification was
+also repeated with automatic, 1, 4, 32, and 200 item waves.
+
 The current batch rewrite has also been checked with NVIDIA Compute Sanitizer
 memcheck and targeted racecheck runs. A small local memcheck can be reproduced
 with:
@@ -494,6 +595,11 @@ with:
 compute-sanitizer --tool memcheck \
     python benchmark_parallel.py -n 1 --repeats 1
 ```
+
+To exercise the complete opt-in preprocessing chain under the sanitizer, add
+the CUDA preprocessing environment variables shown above. Targeted memcheck
+and racecheck runs of the packed mesher, dense-resident handoff, and complete
+signed-flood hierarchy reported zero errors or hazards on the reference build.
 
 ## Troubleshooting
 
