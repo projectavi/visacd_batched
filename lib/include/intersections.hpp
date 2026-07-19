@@ -9,6 +9,15 @@
 
 namespace neural_acd {
 
+class DeviceMesh;
+
+struct IntersectionBatchInput {
+  Mesh *points = nullptr;
+  Mesh *cage = nullptr;
+  const DeviceMesh *points_device = nullptr;
+  const DeviceMesh *cage_device = nullptr;
+};
+
 struct RayGenData {
   const float *points;
   const unsigned int *new_mask;
@@ -41,7 +50,7 @@ private:
 
   friend std::vector<std::vector<std::pair<unsigned int, unsigned int>>>
   compute_intersection_matrices(
-      const std::vector<std::pair<Mesh *, Mesh *>> &, OptixRuntime &, size_t,
+      const std::vector<IntersectionBatchInput> &, OptixRuntime &, size_t,
       double, BatchExecutor *);
 };
 
@@ -50,7 +59,7 @@ private:
 // are submitted concurrently in memory-aware waves.
 std::vector<std::vector<std::pair<unsigned int, unsigned int>>>
 compute_intersection_matrices(
-    const std::vector<std::pair<Mesh *, Mesh *>> &requests,
+    const std::vector<IntersectionBatchInput> &requests,
     OptixRuntime &runtime, size_t max_batch_size = 0,
     double memory_fraction = 0.7, BatchExecutor *executor = nullptr);
 

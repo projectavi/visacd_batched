@@ -6,6 +6,7 @@
 #include <cuda_buffer.hpp>
 #include <cuda_runtime.h>
 #include <deque>
+#include <device_mesh.hpp>
 #include <dlfcn.h>
 #include <edge_compaction.hpp>
 #include <filesystem>
@@ -80,7 +81,9 @@ size_t estimate_geometry_bytes(const Mesh &mesh) {
          mesh.triangles.size() * sizeof(uint3);
 }
 
-size_t estimate_request_bytes(const Mesh &points, const Mesh &cage) {
+size_t estimate_request_bytes(const IntersectionBatchInput &input) {
+  const Mesh &points = *input.points;
+  const Mesh &cage = *input.cage;
   const size_t segments = segment_count(points.vertices.size());
   const size_t word_bytes =
       accepted_word_count(segments) * sizeof(unsigned int);
@@ -301,6 +304,8 @@ struct OptixJob {
   const Mesh &target;
   OptixRuntime::Impl &runtime;
   OptixSlot &slot;
+  const DeviceMesh *points_device = nullptr;
+  const DeviceMesh *cage_device = nullptr;
 
   vector<float> h_points;
   vector<unsigned int> h_new_mask;
@@ -341,10 +346,11 @@ struct OptixJob {
   CUdeviceptr d_self_vertices_ptr = 0;
   unsigned int triangle_input_flags[1] = {0};
 
-  OptixJob(const Mesh &points_mesh_, const Mesh &target_,
+  OptixJob(const IntersectionBatchInput &input,
            OptixRuntime::Impl &runtime_, OptixSlot &slot_)
-      : points_mesh(points_mesh_), target(target_), runtime(runtime_),
-        slot(slot_), stream(slot_.stream) {
+      : points_mesh(*input.points), target(*input.cage), runtime(runtime_),
+        slot(slot_), points_device(input.points_device),
+        cage_device(input.cage_device), stream(slot_.stream) {
     prepare_host_data();
   }
 
@@ -364,23 +370,44 @@ struct OptixJob {
       throw overflow_error("OptiX target mesh is too large");
     }
 
-    fill_float_array(points_mesh.vertices, h_points);
+    if (points_device) {
+      const DeviceMeshView view = device_mesh_view(*points_device);
+      if (view.vertex_count != points_mesh.vertices.size() ||
+          view.triangle_count != points_mesh.triangles.size()) {
+        throw invalid_argument(
+            "OptiX resident point mesh does not match its host mesh");
+      }
+    } else {
+      fill_float_array(points_mesh.vertices, h_points);
+    }
     h_new_mask.reserve(points_mesh.is_new.size());
     for (bool is_new : points_mesh.is_new)
       h_new_mask.push_back(is_new ? 1u : 0u);
-    fill_float_array(target.vertices, h_vertices);
-    h_indices.reserve(target.triangles.size());
-    for (const auto &triangle : target.triangles) {
-      h_indices.push_back(make_uint3(static_cast<unsigned>(triangle[0]),
-                                     static_cast<unsigned>(triangle[1]),
-                                     static_cast<unsigned>(triangle[2])));
+    if (cage_device) {
+      const DeviceMeshView view = device_mesh_view(*cage_device);
+      if (view.vertex_count != target.vertices.size() ||
+          view.triangle_count != target.triangles.size()) {
+        throw invalid_argument(
+            "OptiX resident cage mesh does not match its host mesh");
+      }
+    } else {
+      fill_float_array(target.vertices, h_vertices);
+      h_indices.reserve(target.triangles.size());
+      for (const auto &triangle : target.triangles) {
+        h_indices.push_back(
+            make_uint3(static_cast<unsigned>(triangle[0]),
+                       static_cast<unsigned>(triangle[1]),
+                       static_cast<unsigned>(triangle[2])));
+      }
     }
-    h_self_indices.reserve(points_mesh.triangles.size());
-    for (const auto &triangle : points_mesh.triangles) {
-      h_self_indices.push_back(
-          make_uint3(static_cast<unsigned>(triangle[0]),
-                     static_cast<unsigned>(triangle[1]),
-                     static_cast<unsigned>(triangle[2])));
+    if (!points_device) {
+      h_self_indices.reserve(points_mesh.triangles.size());
+      for (const auto &triangle : points_mesh.triangles) {
+        h_self_indices.push_back(
+            make_uint3(static_cast<unsigned>(triangle[0]),
+                       static_cast<unsigned>(triangle[1]),
+                       static_cast<unsigned>(triangle[2])));
+      }
     }
     word_count = accepted_word_count(segments);
   }
@@ -391,18 +418,32 @@ struct OptixJob {
 
     DeviceBuffer::set_allocation_stream(stream);
 
-    slot.points.ensure(sizeof(float) * h_points.size());
-    d_points = slot.points.as<float>();
+    if (points_device) {
+      const DeviceMeshView view = device_mesh_view(*points_device);
+      d_points = const_cast<float *>(view.float_vertices);
+      d_self_indices = const_cast<uint3 *>(
+          reinterpret_cast<const uint3 *>(view.triangles));
+    } else {
+      slot.points.ensure(sizeof(float) * h_points.size());
+      d_points = slot.points.as<float>();
+      slot.self_indices.ensure(sizeof(uint3) * h_self_indices.size());
+      d_self_indices = slot.self_indices.as<uint3>();
+    }
     if (!h_new_mask.empty()) {
       slot.new_mask.ensure(sizeof(unsigned int) * h_new_mask.size());
       d_new_mask = slot.new_mask.as<unsigned int>();
     }
-    slot.vertices.ensure(sizeof(float) * h_vertices.size());
-    d_vertices = slot.vertices.as<float>();
-    slot.indices.ensure(sizeof(uint3) * h_indices.size());
-    d_indices = slot.indices.as<uint3>();
-    slot.self_indices.ensure(sizeof(uint3) * h_self_indices.size());
-    d_self_indices = slot.self_indices.as<uint3>();
+    if (cage_device) {
+      const DeviceMeshView view = device_mesh_view(*cage_device);
+      d_vertices = const_cast<float *>(view.float_vertices);
+      d_indices = const_cast<uint3 *>(
+          reinterpret_cast<const uint3 *>(view.triangles));
+    } else {
+      slot.vertices.ensure(sizeof(float) * h_vertices.size());
+      d_vertices = slot.vertices.as<float>();
+      slot.indices.ensure(sizeof(uint3) * h_indices.size());
+      d_indices = slot.indices.as<uint3>();
+    }
     slot.accepted_words.ensure(sizeof(unsigned int) * word_count);
     d_accepted_words = slot.accepted_words.as<unsigned int>();
     slot.word_offsets.ensure(sizeof(unsigned int) * word_count);
@@ -470,23 +511,32 @@ struct OptixJob {
     if (word_count == 0)
       return;
 
-    CUCHK(cudaMemcpyAsync(d_points, h_points.data(),
-                          sizeof(float) * h_points.size(),
-                          cudaMemcpyHostToDevice, stream));
+    if (points_device)
+      wait_for_device_mesh(*points_device, stream);
+    else
+      CUCHK(cudaMemcpyAsync(d_points, h_points.data(),
+                            sizeof(float) * h_points.size(),
+                            cudaMemcpyHostToDevice, stream));
     if (!h_new_mask.empty()) {
       CUCHK(cudaMemcpyAsync(d_new_mask, h_new_mask.data(),
                             sizeof(unsigned int) * h_new_mask.size(),
                             cudaMemcpyHostToDevice, stream));
     }
-    CUCHK(cudaMemcpyAsync(d_vertices, h_vertices.data(),
-                          sizeof(float) * h_vertices.size(),
-                          cudaMemcpyHostToDevice, stream));
-    CUCHK(cudaMemcpyAsync(d_indices, h_indices.data(),
-                          sizeof(uint3) * h_indices.size(),
-                          cudaMemcpyHostToDevice, stream));
-    CUCHK(cudaMemcpyAsync(d_self_indices, h_self_indices.data(),
-                          sizeof(uint3) * h_self_indices.size(),
-                          cudaMemcpyHostToDevice, stream));
+    if (cage_device)
+      wait_for_device_mesh(*cage_device, stream);
+    else {
+      CUCHK(cudaMemcpyAsync(d_vertices, h_vertices.data(),
+                            sizeof(float) * h_vertices.size(),
+                            cudaMemcpyHostToDevice, stream));
+      CUCHK(cudaMemcpyAsync(d_indices, h_indices.data(),
+                            sizeof(uint3) * h_indices.size(),
+                            cudaMemcpyHostToDevice, stream));
+    }
+    if (!points_device) {
+      CUCHK(cudaMemcpyAsync(d_self_indices, h_self_indices.data(),
+                            sizeof(uint3) * h_self_indices.size(),
+                            cudaMemcpyHostToDevice, stream));
+    }
     CUCHK(cudaMemsetAsync(d_accepted_words, 0,
                           sizeof(unsigned int) * word_count, stream));
 
@@ -599,15 +649,15 @@ void CUDART_CB notify_completion(void *payload) {
 }
 
 vector<vector<pair<unsigned int, unsigned int>>>
-run_wave(const vector<pair<Mesh *, Mesh *>> &requests, size_t begin, size_t end,
+run_wave(const vector<IntersectionBatchInput> &requests, size_t begin,
+         size_t end,
          OptixRuntime::Impl &runtime, BatchExecutor *executor) {
   runtime.ensure_slots(end - begin);
   vector<unique_ptr<OptixJob>> jobs(end - begin);
   const auto prepare_job = [&](size_t local_idx) {
     const size_t request_idx = begin + local_idx;
     jobs[local_idx] = make_unique<OptixJob>(
-        *requests[request_idx].first, *requests[request_idx].second, runtime,
-        *runtime.slots[local_idx]);
+        requests[request_idx], runtime, *runtime.slots[local_idx]);
   };
   if (executor)
     executor->parallel_for_priority(jobs.size(), prepare_job);
@@ -650,7 +700,7 @@ run_wave(const vector<pair<Mesh *, Mesh *>> &requests, size_t begin, size_t end,
 
   vector<vector<pair<unsigned int, unsigned int>>> results(end - begin);
   const auto decode_result = [&](size_t local_idx) {
-    const Mesh &mesh = *requests[begin + local_idx].first;
+    const Mesh &mesh = *requests[begin + local_idx].points;
     const vector<unsigned int> &accepted_segments =
         jobs[local_idx]->accepted_segments;
     auto &edges = results[local_idx];
@@ -677,12 +727,12 @@ run_wave(const vector<pair<Mesh *, Mesh *>> &requests, size_t begin, size_t end,
 
 vector<vector<pair<unsigned int, unsigned int>>>
 compute_intersection_matrices(
-    const vector<pair<Mesh *, Mesh *>> &requests, OptixRuntime &runtime,
+    const vector<IntersectionBatchInput> &requests, OptixRuntime &runtime,
     size_t max_batch_size, double memory_fraction, BatchExecutor *executor) {
   if (memory_fraction <= 0.0 || memory_fraction > 1.0)
     throw invalid_argument("batch_memory_fraction must be in (0, 1]");
   for (const auto &request : requests) {
-    if (!request.first || !request.second)
+    if (!request.points || !request.cage)
       throw invalid_argument("Intersection requests cannot contain null meshes");
   }
 
@@ -702,9 +752,9 @@ compute_intersection_matrices(
       if (runtime.impl_->max_concurrency &&
           end - begin >= runtime.impl_->max_concurrency)
         break;
-      const Mesh &mesh = *requests[end].first;
+      const Mesh &mesh = *requests[end].points;
       const size_t request_bytes =
-          estimate_request_bytes(mesh, *requests[end].second);
+          estimate_request_bytes(requests[end]);
       const size_t slot_index = end - begin;
       const size_t retained_bytes =
           slot_index < runtime.impl_->slots.size()

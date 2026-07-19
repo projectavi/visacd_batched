@@ -339,6 +339,7 @@ struct PartCache {
 
 struct BatchState {
   Mesh cage;
+  shared_ptr<DeviceMesh> cage_device;
   MeshList parts;
   vector<PartCache> part_cache;
   shared_ptr<DeviceMesh> preprocessed_device;
@@ -365,6 +366,7 @@ struct PendingPart {
   size_t state_index;
   Mesh part;
   Mesh cage;
+  shared_ptr<DeviceMesh> cage_device;
 };
 
 enum class PreprocessPurpose {
@@ -394,7 +396,7 @@ struct IntersectionWork {
   size_t state_index;
   bool initial = false;
   vector<PendingPart> pending_parts;
-  vector<pair<Mesh *, Mesh *>> requests;
+  vector<IntersectionBatchInput> requests;
 };
 
 struct ComponentWork {
@@ -578,10 +580,10 @@ void split_work_wave(vector<shared_ptr<Work>> &work,
 size_t intersection_work_size(const IntersectionWork &work) {
   size_t size = 0;
   for (const auto &request : work.requests) {
-    if (request.first)
-      size = saturating_add(size, mesh_work_size(*request.first));
-    if (request.second)
-      size = saturating_add(size, mesh_work_size(*request.second));
+    if (request.points)
+      size = saturating_add(size, mesh_work_size(*request.points));
+    if (request.cage)
+      size = saturating_add(size, mesh_work_size(*request.cage));
   }
   return size;
 }
@@ -1256,11 +1258,11 @@ void propagate_existing_edges(
 }
 
 void append_intersections(
-    const vector<pair<Mesh *, Mesh *>> &requests,
+    const vector<IntersectionBatchInput> &requests,
     const vector<vector<pair<unsigned int, unsigned int>>> &edges,
     BatchExecutor &executor) {
   executor.parallel_for_priority(requests.size(), [&](size_t i) {
-    auto &destination = requests[i].first->intersecting_edges;
+    auto &destination = requests[i].points->intersecting_edges;
     destination.insert(destination.end(), edges[i].begin(), edges[i].end());
   });
 }
@@ -1707,8 +1709,13 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
             intersections->state_index = work->state_index;
             intersections->initial = true;
             intersections->requests.reserve(state.parts.size());
-            for (Mesh &part : state.parts)
-              intersections->requests.emplace_back(&part, &state.cage);
+            for (size_t part_index = 0;
+                 part_index < state.parts.size(); ++part_index) {
+              intersections->requests.push_back(
+                  {&state.parts[part_index], &state.cage,
+                   state.part_cache[part_index].device.get(),
+                   state.cage_device.get()});
+            }
             coordinator.enqueue_intersections(move(intersections));
             return;
           }
@@ -1755,8 +1762,9 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
           intersections->requests.reserve(
               intersections->pending_parts.size());
           for (PendingPart &pending : intersections->pending_parts) {
-            intersections->requests.emplace_back(&pending.part,
-                                                  &pending.cage);
+            intersections->requests.push_back(
+                {&pending.part, &pending.cage, nullptr,
+                 pending.cage_device.get()});
           }
 
           auto remaining = make_shared<atomic<size_t>>(
@@ -1866,13 +1874,17 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
       work->child_intersections
           ->pending_parts[work->child_index]
           .cage = move(work->mesh);
+      work->child_intersections
+          ->pending_parts[work->child_index]
+          .cage_device = move(work->device);
       if (work->child_remaining->fetch_sub(1) == 1) {
         auto &intersections = *work->child_intersections;
         intersections.requests.clear();
         intersections.requests.reserve(intersections.pending_parts.size());
         for (PendingPart &pending : intersections.pending_parts) {
-          intersections.requests.emplace_back(&pending.part,
-                                               &pending.cage);
+          intersections.requests.push_back(
+              {&pending.part, &pending.cage, nullptr,
+               pending.cage_device.get()});
         }
         coordinator.enqueue_intersections(work->child_intersections);
       }
@@ -1910,6 +1922,7 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
     }
 
     state.cage = move(work->mesh);
+    state.cage_device = move(work->device);
     if (config.use_flat_surfaces) {
       auto surfaces = make_shared<FlatSurfaceWork>();
       surfaces->state_index = work->state_index;
@@ -2114,7 +2127,7 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
       }
 
       if (gpu_work.kind == GpuWorkKind::intersections) {
-        vector<pair<Mesh *, Mesh *>> requests;
+        vector<IntersectionBatchInput> requests;
         size_t request_count = 0;
         for (const shared_ptr<IntersectionWork> &work :
              gpu_work.intersections) {
