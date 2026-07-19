@@ -9,6 +9,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <openvdb/Exceptions.h>
 #include <openvdb/openvdb.h>
 #include <openvdb/tools/MeshToVolume.h>
@@ -932,11 +933,62 @@ bool postprocess_sparse_surface_cuda(
   return true;
 }
 
+vector<int> dense_leaf_traversal_order(const Coord &minimum,
+                                       const Coord &dimensions) {
+  using RootChildType =
+      NarrowbandTree::RootNodeType::ChildNodeType;
+  using InternalChildType = RootChildType::ChildNodeType;
+  const int root_dimension = RootChildType::DIM;
+  const int internal_dimension = InternalChildType::DIM;
+  const int leaf_dimensions[3] = {
+      static_cast<int>(dimensions[0] / NarrowbandLeaf::DIM),
+      static_cast<int>(dimensions[1] / NarrowbandLeaf::DIM),
+      static_cast<int>(dimensions[2] / NarrowbandLeaf::DIM)};
+  const size_t leaf_count =
+      static_cast<size_t>(leaf_dimensions[0]) * leaf_dimensions[1] *
+      leaf_dimensions[2];
+  vector<int> order(leaf_count);
+  iota(order.begin(), order.end(), 0);
+  const auto leaf_origin = [&](int leaf) {
+    const int yz = leaf_dimensions[1] * leaf_dimensions[2];
+    const int x = leaf / yz;
+    const int remainder = leaf % yz;
+    const int y = remainder / leaf_dimensions[2];
+    const int z = remainder % leaf_dimensions[2];
+    return Coord(minimum[0] + x * NarrowbandLeaf::DIM,
+                 minimum[1] + y * NarrowbandLeaf::DIM,
+                 minimum[2] + z * NarrowbandLeaf::DIM);
+  };
+  const auto traversal_key = [&](int leaf) {
+    const Coord origin = leaf_origin(leaf);
+    const Coord root_origin = origin & ~(root_dimension - 1);
+    const Coord internal_origin =
+        origin & ~(internal_dimension - 1);
+    array<int, 9> key{};
+    for (int axis = 0; axis < 3; ++axis) {
+      key[axis] = root_origin[axis];
+      key[3 + axis] =
+          (internal_origin[axis] - root_origin[axis]) /
+          internal_dimension;
+      key[6 + axis] =
+          (origin[axis] - internal_origin[axis]) /
+          NarrowbandLeaf::DIM;
+    }
+    return key;
+  };
+  sort(order.begin(), order.end(), [&](int first, int second) {
+    return traversal_key(first) < traversal_key(second);
+  });
+  return order;
+}
+
 bool expand_narrowband_dense(
     NarrowbandTree &distance_tree, NarrowbandIndexTree &index_tree,
     const Mesh &source_mesh, double scale, double exterior_width,
     double interior_width, double voxel_size,
-    unsigned int maximum_iterations, bool &renormalized) {
+    unsigned int maximum_iterations, bool &renormalized,
+    double isovalue, vector<Vec3s> *meshed_points,
+    vector<Vec4I> *meshed_quads) {
   renormalized = false;
   CoordBBox active_bounds;
   if (!distance_tree.evalActiveVoxelBoundingBox(active_bounds))
@@ -975,10 +1027,14 @@ bool expand_narrowband_dense(
   grid.iterations = maximum_iterations;
   grid.renormalize = environment_enabled(
       "VISACD_ENABLE_CUDA_PREPROCESS_RENORMALIZE");
+  grid.mesh_output = grid.renormalize && meshed_points && meshed_quads;
+  grid.isovalue = isovalue;
   grid.active.resize(cell_count);
   grid.inside.resize(cell_count);
   grid.distances.resize(cell_count);
   grid.triangle_indices.resize(cell_count, Int32(util::INVALID_IDX));
+  if (grid.mesh_output)
+    grid.leaf_order = dense_leaf_traversal_order(minimum, dimensions);
   vector<unsigned char> original_active(cell_count);
   tree::ValueAccessor<NarrowbandTree> distance_accessor(distance_tree);
   tree::ValueAccessor<NarrowbandIndexTree> index_accessor(index_tree);
@@ -1058,6 +1114,24 @@ bool expand_narrowband_dense(
   }
 
   dense_narrowband_cuda_batcher().expand({&source_mesh, scale, &grid});
+  if (grid.mesh_output) {
+    if (grid.points.size() % 3 != 0 || grid.quads.size() % 4 != 0)
+      throw logic_error("Resident CUDA volume mesh is malformed");
+    meshed_points->resize(grid.points.size() / 3);
+    for (size_t index = 0; index < meshed_points->size(); ++index) {
+      (*meshed_points)[index] =
+          Vec3s(grid.points[index * 3], grid.points[index * 3 + 1],
+                grid.points[index * 3 + 2]);
+    }
+    meshed_quads->resize(grid.quads.size() / 4);
+    for (size_t index = 0; index < meshed_quads->size(); ++index) {
+      (*meshed_quads)[index] =
+          Vec4I(grid.quads[index * 4], grid.quads[index * 4 + 1],
+                grid.quads[index * 4 + 2], grid.quads[index * 4 + 3]);
+    }
+    renormalized = true;
+    return true;
+  }
   size_t offset = 0;
   Coord coordinate;
   for (int x = minimum[0]; x <= maximum[0]; ++x) {
@@ -1128,7 +1202,9 @@ DoubleGrid::Ptr signed_distance_field_from_surface(
     const math::Transform &transform,
     const vector<SurfaceVoxelRecord> &surface, float exterior_band_width,
     float interior_band_width, ManifoldPreprocessMetrics *metrics,
-    const Mesh &source_mesh, double scale) {
+    const Mesh &source_mesh, double scale, double meshing_isovalue,
+    vector<Vec3s> *resident_points, vector<Vec4I> *resident_quads,
+    bool *resident_meshed) {
   using GridType = DoubleGrid;
   using TreeType = GridType::TreeType;
   using LeafNodeType = TreeType::LeafNodeType;
@@ -1137,6 +1213,9 @@ DoubleGrid::Ptr signed_distance_field_from_surface(
   using IntTreeType = IntGridType::TreeType;
   using BoolTreeType = TreeType::ValueConverter<bool>::Type;
   using Adapter = tools::QuadAndTriangleDataAdapter<Vec3s, Vec3I>;
+
+  if (resident_meshed)
+    *resident_meshed = false;
 
   const auto seed_grid_start = PreprocessClock::now();
   GridType::Ptr distance_grid(
@@ -1280,10 +1359,27 @@ DoubleGrid::Ptr signed_distance_field_from_surface(
     if (environment_enabled(
             "VISACD_ENABLE_CUDA_PREPROCESS_EXPAND_DENSE")) {
       try {
+        const bool request_resident_mesh =
+            resident_points && resident_quads && resident_meshed &&
+            environment_enabled(
+                "VISACD_ENABLE_CUDA_PREPROCESS_RESIDENT") &&
+            environment_enabled(
+                "VISACD_ENABLE_CUDA_PREPROCESS_RENORMALIZE") &&
+            environment_enabled("VISACD_ENABLE_CUDA_PREPROCESS_MESH");
         dense_expanded = expand_narrowband_dense(
             distance_tree, index_tree, source_mesh, scale,
             exterior_width, interior_width, voxel_size,
-            maximum_iterations, dense_renormalized);
+            maximum_iterations, dense_renormalized, meshing_isovalue,
+            request_resident_mesh ? resident_points : nullptr,
+            request_resident_mesh ? resident_quads : nullptr);
+        if (dense_expanded && request_resident_mesh) {
+          *resident_meshed = true;
+          if (metrics) {
+            metrics->sdf_expand_ns = elapsed_ns(expand_start);
+            metrics->sdf_renormalize_ns = 0;
+          }
+          return distance_grid;
+        }
       } catch (const exception &error) {
         if (environment_enabled("VISACD_PREPROCESS_EXPAND_TRACE"))
           cerr << "[visacd expand dense] fallback=" << error.what()
@@ -1717,11 +1813,17 @@ bool sdf_manifold(Mesh &input, Mesh &output, double scale, double level_set,
 
   const auto sdf_start = PreprocessClock::now();
   DoubleGrid::Ptr sgrid;
+  vector<Vec3s> resident_points;
+  vector<Vec4I> resident_quads;
+  bool resident_meshed = false;
   if (provided_surface) {
     sgrid = signed_distance_field_from_surface(
         points, tris, *xform, *provided_surface,
         static_cast<float>(level_set * scale + 1.0), 3.0f, metrics,
-        input, scale);
+        input, scale, level_set * scale,
+        use_cuda ? &resident_points : nullptr,
+        use_cuda ? &resident_quads : nullptr,
+        use_cuda ? &resident_meshed : nullptr);
   } else if (use_cuda) {
     try {
       static thread_local ManifoldCudaRuntime runtime;
@@ -1735,7 +1837,8 @@ bool sdf_manifold(Mesh &input, Mesh &output, double scale, double level_set,
       sgrid = signed_distance_field_from_surface(
           points, tris, *xform, surface.records,
           static_cast<float>(level_set * scale + 1.0), 3.0f, metrics,
-          input, scale);
+          input, scale, level_set * scale, &resident_points,
+          &resident_quads, &resident_meshed);
     } catch (const exception &error) {
       if (fallback_reason)
         *fallback_reason = error.what();
@@ -1754,8 +1857,12 @@ bool sdf_manifold(Mesh &input, Mesh &output, double scale, double level_set,
   vector<Vec3I> newTriangles;
   vector<Vec4I> newQuads;
   const auto meshing_start = PreprocessClock::now();
-  bool cuda_meshed = false;
-  if (use_cuda &&
+  bool cuda_meshed = resident_meshed;
+  if (resident_meshed) {
+    newPoints = move(resident_points);
+    newQuads = move(resident_quads);
+  }
+  if (!cuda_meshed && use_cuda &&
       environment_enabled("VISACD_ENABLE_CUDA_PREPROCESS_MESH")) {
     try {
       cuda_meshed = volume_to_mesh_cuda(

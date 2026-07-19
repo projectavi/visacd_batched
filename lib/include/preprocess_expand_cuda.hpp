@@ -44,10 +44,15 @@ struct DenseNarrowbandGrid {
   double voxel_size = 1.0;
   unsigned int iterations = 0;
   bool renormalize = false;
+  bool mesh_output = false;
+  double isovalue = 0.0;
   std::vector<unsigned char> active;
   std::vector<unsigned char> inside;
   std::vector<double> distances;
   std::vector<int> triangle_indices;
+  std::vector<int> leaf_order;
+  std::vector<float> points;
+  std::vector<int> quads;
 };
 
 struct DenseNarrowbandInput {

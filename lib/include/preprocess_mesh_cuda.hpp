@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <vector>
 
 namespace neural_acd {
@@ -21,5 +22,10 @@ void mesh_dense_volume_cuda(DenseVolumeMeshingGrid &grid);
 
 void mesh_dense_volume_cuda_batch(
     const std::vector<DenseVolumeMeshingGrid *> &grids);
+
+void mesh_dense_volume_cuda_device_batch(
+    const std::vector<DenseVolumeMeshingGrid *> &grids,
+    const unsigned char *device_active, const double *device_values,
+    const std::vector<size_t> &cell_offsets, void *producer_stream);
 
 } // namespace neural_acd

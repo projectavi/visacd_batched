@@ -506,6 +506,7 @@ __global__ void compute_quads_kernel(
 struct Runtime {
   std::mutex mutex;
   cudaStream_t stream = nullptr;
+  cudaEvent_t input_ready = nullptr;
   bool tables_ready = false;
   DeviceBuffer active, values, intersection, flags;
   DeviceBuffer leaf_order, leaf_ranks;
@@ -517,6 +518,8 @@ struct Runtime {
   PinnedBuffer host_totals;
 
   ~Runtime() {
+    if (input_ready)
+      cudaEventDestroy(input_ready);
     if (stream)
       cudaStreamDestroy(stream);
   }
@@ -526,6 +529,11 @@ struct Runtime {
       cuda_memory::check(
           cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
           "create dense volume meshing CUDA stream");
+    }
+    if (!input_ready) {
+      cuda_memory::check(
+          cudaEventCreateWithFlags(&input_ready, cudaEventDisableTiming),
+          "create dense volume meshing input event");
     }
     DeviceBuffer::set_allocation_stream(stream);
     if (!tables_ready) {
@@ -559,8 +567,20 @@ void mesh_dense_volume_cuda(DenseVolumeMeshingGrid &grid) {
   mesh_dense_volume_cuda_batch(grids);
 }
 
-void mesh_dense_volume_cuda_batch(
-    const std::vector<DenseVolumeMeshingGrid *> &grids) {
+namespace {
+
+void mesh_dense_volume_cuda_batch_impl(
+    const std::vector<DenseVolumeMeshingGrid *> &grids,
+    const unsigned char *device_active, const double *device_values,
+    const std::vector<size_t> *source_cell_offsets,
+    cudaStream_t producer_stream) {
+  const bool device_input = device_active != nullptr;
+  if (device_input != (device_values != nullptr) ||
+      device_input != (source_cell_offsets != nullptr) ||
+      device_input != (producer_stream != nullptr) ||
+      (source_cell_offsets && source_cell_offsets->size() != grids.size()))
+    throw std::invalid_argument(
+        "dense volume meshing device input is malformed");
   struct BatchGrid {
     PackedGrid packed;
     size_t cell_offset = 0;
@@ -594,8 +614,10 @@ void mesh_dense_volume_cuda_batch(
                          static_cast<size_t>(grid->dimensions[2]))
       throw std::overflow_error("dense volume meshing cell overflow");
     grid_cells *= static_cast<size_t>(grid->dimensions[2]);
-    if (grid->active.size() != grid_cells ||
-        grid->values.size() != grid_cells || grid_cells == 0 ||
+    if ((!device_input &&
+         (grid->active.size() != grid_cells ||
+          grid->values.size() != grid_cells)) ||
+        grid_cells == 0 ||
         grid_cells >
             static_cast<size_t>(std::numeric_limits<int>::max()))
       throw std::invalid_argument(
@@ -639,10 +661,12 @@ void mesh_dense_volume_cuda_batch(
   std::lock_guard<std::mutex> lock(state.mutex);
   state.ensure_stream();
 #define ENSURE(buffer, bytes, message) state.buffer.ensure(bytes, message)
-  ENSURE(active, cell_count * sizeof(unsigned char),
-         "allocate batched dense volume activity");
-  ENSURE(values, cell_count * sizeof(double),
-         "allocate batched dense volume values");
+  if (!device_input) {
+    ENSURE(active, cell_count * sizeof(unsigned char),
+           "allocate batched dense volume activity");
+    ENSURE(values, cell_count * sizeof(double),
+           "allocate batched dense volume values");
+  }
   ENSURE(intersection, cell_count * sizeof(int),
          "allocate batched dense volume intersections");
   ENSURE(flags, cell_count * sizeof(unsigned short),
@@ -659,10 +683,12 @@ void mesh_dense_volume_cuda_batch(
          "allocate batched dense volume quad counts");
   ENSURE(quad_offsets, cell_count * sizeof(unsigned int),
          "allocate batched dense volume quad offsets");
-  ENSURE(host_active, cell_count * sizeof(unsigned char),
-         "allocate host batched dense volume activity");
-  ENSURE(host_values, cell_count * sizeof(double),
-         "allocate host batched dense volume values");
+  if (!device_input) {
+    ENSURE(host_active, cell_count * sizeof(unsigned char),
+           "allocate host batched dense volume activity");
+    ENSURE(host_values, cell_count * sizeof(double),
+           "allocate host batched dense volume values");
+  }
   ENSURE(host_leaf_order, leaf_count * sizeof(int),
          "allocate host batched dense volume leaf order");
   ENSURE(host_leaf_ranks, leaf_count * sizeof(int),
@@ -674,11 +700,13 @@ void mesh_dense_volume_cuda_batch(
   for (size_t grid_index = 0; grid_index < grids.size(); ++grid_index) {
     const DenseVolumeMeshingGrid &grid = *grids[grid_index];
     const BatchGrid &entry = batch[grid_index];
-    std::copy(grid.active.begin(), grid.active.end(),
-              state.host_active.as<unsigned char>() +
-                  entry.cell_offset);
-    std::copy(grid.values.begin(), grid.values.end(),
-              state.host_values.as<double>() + entry.cell_offset);
+    if (!device_input) {
+      std::copy(grid.active.begin(), grid.active.end(),
+                state.host_active.as<unsigned char>() +
+                    entry.cell_offset);
+      std::copy(grid.values.begin(), grid.values.end(),
+                state.host_values.as<double>() + entry.cell_offset);
+    }
     for (size_t rank = 0; rank < entry.leaf_count; ++rank) {
       const int local = grid.leaf_order[rank];
       state.host_leaf_order.as<int>()[entry.leaf_offset + rank] =
@@ -694,14 +722,22 @@ void mesh_dense_volume_cuda_batch(
                         cudaMemcpyHostToDevice, state.stream),
         message);
   };
-  copy_to_device(state.active.as<unsigned char>(),
-                 state.host_active.as<unsigned char>(),
-                 cell_count * sizeof(unsigned char),
-                 "copy batched dense volume activity");
-  copy_to_device(state.values.as<double>(),
-                 state.host_values.as<double>(),
-                 cell_count * sizeof(double),
-                 "copy batched dense volume values");
+  if (device_input) {
+    cuda_memory::check(cudaEventRecord(state.input_ready, producer_stream),
+                       "record dense volume device input event");
+    cuda_memory::check(
+        cudaStreamWaitEvent(state.stream, state.input_ready, 0),
+        "wait for dense volume device input");
+  } else {
+    copy_to_device(state.active.as<unsigned char>(),
+                   state.host_active.as<unsigned char>(),
+                   cell_count * sizeof(unsigned char),
+                   "copy batched dense volume activity");
+    copy_to_device(state.values.as<double>(),
+                   state.host_values.as<double>(),
+                   cell_count * sizeof(double),
+                   "copy batched dense volume values");
+  }
   copy_to_device(state.leaf_order.as<int>(),
                  state.host_leaf_order.as<int>(),
                  leaf_count * sizeof(int),
@@ -735,9 +771,15 @@ void mesh_dense_volume_cuda_batch(
     const BatchGrid &entry = batch[grid_index];
     const int blocks = static_cast<int>(
         (entry.cell_count + threads - 1) / threads);
-    unsigned char *active = state.active.as<unsigned char>() +
-                            entry.cell_offset;
-    double *values = state.values.as<double>() + entry.cell_offset;
+    const size_t input_offset =
+        device_input ? (*source_cell_offsets)[grid_index]
+                     : entry.cell_offset;
+    const unsigned char *active =
+        device_input ? device_active + input_offset
+                     : state.active.as<unsigned char>() + input_offset;
+    const double *values =
+        device_input ? device_values + input_offset
+                     : state.values.as<double>() + input_offset;
     int *intersection = state.intersection.as<int>() + entry.cell_offset;
     unsigned short *flags = state.flags.as<unsigned short>() +
                             entry.cell_offset;
@@ -832,13 +874,19 @@ void mesh_dense_volume_cuda_batch(
                            "allocate host batched dense volume points");
   state.host_quads.ensure(quad_count * sizeof(int4),
                           "allocate host batched dense volume quads");
-  for (const BatchGrid &entry : batch) {
+  for (size_t grid_index = 0; grid_index < batch.size(); ++grid_index) {
+    const BatchGrid &entry = batch[grid_index];
     const int blocks = static_cast<int>(
         (entry.cell_count + threads - 1) / threads);
     if (entry.point_count > 0) {
+      const size_t input_offset =
+          device_input ? (*source_cell_offsets)[grid_index]
+                       : entry.cell_offset;
+      const double *values =
+          device_input ? device_values + input_offset
+                       : state.values.as<double>() + input_offset;
       compute_points_kernel<<<blocks, threads, 0, state.stream>>>(
-          entry.packed, entry.cell_count,
-          state.values.as<double>() + entry.cell_offset,
+          entry.packed, entry.cell_count, values,
           state.leaf_order.as<int>() + entry.leaf_offset,
           state.flags.as<unsigned short>() + entry.cell_offset,
           state.point_offsets.as<unsigned int>() + entry.cell_offset,
@@ -893,6 +941,23 @@ void mesh_dense_volume_cuda_batch(
                   entry.quad_count * 4, grid.quads.begin());
     }
   }
+}
+
+} // namespace
+
+void mesh_dense_volume_cuda_batch(
+    const std::vector<DenseVolumeMeshingGrid *> &grids) {
+  mesh_dense_volume_cuda_batch_impl(grids, nullptr, nullptr, nullptr,
+                                    nullptr);
+}
+
+void mesh_dense_volume_cuda_device_batch(
+    const std::vector<DenseVolumeMeshingGrid *> &grids,
+    const unsigned char *device_active, const double *device_values,
+    const std::vector<size_t> &cell_offsets, void *producer_stream) {
+  mesh_dense_volume_cuda_batch_impl(
+      grids, device_active, device_values, &cell_offsets,
+      reinterpret_cast<cudaStream_t>(producer_stream));
 }
 
 } // namespace neural_acd

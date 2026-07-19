@@ -1,6 +1,7 @@
 #include <cuda_buffer.hpp>
 #include <cuda_runtime.h>
 #include <preprocess_expand_cuda.hpp>
+#include <preprocess_mesh_cuda.hpp>
 
 #include <algorithm>
 #include <cfloat>
@@ -1113,6 +1114,49 @@ void expand_narrowband_dense_cuda_batch(
       state.dense_output_distances.as<double>());
   cuda_memory::check(cudaGetLastError(),
                      "renormalize dense narrowband");
+
+  std::vector<DenseVolumeMeshingGrid> meshing_storage;
+  std::vector<DenseVolumeMeshingGrid *> meshing_grids;
+  std::vector<DenseNarrowbandGrid *> meshing_outputs;
+  std::vector<size_t> meshing_cell_offsets;
+  meshing_storage.reserve(inputs.size());
+  meshing_grids.reserve(inputs.size());
+  meshing_outputs.reserve(inputs.size());
+  meshing_cell_offsets.reserve(inputs.size());
+  bool readback = false;
+  for (size_t input_index = 0; input_index < inputs.size(); ++input_index) {
+    DenseNarrowbandGrid &grid = *inputs[input_index].grid;
+    if (!grid.mesh_output) {
+      readback = true;
+      continue;
+    }
+    meshing_storage.emplace_back();
+    DenseVolumeMeshingGrid &mesh_grid = meshing_storage.back();
+    for (int axis = 0; axis < 3; ++axis) {
+      mesh_grid.minimum[axis] = grid.minimum[axis];
+      mesh_grid.dimensions[axis] = grid.dimensions[axis];
+    }
+    mesh_grid.isovalue = grid.isovalue;
+    mesh_grid.leaf_order = grid.leaf_order;
+    meshing_grids.push_back(&mesh_grid);
+    meshing_outputs.push_back(&grid);
+    meshing_cell_offsets.push_back(host_grids[input_index].cell_offset);
+  }
+  if (!meshing_grids.empty()) {
+    mesh_dense_volume_cuda_device_batch(
+        meshing_grids,
+        state.dense_source_active.as<unsigned char>(),
+        state.dense_output_distances.as<double>(),
+        meshing_cell_offsets, reinterpret_cast<void *>(state.stream));
+    for (size_t index = 0; index < meshing_grids.size(); ++index) {
+      meshing_outputs[index]->points =
+          std::move(meshing_grids[index]->points);
+      meshing_outputs[index]->quads =
+          std::move(meshing_grids[index]->quads);
+    }
+  }
+  if (!readback)
+    return;
 
   cuda_memory::check(
       cudaMemcpyAsync(host_active,
