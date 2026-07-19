@@ -1972,6 +1972,15 @@ bool volume_to_mesh_cuda(const DoubleGrid &grid, double isovalue,
 
 } // namespace
 
+bool cuda_manifold_preprocessing_enabled() {
+  const char *enabled = std::getenv("VISACD_ENABLE_CUDA_PREPROCESS");
+  if (enabled)
+    return *enabled && string(enabled) != "0";
+  if (environment_enabled("VISACD_DISABLE_CUDA_PREPROCESS"))
+    return false;
+  return true;
+}
+
 vector<SurfaceVoxelRecord>
 reference_surface_voxelization(const Mesh &input, double scale) {
   vector<Vec3s> points;
@@ -2220,14 +2229,14 @@ void manifold_preprocess_from_surface_records(
   Mesh output;
   sdf_manifold(
       tmp, output, scale, level_set,
-      environment_enabled("VISACD_ENABLE_CUDA_PREPROCESS"), nullptr,
+      cuda_manifold_preprocessing_enabled(), nullptr,
       metrics, &surface, device_mesh, device_memory_fraction);
   m = std::move(output);
 }
 
 void manifold_preprocess(Mesh &m, double scale, double level_set,
                          ManifoldPreprocessMetrics *metrics) {
-  if (!environment_enabled("VISACD_ENABLE_CUDA_PREPROCESS")) {
+  if (!cuda_manifold_preprocessing_enabled()) {
     manifold_preprocess_cpu_reference(m, scale, level_set, metrics);
     return;
   }

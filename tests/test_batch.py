@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 RUN_GPU_TESTS = os.environ.get("VISACD_RUN_GPU_TESTS") == "1"
 CUDA_PREPROCESS_ENV = (
     "VISACD_ENABLE_CUDA_PREPROCESS",
+    "VISACD_DISABLE_CUDA_PREPROCESS",
     "VISACD_VERIFY_CUDA_PREPROCESS",
     "VISACD_ENABLE_CUDA_PREPROCESS_SIGN",
     "VISACD_ENABLE_CUDA_PREPROCESS_EXPAND",
@@ -354,7 +355,7 @@ class BatchGpuTests(unittest.TestCase):
                 self.assertEqual(comparison["triangle_mismatches"], 0)
 
     def test_cuda_preprocessing_preserves_decomposition_output(self):
-        self.set_cuda_preprocess_flags()
+        self.set_cuda_preprocess_flags("VISACD_DISABLE_CUDA_PREPROCESS")
         visacd.config.max_batch_size = 0
         visacd.config.batch_cpu_threads = 0
         visacd.set_seed(1234)

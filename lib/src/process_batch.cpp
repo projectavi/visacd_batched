@@ -524,7 +524,7 @@ bool environment_flag_enabled(const char *name) {
 }
 
 bool batched_cuda_preprocessing_enabled() {
-  return environment_flag_enabled("VISACD_ENABLE_CUDA_PREPROCESS") &&
+  return cuda_manifold_preprocessing_enabled() &&
          !environment_flag_enabled("VISACD_VERIFY_CUDA_PREPROCESS");
 }
 

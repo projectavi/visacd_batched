@@ -32,6 +32,8 @@ struct ManifoldPreprocessMetrics {
   size_t output_triangles = 0;
 };
 
+bool cuda_manifold_preprocessing_enabled();
+
 void manifold_preprocess(Mesh &m, double scale = 50.0f,
                          double level_set = 0.55f,
                          ManifoldPreprocessMetrics *metrics = nullptr);
