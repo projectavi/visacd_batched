@@ -8,6 +8,7 @@
 #include <deque>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <memory>
 #include <numeric>
 #include <openvdb/Exceptions.h>
@@ -18,6 +19,7 @@
 #include <preprocess.hpp>
 #include <preprocess_cuda.hpp>
 #include <preprocess_expand_cuda.hpp>
+#include <preprocess_flood_cuda.hpp>
 #include <preprocess_mesh_cuda.hpp>
 #include <preprocess_renormalize_cuda.hpp>
 #include <preprocess_surface_post_cuda.hpp>
@@ -788,6 +790,100 @@ SparseSurfacePostCudaBatcher &sparse_surface_post_cuda_batcher() {
   return batcher;
 }
 
+struct SparseHierarchyFloodBatchRequest {
+  SparseHierarchyFloodGrid *grid = nullptr;
+  bool done = false;
+  exception_ptr error;
+};
+
+class SparseHierarchyFloodCudaBatcher {
+public:
+  void flood(SparseHierarchyFloodGrid &grid) {
+    auto request = make_shared<SparseHierarchyFloodBatchRequest>();
+    request->grid = &grid;
+    bool leader = false;
+    {
+      lock_guard<mutex> lock(mutex_);
+      queue_.push_back(request);
+      if (!processing_) {
+        processing_ = true;
+        leader = true;
+      }
+      condition_.notify_all();
+    }
+    if (!leader) {
+      unique_lock<mutex> lock(mutex_);
+      condition_.wait(lock, [&]() { return request->done; });
+      if (request->error)
+        rethrow_exception(request->error);
+      return;
+    }
+    while (true) {
+      vector<shared_ptr<SparseHierarchyFloodBatchRequest>> batch;
+      {
+        unique_lock<mutex> lock(mutex_);
+        condition_.wait_for(lock, chrono::microseconds(250), [&]() {
+          return queue_.size() >= 32;
+        });
+        const size_t count = min<size_t>(200, queue_.size());
+        batch.reserve(count);
+        for (size_t index = 0; index < count; ++index) {
+          batch.push_back(move(queue_.front()));
+          queue_.pop_front();
+        }
+      }
+      exception_ptr error;
+      try {
+        vector<SparseHierarchyFloodGrid *> grids;
+        grids.reserve(batch.size());
+        size_t node_count = 0;
+        for (const auto &pending : batch) {
+          grids.push_back(pending->grid);
+          node_count +=
+              pending->grid->lower_child_indices.size() / 4096;
+          node_count +=
+              pending->grid->upper_child_indices.size() / 32768;
+        }
+        if (environment_enabled("VISACD_PREPROCESS_SIGN_TRACE")) {
+          cerr << "[visacd hierarchy flood] meshes=" << batch.size()
+               << " nodes=" << node_count << '\n';
+        }
+        flood_sparse_hierarchy_cuda_batch(grids);
+      } catch (...) {
+        error = current_exception();
+      }
+      bool finished = false;
+      {
+        lock_guard<mutex> lock(mutex_);
+        for (const auto &pending : batch) {
+          pending->error = error;
+          pending->done = true;
+        }
+        if (queue_.empty()) {
+          processing_ = false;
+          finished = true;
+        }
+        condition_.notify_all();
+      }
+      if (finished)
+        break;
+    }
+    if (request->error)
+      rethrow_exception(request->error);
+  }
+
+private:
+  mutex mutex_;
+  condition_variable condition_;
+  deque<shared_ptr<SparseHierarchyFloodBatchRequest>> queue_;
+  bool processing_ = false;
+};
+
+SparseHierarchyFloodCudaBatcher &sparse_hierarchy_flood_cuda_batcher() {
+  static SparseHierarchyFloodCudaBatcher batcher;
+  return batcher;
+}
+
 bool postprocess_sparse_surface_cuda(
     NarrowbandTree &distance_tree, NarrowbandIndexTree &index_tree,
     const vector<NarrowbandLeaf *> &nodes, const Mesh &source_mesh,
@@ -930,6 +1026,133 @@ bool postprocess_sparse_surface_cuda(
       }
     }
   }
+  return true;
+}
+
+bool flood_sparse_tree_hierarchy_cuda(
+    NarrowbandTree &distance_tree,
+    const vector<NarrowbandLeaf *> &leaves, double exterior_width,
+    double interior_width) {
+  using UpperNode =
+      NarrowbandTree::RootNodeType::ChildNodeType;
+  using LowerNode = UpperNode::ChildNodeType;
+  static_assert(LowerNode::NUM_VALUES == 4096,
+                "CUDA lower flood assumes OpenVDB 8.2 tree layout");
+  static_assert(UpperNode::NUM_VALUES == 32768,
+                "CUDA upper flood assumes OpenVDB 8.2 tree layout");
+  if (leaves.empty())
+    return true;
+
+  vector<LowerNode *> lower_nodes;
+  vector<UpperNode *> upper_nodes;
+  distance_tree.getNodes(lower_nodes);
+  distance_tree.getNodes(upper_nodes);
+  if (lower_nodes.empty() || upper_nodes.empty())
+    return false;
+  sort(upper_nodes.begin(), upper_nodes.end(),
+       [](const UpperNode *first, const UpperNode *second) {
+         return first->origin() < second->origin();
+       });
+
+  unordered_map<const NarrowbandLeaf *, int> leaf_indices;
+  unordered_map<const LowerNode *, int> lower_indices;
+  leaf_indices.reserve(leaves.size());
+  lower_indices.reserve(lower_nodes.size());
+  for (size_t index = 0; index < leaves.size(); ++index)
+    leaf_indices.emplace(leaves[index], static_cast<int>(index));
+  for (size_t index = 0; index < lower_nodes.size(); ++index)
+    lower_indices.emplace(lower_nodes[index], static_cast<int>(index));
+
+  SparseHierarchyFloodGrid grid;
+  grid.exterior_width = exterior_width;
+  grid.interior_width = interior_width;
+  grid.leaf_first_values.resize(leaves.size());
+  grid.leaf_last_values.resize(leaves.size());
+  for (size_t index = 0; index < leaves.size(); ++index) {
+    grid.leaf_first_values[index] = leaves[index]->getFirstValue();
+    grid.leaf_last_values[index] = leaves[index]->getLastValue();
+  }
+  grid.lower_child_indices.assign(
+      lower_nodes.size() * static_cast<size_t>(LowerNode::NUM_VALUES),
+      -1);
+  for (size_t node_index = 0; node_index < lower_nodes.size();
+       ++node_index) {
+    const LowerNode &node = *lower_nodes[node_index];
+    const auto &mask = node.getChildMask();
+    const auto *table = node.getTable();
+    for (Index position = mask.findFirstOn();
+         position < LowerNode::NUM_VALUES;
+         position = mask.findNextOn(position + 1)) {
+      const auto found = leaf_indices.find(table[position].getChild());
+      if (found == leaf_indices.end())
+        throw logic_error("Sparse hierarchy leaf topology diverged");
+      grid.lower_child_indices[
+          node_index * LowerNode::NUM_VALUES + position] =
+          found->second;
+    }
+  }
+  grid.upper_child_indices.assign(
+      upper_nodes.size() * static_cast<size_t>(UpperNode::NUM_VALUES),
+      -1);
+  grid.upper_origins.resize(upper_nodes.size() * 3);
+  for (size_t node_index = 0; node_index < upper_nodes.size();
+       ++node_index) {
+    const UpperNode &node = *upper_nodes[node_index];
+    const Coord origin = node.origin();
+    for (int axis = 0; axis < 3; ++axis)
+      grid.upper_origins[node_index * 3 + axis] = origin[axis];
+    const auto &mask = node.getChildMask();
+    const auto *table = node.getTable();
+    for (Index position = mask.findFirstOn();
+         position < UpperNode::NUM_VALUES;
+         position = mask.findNextOn(position + 1)) {
+      const auto found = lower_indices.find(table[position].getChild());
+      if (found == lower_indices.end())
+        throw logic_error("Sparse hierarchy internal topology diverged");
+      grid.upper_child_indices[
+          node_index * UpperNode::NUM_VALUES + position] =
+          found->second;
+    }
+  }
+
+  sparse_hierarchy_flood_cuda_batcher().flood(grid);
+  for (size_t node_index = 0; node_index < lower_nodes.size();
+       ++node_index) {
+    LowerNode &node = *lower_nodes[node_index];
+    auto *table = const_cast<LowerNode::UnionType *>(node.getTable());
+    for (Index position = 0; position < LowerNode::NUM_VALUES;
+         ++position) {
+      if (node.isChildMaskOff(position)) {
+        table[position].setValue(grid.lower_tile_values[
+            node_index * LowerNode::NUM_VALUES + position]);
+      }
+    }
+  }
+  for (size_t node_index = 0; node_index < upper_nodes.size();
+       ++node_index) {
+    UpperNode &node = *upper_nodes[node_index];
+    auto *table = const_cast<UpperNode::UnionType *>(node.getTable());
+    for (Index position = 0; position < UpperNode::NUM_VALUES;
+         ++position) {
+      if (node.isChildMaskOff(position)) {
+        table[position].setValue(grid.upper_tile_values[
+            node_index * UpperNode::NUM_VALUES + position]);
+      }
+    }
+  }
+  for (size_t index = 0; index < grid.root_inside_gaps.size();
+       ++index) {
+    if (!grid.root_inside_gaps[index])
+      continue;
+    Coord coordinate = upper_nodes[index]->origin() +
+                       Coord(0, 0, UpperNode::DIM);
+    const Coord end = upper_nodes[index + 1]->origin();
+    for (; coordinate[2] != end[2];
+         coordinate[2] += UpperNode::DIM) {
+      distance_tree.root().addTile(coordinate, interior_width, false);
+    }
+  }
+  distance_tree.root().setBackground(exterior_width, false);
   return true;
 }
 
@@ -1319,16 +1542,33 @@ DoubleGrid::Ptr signed_distance_field_from_surface(
   nodes.reserve(distance_tree.leafCount());
   distance_tree.getNodes(nodes);
   const auto transform_flood_start = PreprocessClock::now();
+  bool cuda_hierarchy_flooded = false;
   if (!cuda_surface_postprocessed) {
     tbb::parallel_for(
         tbb::blocked_range<size_t>(0, nodes.size()),
         tools::mesh_to_volume_internal::TransformValues<TreeType>(
             nodes, voxel_size, false));
+  } else {
+    try {
+      cuda_hierarchy_flooded = flood_sparse_tree_hierarchy_cuda(
+          distance_tree, nodes, exterior_width, -interior_width);
+    } catch (const exception &error) {
+      if (environment_enabled("VISACD_PREPROCESS_SIGN_TRACE"))
+        cerr << "[visacd hierarchy flood] fallback=" << error.what()
+             << '\n';
+      cuda_hierarchy_flooded = false;
+    } catch (...) {
+      if (environment_enabled("VISACD_PREPROCESS_SIGN_TRACE"))
+        cerr << "[visacd hierarchy flood] fallback=unknown exception\n";
+      cuda_hierarchy_flooded = false;
+    }
   }
-  distance_tree.root().setBackground(exterior_width, false);
-  tools::signedFloodFillWithValues(
-      distance_tree, exterior_width, -interior_width, true, 1,
-      cuda_surface_postprocessed ? 1 : 0);
+  if (!cuda_hierarchy_flooded) {
+    distance_tree.root().setBackground(exterior_width, false);
+    tools::signedFloodFillWithValues(
+        distance_tree, exterior_width, -interior_width, true, 1,
+        cuda_surface_postprocessed ? 1 : 0);
+  }
   if (metrics)
     metrics->sdf_transform_flood_ns =
         elapsed_ns(transform_flood_start);
