@@ -1,3 +1,4 @@
+import ctypes
 import hashlib
 import os
 from pathlib import Path
@@ -23,6 +24,37 @@ CUDA_PREPROCESS_ENV = (
     "VISACD_ENABLE_CUDA_PREPROCESS_MESH",
     "VISACD_ENABLE_CUDA_PREPROCESS_RESIDENT",
 )
+
+
+def free_cuda_memory():
+    driver = ctypes.CDLL("libcuda.so.1")
+    driver.cuCtxGetCurrent.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+    driver.cuDevicePrimaryCtxRetain.argtypes = [
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_int,
+    ]
+    driver.cuCtxSetCurrent.argtypes = [ctypes.c_void_p]
+    driver.cuMemGetInfo_v2.argtypes = [
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
+    if driver.cuInit(0) != 0:
+        raise RuntimeError("cuInit failed")
+    context = ctypes.c_void_p()
+    if driver.cuCtxGetCurrent(ctypes.byref(context)) != 0:
+        raise RuntimeError("cuCtxGetCurrent failed")
+    if not context.value:
+        if driver.cuDevicePrimaryCtxRetain(ctypes.byref(context), 0) != 0:
+            raise RuntimeError("cuDevicePrimaryCtxRetain failed")
+        if driver.cuCtxSetCurrent(context) != 0:
+            raise RuntimeError("cuCtxSetCurrent failed")
+    if driver.cuCtxSynchronize() != 0:
+        raise RuntimeError("cuCtxSynchronize failed")
+    free = ctypes.c_size_t()
+    total = ctypes.c_size_t()
+    if driver.cuMemGetInfo_v2(ctypes.byref(free), ctypes.byref(total)) != 0:
+        raise RuntimeError("cuMemGetInfo_v2 failed")
+    return free.value
 
 
 def load_sample(name, x_offset=0.0):
@@ -204,6 +236,30 @@ class BatchGpuTests(unittest.TestCase):
         visacd.release_gpu_resources()
 
         visacd.config.retain_gpu_resources = True
+
+    def test_gpu_resource_release_recovers_vram(self):
+        visacd.release_gpu_resources()
+        baseline = free_cuda_memory()
+
+        visacd.config.retain_gpu_resources = True
+        retained_results = self.run_batch(max_batch_size=0)
+        retained = free_cuda_memory()
+        self.assertEqual(len(retained_results), 2)
+
+        visacd.release_gpu_resources()
+        released = free_cuda_memory()
+
+        mib = 1024 * 1024
+        self.assertGreater(
+            released - retained,
+            64 * mib,
+            "explicit release did not recover meaningful device memory",
+        )
+        self.assertLess(
+            abs(baseline - released),
+            256 * mib,
+            "released VRAM did not return near the initialized baseline",
+        )
 
     def test_order_repeatability_and_forced_waves(self):
         automatic = self.run_batch(max_batch_size=0)
