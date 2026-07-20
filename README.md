@@ -310,6 +310,13 @@ rather than a list.
 Seeds the next decomposition call. Call it immediately before `process_batch`
 when deterministic batch repeatability is required.
 
+### `release_gpu_resources()`
+
+Releases reusable CUDA and OptiX state owned by VisACD. Call it on the same
+thread that submitted the retained batch, with no decomposition active. The
+function waits for VisACD work to quiesce before destroying its buffers,
+streams, OptiX objects, worker runtimes, and private CUDA memory pool.
+
 ### `ProcessResult`
 
 | Field | Meaning |
@@ -349,6 +356,7 @@ Python configuration is exposed through the global `visacd.config` object.
 | `batch_cpu_threads` | `0` | Automatic host-worker count. A positive value requests an explicit count, capped by useful batch work. |
 | `max_batch_size` | `0` | Automatic memory-aware GPU waves. A positive value caps work items in each wave. |
 | `batch_memory_fraction` | `0.7` | Fraction of currently free device memory available to batch waves. Valid range is `(0, 1]`. |
+| `retain_gpu_resources` | `True` | Retain CUDA/OptiX state for faster later batches. Set to `False` to release VisACD GPU resources before every `process_batch` or `process` call returns. |
 | `score_mode` | `"concavity"` | Split selection mode. Supported values are `"concavity"` and `"edge"`. |
 | `use_flat_surfaces` | `True` | Include detected flat support surfaces in plane selection. |
 | `flat_surface_min_area` | `0.1` | Minimum area used by flat-surface detection. |
@@ -359,6 +367,45 @@ Python configuration is exposed through the global `visacd.config` object.
 Automatic settings are intended to be portable across mesh sizes and machines.
 Override them for controlled experiments or when sharing a GPU with other
 workloads.
+
+### GPU resource lifetime
+
+Retained mode is intended for a dedicated VisACD process or several adjacent
+decomposition calls. It avoids recreating streams, OptiX state, and grow-only
+scratch buffers. On the reference GPU, retained warm 200-mesh batches averaged
+about 3.33 seconds; recreating resources makes each later call behave like a
+cold call.
+
+For a GPU shared in phases with simulation or training, either release
+automatically:
+
+```python
+visacd.config.retain_gpu_resources = False
+results = visacd.process_batch(meshes, concavity=0.04, num_parts=32)
+# VisACD VRAM has been released here.
+```
+
+or retain resources across a short decomposition burst and release explicitly:
+
+```python
+visacd.config.retain_gpu_resources = True
+first = visacd.process_batch(first_meshes, 0.04, 32)
+second = visacd.process_batch(second_meshes, 0.04, 32)
+visacd.release_gpu_resources()
+# Restart the simulator or RL workload here.
+```
+
+VisACD asynchronous allocations use a private CUDA pool, so releasing VisACD
+does not trim a CUDA pool owned by PyTorch or another library. The release does
+not call `cudaDeviceReset` and therefore does not invalidate another library's
+CUDA context. CUDA code modules and driver context state can leave a small
+fixed residual allocation; a 200-mesh release test on the reference machine
+returned to within 58 MiB of the initialized baseline instead of retaining
+several GiB.
+
+Automatic release serializes simultaneous top-level VisACD calls so resources
+cannot be destroyed under active work. Explicit release must be called from
+the thread that owns the retained resources.
 
 ### Runtime and OptiX controls
 
@@ -646,6 +693,13 @@ a decimal point.
 Lower `visacd.config.batch_memory_fraction`, or set a positive
 `visacd.config.max_batch_size`. Automatic sizing uses currently free memory,
 so other processes using the same GPU affect wave size.
+
+### VRAM is needed by another GPU workload after decomposition
+
+Set `visacd.config.retain_gpu_resources = False` before decomposition, or call
+`visacd.release_gpu_resources()` on the submitting thread after the final
+batch. `batch_memory_fraction` limits peak wave size but does not control
+post-batch retention.
 
 ### The first benchmark repetition is slower
 
