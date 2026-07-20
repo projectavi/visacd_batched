@@ -46,9 +46,8 @@ CUDA, transfer, and OptiX work can overlap.
   storage, remaps it through exact connected-component ordering, appends
   visibility edges in place, and reuses resident initial and cage geometry in
   later CUDA and OptiX stages.
-- Crossing-triangle records are compacted before transfer. On the representative
-  200-mesh benchmark this reduced clip-related device-to-host traffic from
-  7.22 MB to 0.65 MB.
+- Crossing-triangle records are compacted before transfer to reduce
+  clip-related device-to-host traffic.
 - Work-size bucketing and double-buffered waves overlap transfer and compute
   while memory-aware sizing controls VRAM pressure.
 - A persistent CPU executor uses dynamic scheduling, priority work, and
@@ -401,9 +400,8 @@ returned-output behavior rather than scheduling.
 
 Retained mode is intended for a dedicated VisACD process or several adjacent
 decomposition calls. It avoids recreating streams, OptiX state, and grow-only
-scratch buffers. On the reference GPU, retained warm 200-mesh batches averaged
-about 3.33 seconds; recreating resources makes each later call behave like a
-cold call.
+scratch buffers, keeping later calls warm. Releasing resources makes the next
+decomposition rebuild that reusable state.
 
 For a GPU shared in phases with simulation or training, either release
 automatically:
@@ -428,9 +426,8 @@ VisACD asynchronous allocations use a private CUDA pool, so releasing VisACD
 does not trim a CUDA pool owned by PyTorch or another library. The release does
 not call `cudaDeviceReset` and therefore does not invalidate another library's
 CUDA context. CUDA code modules and driver context state can leave a small
-fixed residual allocation; a 200-mesh release test on the reference machine
-returned to within 58 MiB of the initialized baseline instead of retaining
-several GiB.
+fixed residual allocation, but reusable streams, scratch buffers, OptiX state,
+and the VisACD-owned pool are released.
 
 Automatic release serializes simultaneous top-level VisACD calls so resources
 cannot be destroyed under active work. Explicit release must be called from
@@ -567,42 +564,37 @@ comparing steady-state performance.
 
 ### Reference engineering benchmark
 
-The following representative warm results compare the previous batch baseline
-at `cbe1e95` with the current throughput implementation. The workload replicated
-`data/samples/cow.obj`, used `concavity=0.04` and `num_parts=2`, and
-preserved the exact output digest.
+The only performance baseline used here is original VisACD: 200 sequential
+calls to the original `process` implementation. The final batched column is one
+`process_batch` call containing the same 200 inputs. Intermediate batched
+revisions and stage-ablation timings are intentionally excluded.
+
+Results are medians of three warm repetitions with input loading and conversion
+outside the timed region, `concavity=0.04`, and `num_parts=2`.
 
 Reference system: one NVIDIA GeForce RTX 5090 selected through
 `CUDA_VISIBLE_DEVICES=0`, CUDA 12.8, driver 595.71.05, and an AMD Ryzen
 Threadripper PRO 9955WX with 32 hardware threads.
 
-| Meshes | Baseline time | Current time | Current throughput | Throughput gain |
-|---:|---:|---:|---:|---:|
-| 1 | 0.3817 s | 0.2912 s | 3.43 meshes/s | 31.1% |
-| 32 | 1.0198 s | 0.8361 s | 38.27 meshes/s | 22.0% |
-| 200 | 4.1619 s | 3.4211 s | 58.46 meshes/s | 21.7% |
+| 200-mesh workload | Original VisACD, sequential | Final batched VisACD | Final throughput | Speedup |
+|---|---:|---:|---:|---:|
+| Identical `cow.obj` meshes | 57.8767 s | 3.5276 s | 56.70 meshes/s | 16.4x |
+| Deterministic smooth cow variants | 90.5219 s | 3.5522 s | 56.30 meshes/s | 25.5x |
+| Distinct Thingi10K sample | 130.3480 s | 10.1113 s | 19.78 meshes/s | 12.9x |
 
-These numbers characterize one mesh, configuration, and machine. Real
-throughput depends strongly on topology, remeshing cost, requested part count,
-VRAM, CPU capacity, and the balance between CUDA and OptiX work.
+The smooth-variant workload contains 200 unique geometry hashes with a 1.02%
+median RMS vertex warp. The heterogeneous Thingi10K sample spans 11 categories
+and 116--48,023 vertices per mesh. The sampling and perturbation procedures are
+implemented in [benchmark_perturbed.py](benchmark_perturbed.py) and
+[benchmark_thingi10k.py](benchmark_thingi10k.py).
 
-### Preprocessing throughput gate
-
-The preprocessing ports were benchmarked independently before deciding which
-path to recommend. For 200 replicated cows, the second repetition on the same
-reference system produced the following exact matching digest:
-
-| Preprocessing path | Warm time | Throughput | Relative to OpenVDB |
-|---|---:|---:|---:|
-| OpenVDB reference | 4.0855 s | 48.95 meshes/s | baseline |
-| CUDA surface voxelization, OpenVDB downstream | 3.2754 s | 61.06 meshes/s | +24.7% |
-| Complete exact CUDA dense-resident chain | 4.23 s | 47.30 meshes/s | -3.4% |
-
-The sparse CUDA expansion, sparse renormalization, sign hierarchy, and volume
-meshing paths were also measured separately and did not improve this workload.
-They therefore remain opt-in. This is a throughput decision, not a correctness
-limitation; the experimental paths reproduce the reference topology and
-numerical output exactly on the validated system.
+These measurements characterize the original-to-final improvement on one
+machine. Real throughput depends strongly on topology, remeshing cost,
+requested part count, VRAM, CPU capacity, and the balance between CUDA and
+OptiX work. The final default keeps the throughput-positive CUDA surface
+voxelizer enabled; the remaining exact preprocessing stages stay opt-in because
+they did not provide a consistent end-to-end benefit during development. They
+reproduce the reference topology and numerical output on the validated system.
 
 Native stage timings are accumulated task wall times. Parallel tasks overlap,
 so stage values can exceed end-to-end elapsed time and must not be added
