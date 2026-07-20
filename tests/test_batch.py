@@ -142,6 +142,7 @@ class BatchGpuTests(unittest.TestCase):
             "max_batch_size": visacd.config.max_batch_size,
             "batch_memory_fraction": visacd.config.batch_memory_fraction,
             "batch_cpu_threads": visacd.config.batch_cpu_threads,
+            "retain_gpu_resources": visacd.config.retain_gpu_resources,
         }
         visacd.config.return_parts = False
         visacd.config.score_mode = "concavity"
@@ -149,6 +150,7 @@ class BatchGpuTests(unittest.TestCase):
         visacd.config.use_merging = False
         visacd.config.batch_memory_fraction = 0.7
         visacd.config.batch_cpu_threads = 0
+        visacd.config.retain_gpu_resources = True
 
     def tearDown(self):
         for name, value in self.saved_cuda_preprocess_env.items():
@@ -182,6 +184,26 @@ class BatchGpuTests(unittest.TestCase):
             concavity=0.04,
             num_parts=2,
         )
+
+    def test_gpu_resource_release_preserves_results(self):
+        visacd.config.retain_gpu_resources = True
+        retained = self.run_batch(max_batch_size=0)
+        retained_digest = result_digest(retained)
+
+        visacd.release_gpu_resources()
+        visacd.release_gpu_resources()
+
+        visacd.config.retain_gpu_resources = False
+        released = self.run_batch(max_batch_size=0)
+        self.assertEqual(retained_digest, result_digest(released))
+
+        # Automatic cleanup also runs when validation rejects a batch, and an
+        # explicit release remains safe afterward.
+        with self.assertRaisesRegex(ValueError, "num_parts"):
+            visacd.process_batch([], 0.04, 0)
+        visacd.release_gpu_resources()
+
+        visacd.config.retain_gpu_resources = True
 
     def test_order_repeatability_and_forced_waves(self):
         automatic = self.run_batch(max_batch_size=0)
