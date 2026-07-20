@@ -1,6 +1,7 @@
 #include <cuda_buffer.hpp>
 #include <cuda_runtime.h>
 #include <preprocess_surface_post_cuda.hpp>
+#include <resettable_runtime.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -618,6 +619,8 @@ struct Runtime {
 
   ~Runtime() {
     if (stream)
+      cudaStreamSynchronize(stream);
+    if (stream)
       cudaStreamDestroy(stream);
   }
 
@@ -631,12 +634,18 @@ struct Runtime {
   }
 };
 
-Runtime &runtime() {
-  static Runtime state;
+ResettableRuntime<Runtime> &runtime_storage() {
+  static ResettableRuntime<Runtime> state;
   return state;
 }
 
+Runtime &runtime() {
+  return runtime_storage().get();
+}
+
 } // namespace
+
+void release_surface_post_cuda_runtime() { runtime_storage().reset(); }
 
 void postprocess_sparse_surface_cuda(SparseSurfacePostGrid &grid) {
   std::vector<SparseSurfacePostGrid *> grids{&grid};

@@ -28,4 +28,6 @@ void postprocess_sparse_surface_cuda(SparseSurfacePostGrid &grid);
 void postprocess_sparse_surface_cuda_batch(
     const std::vector<SparseSurfacePostGrid *> &grids);
 
+void release_surface_post_cuda_runtime();
+
 } // namespace neural_acd

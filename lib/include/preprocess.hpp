@@ -54,4 +54,7 @@ void manifold_preprocess_from_surface_records(
     std::shared_ptr<DeviceMesh> *device_mesh = nullptr,
     double device_memory_fraction = 0.7);
 
+// Release process-wide CUDA preprocessing caches. No work may be active.
+void release_preprocess_cuda_resources();
+
 } // namespace neural_acd

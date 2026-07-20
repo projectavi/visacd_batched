@@ -35,4 +35,6 @@ void mesh_dense_volume_cuda_device_batch(
     const unsigned char *device_active, const double *device_values,
     const std::vector<size_t> &cell_offsets, void *producer_stream);
 
+void release_mesh_cuda_runtime();
+
 } // namespace neural_acd
