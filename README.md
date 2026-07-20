@@ -349,24 +349,53 @@ memory-aware GPU waves.
 
 ## Configuration
 
-Python configuration is exposed through the global `visacd.config` object.
+Python configuration is exposed through the process-global `visacd.config`
+object. Set it before submitting a batch; do not mutate it while VisACD work is
+running.
+
+### Batched implementation knobs
+
+These settings control how the batch engine maps a complete input batch onto
+host workers, memory-aware GPU waves, and reusable GPU state.
 
 | Setting | Default | Meaning |
 |---|---:|---|
-| `batch_cpu_threads` | `0` | Automatic host-worker count. A positive value requests an explicit count, capped by useful batch work. |
-| `max_batch_size` | `0` | Automatic memory-aware GPU waves. A positive value caps work items in each wave. |
-| `batch_memory_fraction` | `0.7` | Fraction of currently free device memory available to batch waves. Valid range is `(0, 1]`. |
-| `retain_gpu_resources` | `True` | Retain CUDA/OptiX state for faster later batches. Set to `False` to release VisACD GPU resources before every `process_batch` or `process` call returns. |
+| `batch_cpu_threads` | `0` | Host executor size. `0` selects `min(useful batch items, available hardware threads, 200)`; a positive value requests an explicit count, still capped by useful work. This is a worker count, not the number of meshes accepted by the API. |
+| `max_batch_size` | `0` | Maximum number of ready items placed in most GPU waves. `0` leaves wave length to the memory-aware scheduler. A positive value is a cap rather than a target; memory pressure can produce smaller waves. Packed preprocessing waves are additionally capped at 200 items. |
+| `batch_memory_fraction` | `0.7` | Fraction of currently free VRAM that VisACD may budget for growing a wave. Valid range: `(0, 1]`. The coordinator divides the budget conservatively among overlapping GPU host lanes; retained buffers from earlier work are accounted for separately. Lower this when another CUDA workload must keep headroom. |
+| `retain_gpu_resources` | `True` | Keep streams, OptiX objects, the private asynchronous pool, and grow-only scratch capacity for faster warm batches. `False` performs automatic release before `process_batch` or `process` returns. See [GPU resource lifetime](#gpu-resource-lifetime). |
+
+The defaults are the recommended starting point for heterogeneous batches and
+machines with different CPU counts and VRAM capacities. `max_batch_size` and
+`batch_memory_fraction` are independent: the scheduler stops a wave when it
+reaches either the item cap or its estimated memory budget. For a GPU shared
+with simulation or training, reduce `batch_memory_fraction` to reserve
+in-call headroom and disable `retain_gpu_resources` to return VisACD-owned VRAM
+after the call.
+
+For example:
+
+```python
+visacd.config.batch_cpu_threads = 0       # automatic host parallelism
+visacd.config.max_batch_size = 0          # automatic wave length
+visacd.config.batch_memory_fraction = 0.5 # preserve half of free VRAM
+visacd.config.retain_gpu_resources = False
+results = visacd.process_batch(meshes, concavity=0.04, num_parts=32)
+```
+
+### Algorithm and result knobs
+
+These settings also apply to the batch engine, but change decomposition or
+returned-output behavior rather than scheduling.
+
+| Setting | Default | Meaning |
+|---|---:|---|
 | `score_mode` | `"concavity"` | Split selection mode. Supported values are `"concavity"` and `"edge"`. |
 | `use_flat_surfaces` | `True` | Include detected flat support surfaces in plane selection. |
 | `flat_surface_min_area` | `0.1` | Minimum area used by flat-surface detection. |
 | `flat_surface_k` | `2.0` | Flat-surface candidate weighting parameter. |
 | `use_merging` | `False` | Run the optional post-decomposition merge pipeline. |
 | `return_parts` | `False` | Return clipped part surfaces instead of final convex-hull meshes when enabled. |
-
-Automatic settings are intended to be portable across mesh sizes and machines.
-Override them for controlled experiments or when sharing a GPU with other
-workloads.
 
 ### GPU resource lifetime
 
@@ -407,15 +436,24 @@ Automatic release serializes simultaneous top-level VisACD calls so resources
 cannot be destroyed under active work. Explicit release must be called from
 the thread that owns the retained resources.
 
-### Runtime and OptiX controls
+### Advanced scheduler, CUDA, and OptiX knobs
+
+These environment variables expose lower-level paths used for architecture
+experiments, profiling, and regressions. Leave them at their defaults unless a
+benchmark demonstrates a benefit on the deployment machine. Set allocator and
+execution-path variables before the first VisACD GPU call in the process.
 
 | Environment variable | Default | Purpose |
 |---|---|---|
 | `VISACD_OPTIX_BUILD_PREFERENCE` | `trace` | OptiX GAS flag: `trace`, `build`, or `none`. |
-| `VISACD_OPTIX_MAX_CONCURRENCY` | automatic | Positive cap on simultaneously active OptiX jobs. |
-| `VISACD_STAGE_TIMING` | disabled | Set to `1` to print accumulated native stage timings. |
-| `VISACD_WORK_STEALING` | topology-dependent | Set to `0` or `1` to disable or force CPU work stealing. |
-| `VISACD_ENABLE_GPU_HULL_TOPOLOGY` | disabled | Enable the exact experimental CUDA convex-hull topology path. |
+| `VISACD_OPTIX_MAX_CONCURRENCY` | memory-aware | Positive cap on simultaneously active OptiX jobs. Unset means no fixed count cap; `max_batch_size` and available VRAM still bound each wave. |
+| `VISACD_WORK_STEALING` | topology-dependent | `0` disables and `1` forces cross-queue CPU work stealing. Automatic mode enables it on a multi-NUMA-node topology and pins workers to the detected nodes. |
+| `VISACD_DISABLE_WORK_BUCKETING` | disabled | Set to `1` to preserve ready-queue order instead of grouping similarly sized work before GPU wave construction. Bucketing is normally beneficial for heterogeneous batches. |
+| `VISACD_DISABLE_DOUBLE_BUFFERING` | disabled | Set to `1` to use one lane per GPU work kind instead of allowing two lanes to overlap transfers and kernels when mixed work sizes make overlap worthwhile. OptiX intersections already use one lane. This can reduce peak scratch capacity at the cost of overlap. |
+| `VISACD_DISABLE_GPU_EDGE_PROJECTION` | disabled | Set to `1` to use the CPU fallback for inherited visibility-edge projection rather than the CUDA path when resident mesh data is available. |
+| `VISACD_ENABLE_GPU_HULL_TOPOLOGY` | disabled | Set to `1` to enable the exact experimental CUDA convex-hull topology path. |
+| `VISACD_DISABLE_GPU_HULL_TOPOLOGY` | disabled | Set to `1` to force the host hull-topology path even if the enable flag is present. |
+| `VISACD_DISABLE_ASYNC_ALLOCATOR` | disabled | Set to `1` before first GPU use to bypass VisACD's private CUDA memory pool and use direct allocation/free. This is primarily an allocator compatibility and lifecycle diagnostic. |
 
 The full GPU hull-topology implementation is disabled by default because it was
 neutral or slower end to end on the reference GPU when competing with the
@@ -435,18 +473,36 @@ end to end.
 | `VISACD_ENABLE_CUDA_PREPROCESS` | enabled | Batch surface voxelization for initial meshes, initial cages, and child cages. Set to `0` to select the OpenVDB reference path. Unsupported or over-budget waves fall back automatically. |
 | `VISACD_DISABLE_CUDA_PREPROCESS` | disabled | Set to `1` for an explicit CPU/OpenVDB preprocessing run. An explicitly set `VISACD_ENABLE_CUDA_PREPROCESS` takes precedence. |
 | `VISACD_VERIFY_CUDA_PREPROCESS` | disabled | Compute both complete CUDA-candidate and CPU-reference outputs, accept the candidate only on bit-exact equality, and otherwise use the reference. This intentionally disables packed scheduling. |
-| `VISACD_PREPROCESS_WAVE_SIZE` | `200` | Maximum surface-voxelization items per packed preprocessing wave; memory availability can reduce it. |
+| `VISACD_PREPROCESS_WAVE_SIZE` | `200` | Maximum surface-voxelization items per packed preprocessing wave when `max_batch_size` is `0`; memory availability can reduce it. Valid range: `[1, 200]`. A positive `max_batch_size` takes precedence and is itself capped at 200 for preprocessing. |
 | `VISACD_ENABLE_CUDA_PREPROCESS_SIGN` | disabled | Enable exact CUDA exterior tracing, surface cleanup, leaf sign propagation, internal-node flood, and root flood. |
 | `VISACD_ENABLE_CUDA_PREPROCESS_EXPAND` | disabled | Enable the exact sparse CUDA narrow-band expansion implementation. |
 | `VISACD_ENABLE_CUDA_PREPROCESS_EXPAND_DENSE` | disabled | Enable the exact dense CUDA narrow-band expansion implementation. |
 | `VISACD_ENABLE_CUDA_PREPROCESS_RENORMALIZE` | disabled | Enable exact CUDA renormalization and narrow-band trimming. |
 | `VISACD_ENABLE_CUDA_PREPROCESS_MESH` | disabled | Enable exact CUDA level-set meshing. |
 | `VISACD_ENABLE_CUDA_PREPROCESS_RESIDENT` | disabled | With dense expansion, renormalization, and meshing enabled, pass dense data directly between CUDA stages and retain meshed initial/cage geometry for downstream CUDA and OptiX reuse. |
+| `VISACD_VERIFY_CUDA_PREPROCESS_EXPAND` | disabled | Compare sparse CUDA narrow-band distances with the CPU implementation and replace a non-exact result with the CPU reference. |
+| `VISACD_PREPROCESS_EXPAND_DENSE_WAIT_US` | `250` | Dense-expansion queue coalescing window in microseconds, in `[0, 100000]`. A queued group launches immediately when it reaches 32 items; otherwise the worker waits this long before taking up to 200. |
 
-Stage-specific diagnostics are available through
-`VISACD_PREPROCESS_TRACE`, `VISACD_PREPROCESS_SIGN_TRACE`,
-`VISACD_PREPROCESS_EXPAND_TRACE`, `VISACD_PREPROCESS_RENORMALIZE_TRACE`,
-and `VISACD_PREPROCESS_MESH_TRACE`.
+`VISACD_ENABLE_CUDA_PREPROCESS_RESIDENT` only takes effect when dense expansion,
+renormalization, and CUDA meshing are all enabled. Feature and trace flags use
+the usual convention that unset, empty, or `0` is disabled and another
+non-empty value is enabled.
+
+### Diagnostics and validation knobs
+
+Diagnostics print to the console and can perturb timing, so disable them for
+reported throughput measurements.
+
+| Environment variable | Output or check |
+|---|---|
+| `VISACD_STAGE_TIMING` | Accumulated native stage calls, item counts, and elapsed times for one top-level batch. |
+| `VISACD_PREPROCESS_TRACE` | Per-call preprocessing topology, timings, hashes, and CUDA fallback reasons. |
+| `VISACD_PREPROCESS_SIGN_TRACE` | CUDA sign-stage timings and fallback reasons. |
+| `VISACD_PREPROCESS_EXPAND_TRACE` | Sparse/dense narrow-band expansion timings and fallback reasons. |
+| `VISACD_PREPROCESS_RENORMALIZE_TRACE` | Renormalization timings and fallback reasons. |
+| `VISACD_PREPROCESS_MESH_TRACE` | CUDA level-set meshing timings and fallback reasons. |
+| `VISACD_HULL_TOPOLOGY_DIAGNOSTICS` | Experimental CUDA hull-topology wave timings and fallback statistics. Enable by setting the variable; disable by unsetting it. |
+| `VISACD_CLIP_COMPACTION_DIAGNOSTICS` | Crossing-triangle compaction counts and device-to-host byte totals. Enable by setting the variable; disable by unsetting it. |
 
 For the currently recommended accelerated preprocessing path:
 
