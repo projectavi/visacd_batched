@@ -18,35 +18,69 @@ inline void check(cudaError_t result, const char *operation) {
   }
 }
 
-inline bool async_pool_available() {
-  static std::once_flag initialized;
-  static bool available = false;
-  std::call_once(initialized, []() {
+struct AsyncPoolState {
+  std::mutex mutex;
+  cudaMemPool_t pool = nullptr;
+  bool support_checked = false;
+  bool supported = false;
+};
+
+inline AsyncPoolState &async_pool_state() {
+  static AsyncPoolState state;
+  return state;
+}
+
+inline cudaMemPool_t async_pool() {
+  AsyncPoolState &state = async_pool_state();
+  std::lock_guard<std::mutex> lock(state.mutex);
+  if (state.pool)
+    return state.pool;
+  if (!state.support_checked) {
+    state.support_checked = true;
     const char *disabled = std::getenv("VISACD_DISABLE_ASYNC_ALLOCATOR");
     if (disabled && *disabled && std::string(disabled) != "0")
-      return;
+      return nullptr;
     int supported = 0;
     if (cudaDeviceGetAttribute(&supported, cudaDevAttrMemoryPoolsSupported,
                                0) != cudaSuccess ||
         !supported) {
       cudaGetLastError();
-      return;
+      return nullptr;
     }
-    cudaMemPool_t pool = nullptr;
-    if (cudaDeviceGetDefaultMemPool(&pool, 0) != cudaSuccess) {
-      cudaGetLastError();
-      return;
-    }
-    unsigned long long threshold =
-        std::numeric_limits<unsigned long long>::max();
-    if (cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold,
-                                &threshold) != cudaSuccess) {
-      cudaGetLastError();
-      return;
-    }
-    available = true;
-  });
-  return available;
+    state.supported = true;
+  }
+  if (!state.supported)
+    return nullptr;
+
+  cudaMemPoolProps properties{};
+  properties.allocType = cudaMemAllocationTypePinned;
+  properties.handleTypes = cudaMemHandleTypeNone;
+  properties.location.type = cudaMemLocationTypeDevice;
+  properties.location.id = 0;
+  if (cudaMemPoolCreate(&state.pool, &properties) != cudaSuccess) {
+    state.pool = nullptr;
+    cudaGetLastError();
+    return nullptr;
+  }
+  unsigned long long threshold =
+      std::numeric_limits<unsigned long long>::max();
+  if (cudaMemPoolSetAttribute(state.pool, cudaMemPoolAttrReleaseThreshold,
+                              &threshold) != cudaSuccess) {
+    cudaMemPoolDestroy(state.pool);
+    state.pool = nullptr;
+    cudaGetLastError();
+    return nullptr;
+  }
+  return state.pool;
+}
+
+inline void release_async_pool() {
+  AsyncPoolState &state = async_pool_state();
+  std::lock_guard<std::mutex> lock(state.mutex);
+  if (state.pool) {
+    check(cudaMemPoolDestroy(state.pool), "destroy VisACD CUDA memory pool");
+    state.pool = nullptr;
+  }
 }
 
 class DeviceBuffer {
@@ -68,9 +102,11 @@ public:
     if (bytes <= capacity_)
       return;
     void *replacement = nullptr;
-    const bool use_async = allocation_stream_ && async_pool_available();
+    cudaMemPool_t pool = allocation_stream_ ? async_pool() : nullptr;
+    const bool use_async = pool != nullptr;
     if (use_async)
-      check(cudaMallocAsync(&replacement, bytes, allocation_stream_),
+      check(cudaMallocFromPoolAsync(&replacement, bytes, pool,
+                                    allocation_stream_),
             operation);
     else
       check(cudaMalloc(&replacement, bytes), operation);
