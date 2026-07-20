@@ -97,7 +97,9 @@ PYBIND11_MODULE(visacd, m)
         .def_readwrite("batch_memory_fraction",
                        &neural_acd::Config::batch_memory_fraction)
         .def_readwrite("batch_cpu_threads",
-                       &neural_acd::Config::batch_cpu_threads);
+                       &neural_acd::Config::batch_cpu_threads)
+        .def_readwrite("retain_gpu_resources",
+                       &neural_acd::Config::retain_gpu_resources);
 
     m.def("make_vecarray3d", [](py::array_t<
                                      double, py::array::c_style |
@@ -386,5 +388,7 @@ PYBIND11_MODULE(visacd, m)
           py::call_guard<py::gil_scoped_release>());
     m.def("process_batch", &neural_acd::process_batch, py::arg("meshes"),
           py::arg("concavity"), py::arg("num_parts"),
+          py::call_guard<py::gil_scoped_release>());
+    m.def("release_gpu_resources", &neural_acd::release_gpu_resources,
           py::call_guard<py::gil_scoped_release>());
 }

@@ -9,6 +9,7 @@
 #include <condition_variable>
 #include <components_batch.hpp>
 #include <convex_hull_batch.hpp>
+#include <cuda_buffer.hpp>
 #include <core.hpp>
 #include <cstdint>
 #include <cstring>
@@ -27,6 +28,7 @@
 #include <memory>
 #include <merge_batch.hpp>
 #include <mutex>
+#include <shared_mutex>
 #include <optional>
 #include <plane_intersections.hpp>
 #include <postprocess.hpp>
@@ -1341,19 +1343,39 @@ struct PersistentBatchResources {
   }
 };
 
+unique_ptr<PersistentBatchResources> &persistent_batch_resource_storage() {
+  thread_local unique_ptr<PersistentBatchResources> resources;
+  return resources;
+}
+
 PersistentBatchResources &persistent_batch_resources() {
   // Runtime state is local to the calling thread so C++ callers can invoke
   // independent batches concurrently without sharing streams or scratch
   // buffers. Repeated calls on a thread retain executors, CUDA streams,
   // pinned buffers, and device allocation capacity.
-  thread_local PersistentBatchResources resources;
-  return resources;
+  auto &resources = persistent_batch_resource_storage();
+  if (!resources)
+    resources = make_unique<PersistentBatchResources>();
+  return *resources;
+}
+
+shared_mutex &gpu_resource_lifecycle_mutex() {
+  static shared_mutex mutex;
+  return mutex;
+}
+
+void release_gpu_resources_locked() {
+  // Destroy executors first so their worker-thread CUDA runtimes are gone
+  // before process-wide caches and the owned asynchronous pool.
+  persistent_batch_resource_storage().reset();
+  release_preprocess_cuda_resources();
+  cuda_memory::release_async_pool();
 }
 
 } // namespace
 
-vector<ProcessResult> process_batch(MeshList meshes, double concavity,
-                                    int num_parts) {
+vector<ProcessResult> process_batch_impl(MeshList meshes, double concavity,
+                                         int num_parts) {
   validate_parameters(meshes, concavity, num_parts);
   if (meshes.empty())
     return {};
@@ -2504,6 +2526,35 @@ vector<ProcessResult> process_batch(MeshList meshes, double concavity,
   profiler.report(chrono::steady_clock::now() - process_start,
                   states.size());
   return results;
+}
+
+vector<ProcessResult> process_batch(MeshList meshes, double concavity,
+                                    int num_parts) {
+  if (config.retain_gpu_resources) {
+    shared_lock<shared_mutex> lock(gpu_resource_lifecycle_mutex());
+    return process_batch_impl(move(meshes), concavity, num_parts);
+  }
+
+  unique_lock<shared_mutex> lock(gpu_resource_lifecycle_mutex());
+  vector<ProcessResult> results;
+  try {
+    results = process_batch_impl(move(meshes), concavity, num_parts);
+  } catch (...) {
+    try {
+      release_gpu_resources_locked();
+    } catch (...) {
+      // Preserve the decomposition failure. Explicit release reports cleanup
+      // failures to callers when there is no earlier exception.
+    }
+    throw;
+  }
+  release_gpu_resources_locked();
+  return results;
+}
+
+void release_gpu_resources() {
+  unique_lock<shared_mutex> lock(gpu_resource_lifecycle_mutex());
+  release_gpu_resources_locked();
 }
 
 } // namespace neural_acd
