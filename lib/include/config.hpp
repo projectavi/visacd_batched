@@ -17,6 +17,7 @@ public:
   int max_batch_size;           // 0 selects memory-aware automatic sizing
   double batch_memory_fraction; // fraction of currently free device memory
   int batch_cpu_threads;        // 0 scales with batch/hardware, capped at 200
+  bool retain_gpu_resources;   // retain reusable CUDA/OptiX state across calls
 
   Config() {
     return_parts = false;
@@ -30,6 +31,7 @@ public:
     max_batch_size = 0;
     batch_memory_fraction = 0.7;
     batch_cpu_threads = 0;
+    retain_gpu_resources = true;
   }
 };
 

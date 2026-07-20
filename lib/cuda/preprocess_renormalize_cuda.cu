@@ -1,6 +1,7 @@
 #include <cuda_buffer.hpp>
 #include <cuda_runtime.h>
 #include <preprocess_renormalize_cuda.hpp>
+#include <resettable_runtime.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -199,6 +200,8 @@ struct Runtime {
 
   ~Runtime() {
     if (stream)
+      cudaStreamSynchronize(stream);
+    if (stream)
       cudaStreamDestroy(stream);
   }
 
@@ -212,12 +215,18 @@ struct Runtime {
   }
 };
 
-Runtime &runtime() {
-  static Runtime state;
+ResettableRuntime<Runtime> &runtime_storage() {
+  static ResettableRuntime<Runtime> state;
   return state;
 }
 
+Runtime &runtime() {
+  return runtime_storage().get();
+}
+
 } // namespace
+
+void release_renormalize_cuda_runtime() { runtime_storage().reset(); }
 
 void renormalize_sparse_cuda(SparseRenormalizeGrid &grid) {
   std::vector<SparseRenormalizeGrid *> grids{&grid};

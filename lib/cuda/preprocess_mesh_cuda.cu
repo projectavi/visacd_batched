@@ -4,6 +4,7 @@
 #include <device_mesh.hpp>
 #include <preprocess_mesh_cuda.hpp>
 #include <preprocess_mesh_tables.hpp>
+#include <resettable_runtime.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -519,6 +520,8 @@ struct Runtime {
   PinnedBuffer host_totals;
 
   ~Runtime() {
+    if (stream)
+      cudaStreamSynchronize(stream);
     if (input_ready)
       cudaEventDestroy(input_ready);
     if (stream)
@@ -556,12 +559,18 @@ struct Runtime {
   }
 };
 
-Runtime &runtime() {
-  static Runtime state;
+ResettableRuntime<Runtime> &runtime_storage() {
+  static ResettableRuntime<Runtime> state;
   return state;
 }
 
+Runtime &runtime() {
+  return runtime_storage().get();
+}
+
 } // namespace
+
+void release_mesh_cuda_runtime() { runtime_storage().reset(); }
 
 void mesh_dense_volume_cuda(DenseVolumeMeshingGrid &grid) {
   std::vector<DenseVolumeMeshingGrid *> grids{&grid};

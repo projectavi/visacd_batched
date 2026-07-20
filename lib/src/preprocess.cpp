@@ -2286,4 +2286,13 @@ void manifold_preprocess(Mesh &m, double scale, double level_set,
     cerr << "preprocess_cuda_fallback reason=" << fallback_reason << '\n';
   manifold_preprocess_cpu_reference(m, scale, level_set, metrics);
 }
+
+void release_preprocess_cuda_resources() {
+  release_expand_cuda_runtime();
+  release_flood_cuda_runtime();
+  release_mesh_cuda_runtime();
+  release_renormalize_cuda_runtime();
+  release_surface_post_cuda_runtime();
+}
+
 } // namespace neural_acd

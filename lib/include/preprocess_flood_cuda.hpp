@@ -22,4 +22,6 @@ void flood_sparse_hierarchy_cuda(SparseHierarchyFloodGrid &grid);
 void flood_sparse_hierarchy_cuda_batch(
     const std::vector<SparseHierarchyFloodGrid *> &grids);
 
+void release_flood_cuda_runtime();
+
 } // namespace neural_acd

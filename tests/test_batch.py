@@ -1,3 +1,4 @@
+import ctypes
 import hashlib
 import os
 from pathlib import Path
@@ -23,6 +24,37 @@ CUDA_PREPROCESS_ENV = (
     "VISACD_ENABLE_CUDA_PREPROCESS_MESH",
     "VISACD_ENABLE_CUDA_PREPROCESS_RESIDENT",
 )
+
+
+def free_cuda_memory():
+    driver = ctypes.CDLL("libcuda.so.1")
+    driver.cuCtxGetCurrent.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+    driver.cuDevicePrimaryCtxRetain.argtypes = [
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_int,
+    ]
+    driver.cuCtxSetCurrent.argtypes = [ctypes.c_void_p]
+    driver.cuMemGetInfo_v2.argtypes = [
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
+    if driver.cuInit(0) != 0:
+        raise RuntimeError("cuInit failed")
+    context = ctypes.c_void_p()
+    if driver.cuCtxGetCurrent(ctypes.byref(context)) != 0:
+        raise RuntimeError("cuCtxGetCurrent failed")
+    if not context.value:
+        if driver.cuDevicePrimaryCtxRetain(ctypes.byref(context), 0) != 0:
+            raise RuntimeError("cuDevicePrimaryCtxRetain failed")
+        if driver.cuCtxSetCurrent(context) != 0:
+            raise RuntimeError("cuCtxSetCurrent failed")
+    if driver.cuCtxSynchronize() != 0:
+        raise RuntimeError("cuCtxSynchronize failed")
+    free = ctypes.c_size_t()
+    total = ctypes.c_size_t()
+    if driver.cuMemGetInfo_v2(ctypes.byref(free), ctypes.byref(total)) != 0:
+        raise RuntimeError("cuMemGetInfo_v2 failed")
+    return free.value
 
 
 def load_sample(name, x_offset=0.0):
@@ -142,6 +174,7 @@ class BatchGpuTests(unittest.TestCase):
             "max_batch_size": visacd.config.max_batch_size,
             "batch_memory_fraction": visacd.config.batch_memory_fraction,
             "batch_cpu_threads": visacd.config.batch_cpu_threads,
+            "retain_gpu_resources": visacd.config.retain_gpu_resources,
         }
         visacd.config.return_parts = False
         visacd.config.score_mode = "concavity"
@@ -149,6 +182,7 @@ class BatchGpuTests(unittest.TestCase):
         visacd.config.use_merging = False
         visacd.config.batch_memory_fraction = 0.7
         visacd.config.batch_cpu_threads = 0
+        visacd.config.retain_gpu_resources = True
 
     def tearDown(self):
         for name, value in self.saved_cuda_preprocess_env.items():
@@ -181,6 +215,50 @@ class BatchGpuTests(unittest.TestCase):
             [load_cow(-100.0), load_cow(100.0)],
             concavity=0.04,
             num_parts=2,
+        )
+
+    def test_gpu_resource_release_preserves_results(self):
+        visacd.config.retain_gpu_resources = True
+        retained = self.run_batch(max_batch_size=0)
+        retained_digest = result_digest(retained)
+
+        visacd.release_gpu_resources()
+        visacd.release_gpu_resources()
+
+        visacd.config.retain_gpu_resources = False
+        released = self.run_batch(max_batch_size=0)
+        self.assertEqual(retained_digest, result_digest(released))
+
+        # Automatic cleanup also runs when validation rejects a batch, and an
+        # explicit release remains safe afterward.
+        with self.assertRaisesRegex(ValueError, "num_parts"):
+            visacd.process_batch([], 0.04, 0)
+        visacd.release_gpu_resources()
+
+        visacd.config.retain_gpu_resources = True
+
+    def test_gpu_resource_release_recovers_vram(self):
+        visacd.release_gpu_resources()
+        baseline = free_cuda_memory()
+
+        visacd.config.retain_gpu_resources = True
+        retained_results = self.run_batch(max_batch_size=0)
+        retained = free_cuda_memory()
+        self.assertEqual(len(retained_results), 2)
+
+        visacd.release_gpu_resources()
+        released = free_cuda_memory()
+
+        mib = 1024 * 1024
+        self.assertGreater(
+            released - retained,
+            64 * mib,
+            "explicit release did not recover meaningful device memory",
+        )
+        self.assertLess(
+            abs(baseline - released),
+            256 * mib,
+            "released VRAM did not return near the initialized baseline",
         )
 
     def test_order_repeatability_and_forced_waves(self):

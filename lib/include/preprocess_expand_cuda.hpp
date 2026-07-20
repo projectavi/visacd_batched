@@ -83,4 +83,6 @@ void evaluate_narrowband_distances_cuda(
     const std::vector<NarrowbandCandidate> &candidates,
     std::vector<NarrowbandDistance> &distances);
 
+void release_expand_cuda_runtime();
+
 } // namespace neural_acd

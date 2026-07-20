@@ -1,6 +1,7 @@
 #include <cuda_buffer.hpp>
 #include <cuda_runtime.h>
 #include <preprocess_flood_cuda.hpp>
+#include <resettable_runtime.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -172,6 +173,8 @@ struct Runtime {
 
   ~Runtime() {
     if (stream)
+      cudaStreamSynchronize(stream);
+    if (stream)
       cudaStreamDestroy(stream);
   }
 
@@ -185,12 +188,18 @@ struct Runtime {
   }
 };
 
-Runtime &runtime() {
-  static Runtime state;
+ResettableRuntime<Runtime> &runtime_storage() {
+  static ResettableRuntime<Runtime> state;
   return state;
 }
 
+Runtime &runtime() {
+  return runtime_storage().get();
+}
+
 } // namespace
+
+void release_flood_cuda_runtime() { runtime_storage().reset(); }
 
 void flood_sparse_hierarchy_cuda(SparseHierarchyFloodGrid &grid) {
   std::vector<SparseHierarchyFloodGrid *> grids{&grid};

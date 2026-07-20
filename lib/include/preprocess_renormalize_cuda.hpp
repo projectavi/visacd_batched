@@ -20,4 +20,6 @@ void renormalize_sparse_cuda(SparseRenormalizeGrid &grid);
 void renormalize_sparse_cuda_batch(
     const std::vector<SparseRenormalizeGrid *> &grids);
 
+void release_renormalize_cuda_runtime();
+
 } // namespace neural_acd

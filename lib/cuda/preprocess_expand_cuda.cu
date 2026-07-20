@@ -2,6 +2,7 @@
 #include <cuda_runtime.h>
 #include <preprocess_expand_cuda.hpp>
 #include <preprocess_mesh_cuda.hpp>
+#include <resettable_runtime.hpp>
 
 #include <algorithm>
 #include <cfloat>
@@ -588,6 +589,8 @@ struct Runtime {
 
   ~Runtime() {
     if (stream)
+      cudaStreamSynchronize(stream);
+    if (stream)
       cudaStreamDestroy(stream);
   }
 
@@ -601,12 +604,18 @@ struct Runtime {
   }
 };
 
+ResettableRuntime<Runtime> &runtime_storage() {
+  static ResettableRuntime<Runtime> state;
+  return state;
+}
+
 Runtime &runtime() {
-  static Runtime instance;
-  return instance;
+  return runtime_storage().get();
 }
 
 } // namespace
+
+void release_expand_cuda_runtime() { runtime_storage().reset(); }
 
 void evaluate_narrowband_distances_cuda(
     const Mesh &mesh, double scale, double voxel_size,
