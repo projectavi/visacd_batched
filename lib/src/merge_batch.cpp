@@ -438,11 +438,11 @@ void merge_convex_hulls_batch(
         PairCandidate candidate;
         candidate.state_index = state_index;
         candidate.first = first;
+        candidate.second = second;
+        candidate.matrix_index = packed_pair_index(first, second);
         candidate.bypass_proximity =
             states[state_index].input.target_part_count > 0 &&
             states[state_index].adjacency_matrix[candidate.matrix_index] != 0;
-        candidate.second = second;
-        candidate.matrix_index = packed_pair_index(first, second);
         initial_candidates.push_back(std::move(candidate));
       }
     }
