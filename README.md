@@ -122,8 +122,9 @@ installed:
 export CUDACXX=/path/to/cuda/bin/nvcc
 ```
 
-For GPU or build environments where automatic PTX architecture detection is
-ambiguous, set the compute capability without a decimal point:
+For GPU or build environments where automatic architecture detection is
+ambiguous, set the compute capability without a decimal point. This one value
+selects both the linked CUDA objects and the OptiX PTX target:
 
 ```bash
 # RTX 5090 / compute capability 12.0
@@ -151,20 +152,24 @@ conda install -c nvidia cuda-nvcc=12.8
 ```
 
 After installing or changing the Conda CUDA package, reactivate the environment
-so its compiler hooks are regenerated. Clear hook variables first so values
-from another CUDA installation cannot survive the switch:
+so its compiler hooks are regenerated. Clear inherited NVCC and architecture
+variables after activation; activation hooks may recreate them:
 
 ```bash
 conda deactivate
+conda activate visacd
+
 unset NVCC_PREPEND_FLAGS NVCC_PREPEND_FLAGS_BACKUP
 unset NVCC_APPEND_FLAGS NVCC_APPEND_FLAGS_BACKUP
-conda activate visacd
+unset CUDAARCHS CMAKE_CUDA_ARCHITECTURES
 ```
 
-Select the Conda `nvcc` explicitly and verify that it reports CUDA 12.8:
+Select the Conda CUDA and host compilers explicitly, then verify that `nvcc`
+reports CUDA 12.8:
 
 ```bash
 export CUDACXX="$CONDA_PREFIX/bin/nvcc"
+export CUDAHOSTCXX="$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-c++"
 nvcc --version
 ```
 
@@ -175,8 +180,10 @@ root. Point CMake at that exact directory:
 export OptiX_INSTALL_DIR="$PWD/NVIDIA-OptiX-SDK-8.0.0-linux64-x86_64"
 ```
 
-The workstation has two GPUs. Set the PTX target explicitly so CMake does not
-turn the multiple `nvidia-smi` result lines into an invalid architecture:
+Set the compute capability explicitly. `PTX_COMPUTE` is consumed before
+CMake's CUDA compiler probe, so it selects both
+`CMAKE_CUDA_ARCHITECTURES=120` and the OptiX `sm_120` PTX target instead of
+relying on environment-sensitive `native` detection:
 
 ```bash
 export PTX_COMPUTE=120
@@ -874,11 +881,14 @@ reported zero errors or hazards on the reference build.
 Set `CUDACXX`, delete the generated `build/` directory, and reinstall.
 Confirm the selected compiler with `nvcc --version`.
 
-### PTX compilation receives an invalid architecture
+### CUDA or PTX compilation receives an invalid architecture
 
-Set `PTX_COMPUTE` explicitly, especially on hosts with multiple GPU compute
-capabilities. Use values such as `75`, `89`, or `120`, without `sm_` or
-a decimal point.
+Set `PTX_COMPUTE` explicitly before deleting `build/` and reinstalling.
+The value controls both regular CUDA compilation and OptiX PTX. Use a single
+numeric value such as `75`, `89`, or `120`, without `sm_` or a decimal
+point. If Conda activation injected stale architecture flags, clear
+`NVCC_PREPEND_FLAGS`, `NVCC_APPEND_FLAGS`, `CUDAARCHS`, and
+`CMAKE_CUDA_ARCHITECTURES` after activating the build environment.
 
 ### A large batch runs out of device memory
 
