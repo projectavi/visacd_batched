@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
 #include <iostream>
 #include <random>
 #include <stdexcept>
@@ -42,6 +43,9 @@ public:
   std::vector<std::array<int, 3>> triangles;
   std::vector<Vec3D> cut_verts;
   std::vector<bool> is_new;
+  // Signed split-interface token per triangle. Opposite signs identify the
+  // two sides of the same generated cut face; zero is not an interface.
+  std::vector<int64_t> triangle_interfaces;
   std::vector<std::pair<unsigned int,unsigned int>> intersecting_edges;
   Mesh();
   void compute_ch(Mesh &convex, bool fix_normals = false) const;

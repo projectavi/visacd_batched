@@ -1824,13 +1824,17 @@ vector<ProcessResult> process_batch_impl(MeshList meshes, double concavity,
           int *first_map = nullptr;
           int *second_map = nullptr;
           MeshList new_parts;
+          const uint32_t split_sequence =
+              config.part_limit_policy == "adjacent_merge"
+                  ? static_cast<uint32_t>(state.iteration + 1)
+                  : 0;
           if (split->prepared_clip.empty()) {
             new_parts = clip(split->part, split->selected_plane, first_map,
-                             second_map);
+                             second_map, split_sequence);
           } else {
             new_parts = clip_prepared(
                 split->part, split->selected_plane, first_map, second_map,
-                split->prepared_clip);
+                split->prepared_clip, split_sequence);
           }
           if (new_parts.size() < 2) {
             delete[] first_map;

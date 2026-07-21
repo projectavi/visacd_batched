@@ -242,6 +242,7 @@ void Mesh::extract_point_set(vector<Vec3D> &samples,
 void Mesh::clear() {
   vertices.clear();
   triangles.clear();
+  triangle_interfaces.clear();
 }
 
 Mesh Mesh::copy() {
@@ -250,6 +251,7 @@ Mesh Mesh::copy() {
   new_mesh.vertices = vertices;
   new_mesh.triangles = triangles;
   new_mesh.cut_verts = cut_verts;
+  new_mesh.triangle_interfaces = triangle_interfaces;
   return new_mesh;
 }
 

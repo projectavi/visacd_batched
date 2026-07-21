@@ -8,10 +8,12 @@
 
 namespace neural_acd {
 
-MeshList clip(const Mesh &mesh, Plane plane, int *&pos_proj, int *&neg_proj);
+MeshList clip(const Mesh &mesh, Plane plane, int *&pos_proj, int *&neg_proj,
+              uint32_t split_sequence = 0);
 MeshList clip_prepared(const Mesh &mesh, Plane plane, int *&pos_proj,
                        int *&neg_proj,
-                       const std::vector<ClipTriangleData> &prepared);
+                       const std::vector<ClipTriangleData> &prepared,
+                       uint32_t split_sequence = 0);
 MeshList multiclip(const Mesh mesh, const std::vector<Plane> &planes);
 
 inline bool same_point_detect(Vec3D p0, Vec3D p1, float eps = 1e-5) {
