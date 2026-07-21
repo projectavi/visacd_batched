@@ -294,10 +294,12 @@ properties remain available for compatibility.
 
 Decomposes every non-empty triangle mesh in one coordinated call. `concavity`
 must be finite and non-negative. In concavity scoring mode it is the early-stop
-threshold. `num_parts` must be at least one and controls the split-iteration
+threshold. `num_parts` must be at least one. With the default
+`config.part_limit_policy = "split_budget"`, it controls the split-iteration
 budget; connected-component separation and optional merging mean that the
-final count is not always a strict copy of the requested value. An empty input
-batch returns an empty result list.
+final count is not always a strict copy of the requested value. Set
+`part_limit_policy = "adjacent_merge"` when `num_parts` must be a strict
+upper bound. An empty input batch returns an empty result list.
 
 ### `process(mesh, concavity, num_parts)`
 
@@ -393,8 +395,40 @@ returned-output behavior rather than scheduling.
 | `use_flat_surfaces` | `True` | Include detected flat support surfaces in plane selection. |
 | `flat_surface_min_area` | `0.1` | Minimum area used by flat-surface detection. |
 | `flat_surface_k` | `2.0` | Flat-surface candidate weighting parameter. |
-| `use_merging` | `False` | Run the optional post-decomposition merge pipeline. |
+| `use_merging` | `False` | Run the optional threshold-based post-decomposition merge pipeline. With `part_limit_policy="adjacent_merge"`, strict adjacent merges run first and this pipeline may then reduce the count further. |
+| `part_limit_policy` | `"split_budget"` | `"split_budget"` preserves legacy split-budget behavior. `"adjacent_merge"` guarantees `result.num_parts <= num_parts` using deterministic split-provenance-adjacent merges. |
 | `return_parts` | `False` | Return clipped part surfaces instead of final convex-hull meshes when enabled. |
+
+### Strict part limits
+
+The default `"split_budget"` policy is backward compatible: `num_parts - 1`
+split attempts are allowed, and one split can produce more than two connected
+components. Choose strict limiting explicitly when downstream systems require a
+hard maximum:
+
+```python
+visacd.config.part_limit_policy = "adjacent_merge"
+visacd.set_seed(42)
+results = visacd.process_batch(meshes, concavity=0.04, num_parts=32)
+assert all(result.num_parts <= 32 for result in results)
+```
+
+Strict mode records a signed provenance token for every generated cut-face
+triangle and propagates those tokens through later clipping and connected-
+component compaction. If the split budget produces too many parts, merge costs
+are evaluated in GPU batches and the deterministic lowest-concavity-cost pair
+is selected repeatedly. A forced pair is eligible only when its members carry
+opposite sides of the same split interface; spatial proximity alone never makes
+two parts eligible.
+
+No part is discarded. Convex-hull output receives the hull of the merged
+geometry, while `return_parts=True` concatenates the complete clipped source
+surfaces. Final concavity is measured again after limiting. Initially
+disconnected components are never silently joined: if their count already
+exceeds `num_parts`, the call raises an `Adjacent part limit is infeasible`
+`ValueError`. When `use_merging=True`, strict adjacent limiting runs first;
+the existing threshold-based optional merger can then reduce the result below
+the requested maximum.
 
 ### GPU resource lifetime
 
@@ -581,6 +615,27 @@ Threadripper PRO 9955WX with 32 hardware threads.
 | Identical `cow.obj` meshes | 57.8767 s | 3.5276 s | 56.70 meshes/s | 16.4x |
 | Deterministic smooth cow variants | 90.5219 s | 3.5522 s | 56.30 meshes/s | 25.5x |
 | Distinct Thingi10K sample | 130.3480 s | 10.1113 s | 19.78 meshes/s | 12.9x |
+
+### Strict-limit overhead
+
+This is a policy-cost measurement within the final batch engine, not a
+comparison with an earlier batched revision. On the reference RTX 5090, a batch
+of 32 identical `cow.obj` meshes used `score_mode="edge"`,
+`concavity=0.2`, `num_parts=4`, `use_merging=False`, automatic waves and
+threads, and retained GPU resources. Input conversion was outside the timed
+region. Seven warm measurements alternated policy order.
+
+| Final batch policy | Median batch time | Throughput | Output parts per mesh |
+|---|---:|---:|---:|
+| `"split_budget"` | 0.8403 s | 38.08 meshes/s | 6--7 |
+| `"adjacent_merge"` | 1.9647 s | 16.29 meshes/s | exactly 4 |
+
+For this deliberately over-limit workload, enforcing the guarantee added
+1.1244 s per 32-mesh batch (133.8%). The cost includes batched adjacent-pair
+concavity scoring, two or three forced merges per mesh, resident-mesh updates,
+and final concavity measurement. If decomposition already produces at most
+`num_parts`, strict mode skips the merge phase; its remaining cost is only
+provenance bookkeeping.
 
 The smooth-variant workload contains 200 unique geometry hashes with a 1.02%
 median RMS vertex warp. The heterogeneous Thingi10K sample spans 11 categories
