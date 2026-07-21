@@ -386,6 +386,93 @@ visacd.config.retain_gpu_resources = False
 results = visacd.process_batch(meshes, concavity=0.04, num_parts=32)
 ```
 
+### Dedicated worker configuration overrides
+
+Because `visacd.config` is process-global, a long-lived spawned worker should
+capture the untouched module defaults once and restore them before every job.
+Apply backend defaults next, caller overrides after that, and mandatory
+shared-GPU policies last. Assignments made before the restore loop are
+overwritten and therefore have no effect.
+
+```python
+# Module scope in the dedicated spawned worker.
+_VISACD_CONFIG_DEFAULTS = None
+
+configurable_names = (
+    "return_parts",
+    "score_mode",
+    "flat_surface_min_area",
+    "use_flat_surfaces",
+    "flat_surface_k",
+    "use_merging",
+    "part_limit_policy",
+    "batch_cpu_threads",
+    "max_batch_size",
+    "batch_memory_fraction",
+    "batch_logging",
+)
+
+# At the beginning of each decomposition job:
+if _VISACD_CONFIG_DEFAULTS is None:
+    # Capture pristine module defaults before changing any setting.
+    _VISACD_CONFIG_DEFAULTS = {
+        name: getattr(visacd.config, name)
+        for name in configurable_names
+    }
+
+# Remove configuration state left by the previous job.
+for name, value in _VISACD_CONFIG_DEFAULTS.items():
+    setattr(visacd.config, name, value)
+
+# Backend defaults. Explicit config_overrides intentionally win over these.
+backend_config = {
+    "return_parts": False,
+    "score_mode": score_mode,
+    "use_merging": use_merging,
+    "part_limit_policy": "adjacent_merge",
+    "batch_cpu_threads": 0,
+    "max_batch_size": 0,
+    "batch_memory_fraction": 0.7,
+    "batch_logging": False,
+}
+
+unknown_names = set(config_overrides).difference(configurable_names)
+if unknown_names:
+    raise ValueError(
+        "Unsupported VisACD configuration option(s): "
+        + ", ".join(sorted(unknown_names))
+    )
+
+backend_config.update(config_overrides)
+for name, value in backend_config.items():
+    setattr(visacd.config, name, value)
+
+# Mandatory for a phase-shared GPU. Keep this after caller overrides.
+visacd.config.retain_gpu_resources = False
+
+vis_meshes = [
+    visacd.Mesh(
+        np.ascontiguousarray(vertices, dtype=np.float64),
+        np.ascontiguousarray(faces, dtype=np.int32),
+    )
+    for vertices, faces in meshes
+]
+visacd.set_seed(seed)
+results = visacd.process_batch(
+    vis_meshes,
+    concavity=concavity,
+    num_parts=target_parts,
+)
+```
+
+In this pattern, callers may override both `part_limit_policy` and
+`batch_logging` through `config_overrides`. The final
+`retain_gpu_resources = False` assignment is deliberately not configurable:
+it guarantees that reusable VisACD allocations are released before simulation
+or RL resumes. If retention should instead be caller-controlled, add it to
+`configurable_names` and `backend_config`, and remove the final mandatory
+assignment.
+
 ### Algorithm and result knobs
 
 These settings also apply to the batch engine, but change decomposition or
