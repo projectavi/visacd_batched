@@ -239,6 +239,8 @@ MeshList assemble_disjoint_parts(Mesh &part, const vector<int> &labels) {
       }
       new_indices[k] = remap[global_v];
     }
+    if (!part.triangle_interfaces.empty())
+      current_part.triangle_interfaces.push_back(part.triangle_interfaces[i]);
     current_part.triangles.push_back(new_indices);
   }
 

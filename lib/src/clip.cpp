@@ -3,6 +3,7 @@
 #include "core.hpp"
 #include <CDT.h>
 #include <CDTUtils.h>
+#include <config.hpp>
 #include <cost.hpp>
 #include <deque>
 #include <fstream>
@@ -162,7 +163,8 @@ short Triangulation(vector<Vec3D> &border, vector<pair<int, int>> border_edges,
         [](const pair<int, int> &p) { return (int)p.second - 1; });
     cdt.eraseOuterTrianglesAndHoles();
   } catch (const runtime_error &e) {
-    cout << e.what() << endl;
+    if (config.batch_logging)
+      cout << e.what() << endl;
     return 2;
   }
 
@@ -191,9 +193,17 @@ namespace {
 
 MeshList clip_impl(const Mesh &mesh, Plane plane, int *&pos_proj,
                    int *&neg_proj,
-                   const vector<ClipTriangleData> *prepared) {
+                   const vector<ClipTriangleData> *prepared,
+                   uint32_t split_sequence) {
   if (prepared && prepared->size() != mesh.triangles.size())
     throw invalid_argument("Prepared clip data does not match the mesh");
+  if (!mesh.triangle_interfaces.empty() &&
+      mesh.triangle_interfaces.size() != mesh.triangles.size()) {
+    throw invalid_argument(
+        "Triangle interface metadata does not match the mesh");
+  }
+  const bool track_interfaces =
+      split_sequence != 0 || !mesh.triangle_interfaces.empty();
   Mesh pos, neg;
   vector<Vec3D> border;
   vector<Vec3D> overlap;
@@ -216,6 +226,11 @@ MeshList clip_impl(const Mesh &mesh, Plane plane, int *&pos_proj,
     int id0, id1, id2;
     id0 = mesh.triangles[i][0];
     id1 = mesh.triangles[i][1];
+    const size_t pos_triangle_begin = pos.triangles.size();
+    const size_t neg_triangle_begin = neg.triangles.size();
+    const int64_t source_interface =
+        mesh.triangle_interfaces.empty() ? 0
+                                         : mesh.triangle_interfaces[i];
     id2 = mesh.triangles[i][2];
     Vec3D p0, p1, p2;
     p0 = mesh.vertices[id0];
@@ -622,6 +637,14 @@ MeshList clip_impl(const Mesh &mesh, Plane plane, int *&pos_proj,
       //      << neg.triangles[neg.triangles.size() - 1][1] << " "
       //      << neg.triangles[neg.triangles.size() - 1][2] << endl;
     }
+    if (track_interfaces) {
+      pos.triangle_interfaces.insert(
+          pos.triangle_interfaces.end(),
+          pos.triangles.size() - pos_triangle_begin, source_interface);
+      neg.triangle_interfaces.insert(
+          neg.triangle_interfaces.end(),
+          neg.triangles.size() - neg_triangle_begin, source_interface);
+    }
   }
 
   std::set<std::pair<int, int>> unique_edges;
@@ -750,12 +773,23 @@ MeshList clip_impl(const Mesh &mesh, Plane plane, int *&pos_proj,
   }
 
   for (int i = 0; i < (int)final_triangles.size(); i++) {
+    const uint64_t raw_interface =
+        (static_cast<uint64_t>(split_sequence) << 32) |
+        (static_cast<uint64_t>(i) + 1);
+    if (raw_interface >
+        static_cast<uint64_t>(numeric_limits<int64_t>::max())) {
+      throw overflow_error("Split interface identifier overflow");
+    }
     pos.triangles.push_back({pos_N + final_triangles[i][0],
                              pos_N + final_triangles[i][1],
                              pos_N + final_triangles[i][2]});
     neg.triangles.push_back({neg_N + final_triangles[i][2],
                              neg_N + final_triangles[i][1],
                              neg_N + final_triangles[i][0]});
+    if (track_interfaces) {
+      pos.triangle_interfaces.push_back(static_cast<int64_t>(raw_interface));
+      neg.triangle_interfaces.push_back(-static_cast<int64_t>(raw_interface));
+    }
   }
 
   MeshList mesh_list;
@@ -768,14 +802,17 @@ MeshList clip_impl(const Mesh &mesh, Plane plane, int *&pos_proj,
 
 } // namespace
 
-MeshList clip(const Mesh &mesh, Plane plane, int *&pos_proj, int *&neg_proj) {
-  return clip_impl(mesh, plane, pos_proj, neg_proj, nullptr);
+MeshList clip(const Mesh &mesh, Plane plane, int *&pos_proj, int *&neg_proj,
+              uint32_t split_sequence) {
+  return clip_impl(mesh, plane, pos_proj, neg_proj, nullptr, split_sequence);
 }
 
 MeshList clip_prepared(const Mesh &mesh, Plane plane, int *&pos_proj,
                        int *&neg_proj,
-                       const vector<ClipTriangleData> &prepared) {
-  return clip_impl(mesh, plane, pos_proj, neg_proj, &prepared);
+                       const vector<ClipTriangleData> &prepared,
+                       uint32_t split_sequence) {
+  return clip_impl(mesh, plane, pos_proj, neg_proj, &prepared,
+                   split_sequence);
 }
 
 MeshList multiclip(const Mesh mesh, const vector<Plane> &planes) {

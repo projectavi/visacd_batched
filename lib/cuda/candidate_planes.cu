@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <candidate_planes.hpp>
 #include <cmath>
+#include <config.hpp>
 #include <cstdio>
 #include <cstdlib>
 #include <cub/cub.cuh>
@@ -1412,7 +1413,8 @@ void run_split_wave(const std::vector<SplitPlaneInput> &inputs, size_t begin,
     throw std::runtime_error(
         "Fused split kernel returned an invalid compact clip count");
   }
-  if (std::getenv("VISACD_CLIP_COMPACTION_DIAGNOSTICS")) {
+  if (config.batch_logging &&
+      std::getenv("VISACD_CLIP_COMPACTION_DIAGNOSTICS")) {
     const size_t previous_bytes =
         clip_triangle_count * sizeof(ClipTriangleData);
     const size_t compact_bytes =

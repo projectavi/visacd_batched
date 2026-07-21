@@ -1,6 +1,7 @@
 #include "core.hpp"
 #include <QuickHull.hpp>
 #include <algorithm>
+#include <config.hpp>
 #include <boost/random/sobol.hpp>
 #include <boost/random/uniform_01.hpp>
 #include <boost/random/variate_generator.hpp>
@@ -99,7 +100,8 @@ void Mesh::compute_ch(Mesh &convex, bool fix_normals) const {
   } catch (const std::exception &e) {
     // fallback: stable but slow algorithm
     save_obj("debug_input.obj");
-    cout<<"Qhull failed, falling back to BulletConvexHullComputer"<<endl;
+    if (config.batch_logging)
+      cout<<"Qhull failed, falling back to BulletConvexHullComputer"<<endl;
     // cout<<"Qhull failed: "<<e.what()<<", falling back to BulletConvexHullComputer"<<endl;
     compute_vch(convex, fix_normals);
   }
@@ -242,6 +244,7 @@ void Mesh::extract_point_set(vector<Vec3D> &samples,
 void Mesh::clear() {
   vertices.clear();
   triangles.clear();
+  triangle_interfaces.clear();
 }
 
 Mesh Mesh::copy() {
@@ -250,6 +253,7 @@ Mesh Mesh::copy() {
   new_mesh.vertices = vertices;
   new_mesh.triangles = triangles;
   new_mesh.cut_verts = cut_verts;
+  new_mesh.triangle_interfaces = triangle_interfaces;
   return new_mesh;
 }
 
@@ -465,6 +469,8 @@ void extract_point_set(Mesh &convex1, Mesh &convex2, vector<Vec3D> &samples,
 }
 
 void LoadingBar::step() {
+  if (!config.batch_logging)
+    return;
   string bar;
   bar += "\r" + message + " [";
   int pos = (current_step * bar_length) / total_steps;
@@ -481,6 +487,8 @@ void LoadingBar::step() {
 }
 
 void LoadingBar::finish() {
+  if (!config.batch_logging)
+    return;
   cout << "\r" + message + " [";
   for (int i = 0; i < bar_length; ++i) {
     if (i < bar_length)

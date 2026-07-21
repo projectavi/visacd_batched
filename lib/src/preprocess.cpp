@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <config.hpp>
 #include <core.hpp>
 #include <cstdio>
 #include <cstdlib>
@@ -46,6 +47,10 @@ long long elapsed_ns(PreprocessClock::time_point start) {
 bool environment_enabled(const char *name) {
   const char *value = std::getenv(name);
   return value != nullptr && value[0] != '\0' && string(value) != "0";
+}
+
+bool diagnostic_enabled(const char *name) {
+  return config.batch_logging && environment_enabled(name);
 }
 
 unsigned int dense_narrowband_wait_microseconds() {
@@ -390,7 +395,7 @@ public:
           inputs.push_back(pending->input);
           candidate_count += pending->input.candidates->size();
         }
-        if (environment_enabled("VISACD_PREPROCESS_EXPAND_TRACE")) {
+        if (diagnostic_enabled("VISACD_PREPROCESS_EXPAND_TRACE")) {
           cerr << "[visacd expand] meshes=" << batch.size()
                << " candidates=" << candidate_count << '\n';
         }
@@ -485,7 +490,7 @@ public:
           inputs.push_back(pending->input);
           cell_count += pending->input.grid->active.size();
         }
-        if (environment_enabled("VISACD_PREPROCESS_EXPAND_TRACE")) {
+        if (diagnostic_enabled("VISACD_PREPROCESS_EXPAND_TRACE")) {
           cerr << "[visacd expand dense] meshes=" << batch.size()
                << " cells=" << cell_count << '\n';
         }
@@ -578,7 +583,7 @@ public:
           leaf_count += pending->grid->active.size() /
                         NarrowbandLeaf::SIZE;
         }
-        if (environment_enabled(
+        if (diagnostic_enabled(
                 "VISACD_PREPROCESS_RENORMALIZE_TRACE")) {
           cerr << "[visacd renormalize] meshes=" << batch.size()
                << " leaves=" << leaf_count << '\n';
@@ -750,7 +755,7 @@ public:
           leaf_count += pending->grid->active.size() /
                         NarrowbandLeaf::SIZE;
         }
-        if (environment_enabled("VISACD_PREPROCESS_SIGN_TRACE")) {
+        if (diagnostic_enabled("VISACD_PREPROCESS_SIGN_TRACE")) {
           cerr << "[visacd surface post] meshes=" << batch.size()
                << " leaves=" << leaf_count << '\n';
         }
@@ -844,7 +849,7 @@ public:
           node_count +=
               pending->grid->upper_child_indices.size() / 32768;
         }
-        if (environment_enabled("VISACD_PREPROCESS_SIGN_TRACE")) {
+        if (diagnostic_enabled("VISACD_PREPROCESS_SIGN_TRACE")) {
           cerr << "[visacd hierarchy flood] meshes=" << batch.size()
                << " nodes=" << node_count << '\n';
         }
@@ -1491,12 +1496,12 @@ DoubleGrid::Ptr signed_distance_field_from_surface(
           distance_tree, index_tree, nodes, source_mesh, scale,
           voxel_size, exterior_width, interior_width);
     } catch (const exception &error) {
-      if (environment_enabled("VISACD_PREPROCESS_SIGN_TRACE"))
+      if (diagnostic_enabled("VISACD_PREPROCESS_SIGN_TRACE"))
         cerr << "[visacd surface post] fallback=" << error.what()
              << '\n';
       cuda_surface_postprocessed = false;
     } catch (...) {
-      if (environment_enabled("VISACD_PREPROCESS_SIGN_TRACE"))
+      if (diagnostic_enabled("VISACD_PREPROCESS_SIGN_TRACE"))
         cerr << "[visacd surface post] fallback=unknown exception\n";
       cuda_surface_postprocessed = false;
     }
@@ -1565,12 +1570,12 @@ DoubleGrid::Ptr signed_distance_field_from_surface(
       cuda_hierarchy_flooded = flood_sparse_tree_hierarchy_cuda(
           distance_tree, nodes, exterior_width, -interior_width);
     } catch (const exception &error) {
-      if (environment_enabled("VISACD_PREPROCESS_SIGN_TRACE"))
+      if (diagnostic_enabled("VISACD_PREPROCESS_SIGN_TRACE"))
         cerr << "[visacd hierarchy flood] fallback=" << error.what()
              << '\n';
       cuda_hierarchy_flooded = false;
     } catch (...) {
-      if (environment_enabled("VISACD_PREPROCESS_SIGN_TRACE"))
+      if (diagnostic_enabled("VISACD_PREPROCESS_SIGN_TRACE"))
         cerr << "[visacd hierarchy flood] fallback=unknown exception\n";
       cuda_hierarchy_flooded = false;
     }
@@ -1635,12 +1640,12 @@ DoubleGrid::Ptr signed_distance_field_from_surface(
           return distance_grid;
         }
       } catch (const exception &error) {
-        if (environment_enabled("VISACD_PREPROCESS_EXPAND_TRACE"))
+        if (diagnostic_enabled("VISACD_PREPROCESS_EXPAND_TRACE"))
           cerr << "[visacd expand dense] fallback=" << error.what()
                << '\n';
         dense_expanded = false;
       } catch (...) {
-        if (environment_enabled("VISACD_PREPROCESS_EXPAND_TRACE"))
+        if (diagnostic_enabled("VISACD_PREPROCESS_EXPAND_TRACE"))
           cerr << "[visacd expand dense] fallback=unknown exception\n";
         dense_expanded = false;
       }
@@ -1698,14 +1703,14 @@ DoubleGrid::Ptr signed_distance_field_from_surface(
           distance_tree, nodes, voxel_size, exterior_width,
           interior_width, trim_narrow_band);
     } catch (const exception &error) {
-      if (environment_enabled(
+      if (diagnostic_enabled(
               "VISACD_PREPROCESS_RENORMALIZE_TRACE")) {
         cerr << "[visacd renormalize] fallback=" << error.what()
              << '\n';
       }
       cuda_renormalized = false;
     } catch (...) {
-      if (environment_enabled(
+      if (diagnostic_enabled(
               "VISACD_PREPROCESS_RENORMALIZE_TRACE")) {
         cerr << "[visacd renormalize] fallback=unknown exception\n";
       }
@@ -1816,7 +1821,7 @@ public:
           grids.push_back(pending->grid);
           cell_count += pending->grid->active.size();
         }
-        if (environment_enabled("VISACD_PREPROCESS_MESH_TRACE")) {
+        if (diagnostic_enabled("VISACD_PREPROCESS_MESH_TRACE")) {
           cerr << "[visacd volume mesh] meshes=" << batch.size()
                << " cells=" << cell_count << '\n';
         }
@@ -2137,12 +2142,12 @@ bool sdf_manifold(Mesh &input, Mesh &output, double scale, double level_set,
       cuda_meshed = volume_to_mesh_cuda(
           *sgrid, level_set * scale, newPoints, newQuads);
     } catch (const exception &error) {
-      if (environment_enabled("VISACD_PREPROCESS_MESH_TRACE"))
+      if (diagnostic_enabled("VISACD_PREPROCESS_MESH_TRACE"))
         cerr << "[visacd volume mesh] fallback=" << error.what()
              << '\n';
       cuda_meshed = false;
     } catch (...) {
-      if (environment_enabled("VISACD_PREPROCESS_MESH_TRACE"))
+      if (diagnostic_enabled("VISACD_PREPROCESS_MESH_TRACE"))
         cerr << "[visacd volume mesh] fallback=unknown exception\n";
       cuda_meshed = false;
     }
@@ -2259,14 +2264,14 @@ void manifold_preprocess(Mesh &m, double scale, double level_set,
           *metrics = candidate_metrics;
         return;
       }
-      if (environment_enabled("VISACD_PREPROCESS_TRACE"))
+      if (diagnostic_enabled("VISACD_PREPROCESS_TRACE"))
         cerr << "preprocess_cuda_fallback reason=full_output_mismatch\n";
       m = std::move(reference);
       if (metrics)
         *metrics = reference_metrics;
       return;
     }
-    if (environment_enabled("VISACD_PREPROCESS_TRACE"))
+    if (diagnostic_enabled("VISACD_PREPROCESS_TRACE"))
       cerr << "preprocess_cuda_fallback reason=" << fallback_reason << '\n';
     ManifoldPreprocessMetrics reference_metrics;
     manifold_preprocess_cpu_reference(
@@ -2282,7 +2287,7 @@ void manifold_preprocess(Mesh &m, double scale, double level_set,
   if (manifold_preprocess_cuda_candidate(m, scale, level_set,
                                          &fallback_reason, metrics))
     return;
-  if (environment_enabled("VISACD_PREPROCESS_TRACE"))
+  if (diagnostic_enabled("VISACD_PREPROCESS_TRACE"))
     cerr << "preprocess_cuda_fallback reason=" << fallback_reason << '\n';
   manifold_preprocess_cpu_reference(m, scale, level_set, metrics);
 }

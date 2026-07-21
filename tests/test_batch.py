@@ -3,6 +3,8 @@ import hashlib
 import os
 from pathlib import Path
 import struct
+import sys
+import tempfile
 import unittest
 
 import numpy as np
@@ -57,6 +59,35 @@ def free_cuda_memory():
     return free.value
 
 
+def capture_native_output(callback):
+    sys.stdout.flush()
+    sys.stderr.flush()
+    with tempfile.TemporaryFile() as stdout_file:
+        with tempfile.TemporaryFile() as stderr_file:
+            saved_stdout = os.dup(sys.stdout.fileno())
+            saved_stderr = os.dup(sys.stderr.fileno())
+            try:
+                os.dup2(stdout_file.fileno(), sys.stdout.fileno())
+                os.dup2(stderr_file.fileno(), sys.stderr.fileno())
+                result = callback()
+                sys.stdout.flush()
+                sys.stderr.flush()
+                libc = ctypes.CDLL(None)
+                libc.fflush.argtypes = [ctypes.c_void_p]
+                libc.fflush.restype = ctypes.c_int
+                libc.fflush(None)
+            finally:
+                os.dup2(saved_stdout, sys.stdout.fileno())
+                os.dup2(saved_stderr, sys.stderr.fileno())
+                os.close(saved_stdout)
+                os.close(saved_stderr)
+            stdout_file.seek(0)
+            stderr_file.seek(0)
+            stdout = stdout_file.read()
+            stderr = stderr_file.read()
+    return result, stdout, stderr
+
+
 def load_sample(name, x_offset=0.0):
     tm = trimesh.load(ROOT / "data" / "samples" / name, force="mesh")
     vertices = np.asarray(tm.vertices, dtype=np.float64).copy()
@@ -101,11 +132,15 @@ class BatchValidationTests(unittest.TestCase):
         self.max_batch_size = visacd.config.max_batch_size
         self.batch_memory_fraction = visacd.config.batch_memory_fraction
         self.batch_cpu_threads = visacd.config.batch_cpu_threads
+        self.part_limit_policy = visacd.config.part_limit_policy
+        self.batch_logging = visacd.config.batch_logging
 
     def tearDown(self):
         visacd.config.max_batch_size = self.max_batch_size
         visacd.config.batch_memory_fraction = self.batch_memory_fraction
         visacd.config.batch_cpu_threads = self.batch_cpu_threads
+        visacd.config.part_limit_policy = self.part_limit_policy
+        visacd.config.batch_logging = self.batch_logging
 
     def test_empty_batch(self):
         self.assertEqual(visacd.process_batch([], 0.04, 2), [])
@@ -121,6 +156,11 @@ class BatchValidationTests(unittest.TestCase):
             visacd.process_batch([visacd.Mesh()], 0.04, 2)
 
     def test_invalid_batch_controls(self):
+        visacd.config.part_limit_policy = "invalid"
+        with self.assertRaisesRegex(ValueError, "part_limit_policy"):
+            visacd.process_batch([], 0.04, 2)
+
+        visacd.config.part_limit_policy = "split_budget"
         visacd.config.batch_cpu_threads = -1
         with self.assertRaisesRegex(ValueError, "batch_cpu_threads"):
             visacd.process_batch([], 0.04, 2)
@@ -171,8 +211,10 @@ class BatchGpuTests(unittest.TestCase):
             "score_mode": visacd.config.score_mode,
             "use_flat_surfaces": visacd.config.use_flat_surfaces,
             "use_merging": visacd.config.use_merging,
+            "part_limit_policy": visacd.config.part_limit_policy,
             "max_batch_size": visacd.config.max_batch_size,
             "batch_memory_fraction": visacd.config.batch_memory_fraction,
+            "batch_logging": visacd.config.batch_logging,
             "batch_cpu_threads": visacd.config.batch_cpu_threads,
             "retain_gpu_resources": visacd.config.retain_gpu_resources,
         }
@@ -180,6 +222,8 @@ class BatchGpuTests(unittest.TestCase):
         visacd.config.score_mode = "concavity"
         visacd.config.use_flat_surfaces = False
         visacd.config.use_merging = False
+        visacd.config.part_limit_policy = "split_budget"
+        visacd.config.batch_logging = True
         visacd.config.batch_memory_fraction = 0.7
         visacd.config.batch_cpu_threads = 0
         visacd.config.retain_gpu_resources = True
@@ -547,6 +591,168 @@ class BatchGpuTests(unittest.TestCase):
         self.assertEqual(expected_digest, result_digest(one_request_waves))
         self.assertEqual(expected_digest, result_digest(one_cpu_thread))
         self.assertEqual(expected_digest, result_digest(host_packed_fallback))
+
+    def test_batch_logging_can_silence_all_native_output(self):
+        diagnostic_names = (
+            "VISACD_STAGE_TIMING",
+            "VISACD_PREPROCESS_TRACE",
+            "VISACD_CLIP_COMPACTION_DIAGNOSTICS",
+            "VISACD_HULL_TOPOLOGY_DIAGNOSTICS",
+        )
+        saved_diagnostics = {
+            name: os.environ.get(name) for name in diagnostic_names
+        }
+        for name in diagnostic_names:
+            os.environ[name] = "1"
+
+        mesh = load_cow()
+        visacd.config.part_limit_policy = "adjacent_merge"
+        visacd.config.score_mode = "edge"
+        try:
+            visacd.config.batch_logging = False
+            visacd.set_seed(31415)
+            quiet, quiet_stdout, quiet_stderr = capture_native_output(
+                lambda: visacd.process_batch([mesh], 0.2, 4)
+            )
+
+            visacd.config.batch_logging = True
+            visacd.set_seed(31415)
+            verbose, verbose_stdout, verbose_stderr = capture_native_output(
+                lambda: visacd.process_batch([mesh], 0.2, 4)
+            )
+        finally:
+            for name, value in saved_diagnostics.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
+        self.assertEqual(quiet_stdout, b"")
+        self.assertEqual(quiet_stderr, b"")
+        self.assertIn(b"[visacd batch 0]", verbose_stdout)
+        self.assertIn(b"[visacd stages]", verbose_stderr)
+        self.assertEqual(result_digest(quiet), result_digest(verbose))
+
+    def run_adjacent_limit(
+        self,
+        max_batch_size=0,
+        batch_cpu_threads=0,
+        batch_memory_fraction=0.7,
+        score_mode="edge",
+        return_parts=False,
+        use_merging=False,
+    ):
+        visacd.config.part_limit_policy = "adjacent_merge"
+        visacd.config.score_mode = score_mode
+        visacd.config.return_parts = return_parts
+        visacd.config.use_merging = use_merging
+        visacd.config.max_batch_size = max_batch_size
+        visacd.config.batch_cpu_threads = batch_cpu_threads
+        visacd.config.batch_memory_fraction = batch_memory_fraction
+        visacd.set_seed(31415)
+        return visacd.process_batch(
+            [load_cow(-100.0), load_cow(100.0)],
+            concavity=0.2 if score_mode == "edge" else 0.04,
+            num_parts=4,
+        )
+
+    def test_adjacent_part_limit_repeatability_and_fallbacks(self):
+        automatic = self.run_adjacent_limit()
+        repeated = self.run_adjacent_limit()
+        one_request_waves = self.run_adjacent_limit(max_batch_size=1)
+        one_cpu_thread = self.run_adjacent_limit(batch_cpu_threads=1)
+        host_packed_fallback = self.run_adjacent_limit(
+            batch_memory_fraction=1e-9
+        )
+
+        expected_digest = result_digest(automatic)
+        self.assertEqual([result.num_parts for result in automatic], [4, 4])
+        self.assertEqual(expected_digest, result_digest(repeated))
+        self.assertEqual(expected_digest, result_digest(one_request_waves))
+        self.assertEqual(expected_digest, result_digest(one_cpu_thread))
+        self.assertEqual(
+            expected_digest, result_digest(host_packed_fallback)
+        )
+        self.assertLess(result_x_bounds(automatic[0])[1], 0.0)
+        self.assertGreater(result_x_bounds(automatic[1])[0], 0.0)
+
+    def test_adjacent_part_limit_all_modes_are_seeded_and_bounded(self):
+        for score_mode in ("edge", "concavity"):
+            for return_parts in (False, True):
+                for use_merging in (False, True):
+                    with self.subTest(
+                        score_mode=score_mode,
+                        return_parts=return_parts,
+                        use_merging=use_merging,
+                    ):
+                        first = self.run_adjacent_limit(
+                            score_mode=score_mode,
+                            return_parts=return_parts,
+                            use_merging=use_merging,
+                        )
+                        second = self.run_adjacent_limit(
+                            score_mode=score_mode,
+                            return_parts=return_parts,
+                            use_merging=use_merging,
+                        )
+                        self.assertTrue(
+                            all(result.num_parts <= 4 for result in first)
+                        )
+                        self.assertEqual(
+                            result_digest(first), result_digest(second)
+                        )
+
+    def test_adjacent_part_limit_preserves_source_geometry(self):
+        visacd.config.score_mode = "edge"
+        visacd.config.return_parts = True
+        visacd.config.use_merging = False
+        visacd.config.part_limit_policy = "split_budget"
+        visacd.set_seed(31415)
+        legacy = visacd.process_batch([load_cow()], 0.2, 4)[0]
+
+        visacd.config.part_limit_policy = "adjacent_merge"
+        visacd.set_seed(31415)
+        limited = visacd.process_batch([load_cow()], 0.2, 4)[0]
+
+        self.assertGreater(legacy.num_parts, 4)
+        self.assertEqual(limited.num_parts, 4)
+        self.assertEqual(
+            sum(len(part.triangles) for part in legacy.parts),
+            sum(len(part.triangles) for part in limited.parts),
+        )
+        for part in limited.parts:
+            vertices = np.asarray(part.vertices, dtype=np.float64)
+            triangles = np.asarray(part.triangles, dtype=np.int64)
+            self.assertTrue(np.isfinite(vertices).all())
+            self.assertGreaterEqual(triangles.min(), 0)
+            self.assertLess(triangles.max(), len(vertices))
+
+    def test_adjacent_part_limit_handles_infinite_cost_fallback(self):
+        visacd.config.part_limit_policy = "adjacent_merge"
+        visacd.config.score_mode = "edge"
+        visacd.config.use_flat_surfaces = True
+        visacd.set_seed(2026)
+        result = visacd.process_batch(
+            [load_sample("Octocat-v2.obj")], 0.2, 4
+        )[0]
+        self.assertEqual(result.num_parts, 4)
+        self.assertTrue(np.isfinite(result.concavity))
+
+    def test_adjacent_part_limit_rejects_initially_disconnected_mesh(self):
+        first = trimesh.creation.icosphere(subdivisions=1)
+        second = first.copy()
+        second.apply_translation([4.0, 0.0, 0.0])
+        disconnected = trimesh.util.concatenate([first, second])
+        mesh = visacd.Mesh(
+            np.asarray(disconnected.vertices, dtype=np.float64),
+            np.asarray(disconnected.faces, dtype=np.int32),
+        )
+        visacd.config.part_limit_policy = "adjacent_merge"
+        with self.assertRaisesRegex(
+            ValueError,
+            "initial disconnected component count 2 exceeds num_parts 1",
+        ):
+            visacd.process_batch([mesh], 0.04, 1)
 
     def test_merge_pipeline_is_repeatable(self):
         def run(

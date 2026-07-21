@@ -422,6 +422,12 @@ void validate_inputs(const std::vector<ComponentBatchInput> &inputs,
             static_cast<size_t>(std::numeric_limits<int>::max() / 3)) {
       throw std::overflow_error("Component mesh exceeds indexing limits");
     }
+    if (!input.mesh->triangle_interfaces.empty() &&
+        input.mesh->triangle_interfaces.size() !=
+            input.mesh->triangles.size()) {
+      throw std::invalid_argument(
+          "Component triangle interface metadata has the wrong size");
+    }
     for (const auto &triangle : input.mesh->triangles) {
       for (int vertex : triangle) {
         if (vertex < 0 ||
@@ -1067,6 +1073,12 @@ void run_wave(const std::vector<ComponentBatchInput> &inputs, size_t begin,
         const int3 compacted = output_triangles[triangle];
         assembled[local][component_locals[component]].triangles.push_back(
             {compacted.x, compacted.y, compacted.z});
+        const Mesh &source = *inputs[begin + local].mesh;
+        if (!source.triangle_interfaces.empty()) {
+          assembled[local][component_locals[component]]
+              .triangle_interfaces.push_back(
+                  source.triangle_interfaces[triangle - triangle_begin]);
+        }
       }
     }
 

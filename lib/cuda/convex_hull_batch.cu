@@ -2,6 +2,7 @@
 #include <array>
 #include <chrono>
 #include <climits>
+#include <config.hpp>
 #include <convex_hull_batch.hpp>
 #include <cuda_buffer.hpp>
 #include <cuda_runtime.h>
@@ -1524,7 +1525,8 @@ void run_topology_wave(
   }
   check_cuda(cudaStreamSynchronize(runtime.stream),
              "synchronize hull topology outputs");
-  if (std::getenv("VISACD_HULL_TOPOLOGY_DIAGNOSTICS")) {
+  if (config.batch_logging &&
+      std::getenv("VISACD_HULL_TOPOLOGY_DIAGNOSTICS")) {
     const auto milliseconds = [](auto duration) {
       return std::chrono::duration<double, std::milli>(duration).count();
     };
@@ -1573,7 +1575,8 @@ void run_topology_wave(
     if (input.fix_normals)
       cvx_fix_normals(hull);
     success[ranges[local].input_index] = 1;
-    if (std::getenv("VISACD_HULL_TOPOLOGY_DIAGNOSTICS")) {
+    if (config.batch_logging &&
+        std::getenv("VISACD_HULL_TOPOLOGY_DIAGNOSTICS")) {
       std::fprintf(stderr,
                    "[visacd hull topology job] input=%zu faces=%d "
                    "active=%d\n",
@@ -1663,7 +1666,8 @@ void compute_convex_hulls_batch(
   if (gpu_hull_topology_enabled()) {
     const std::vector<unsigned char> success = compute_gpu_topology(
         inputs, *runtime.impl_, max_batch_size, memory_fraction);
-    if (std::getenv("VISACD_HULL_TOPOLOGY_DIAGNOSTICS")) {
+    if (config.batch_logging &&
+        std::getenv("VISACD_HULL_TOPOLOGY_DIAGNOSTICS")) {
       const size_t completed = static_cast<size_t>(
           std::count(success.begin(), success.end(), 1));
       std::fprintf(stderr,

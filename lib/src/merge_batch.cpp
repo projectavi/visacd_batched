@@ -29,6 +29,7 @@ struct MergeState {
   std::vector<double> precost_matrix;
   std::vector<BoundingBox> bounds;
   bool finished = false;
+  std::vector<unsigned char> adjacency_matrix;
 };
 
 struct PairCandidate {
@@ -38,6 +39,7 @@ struct PairCandidate {
   size_t matrix_index = 0;
   bool needs_proximity = false;
   bool within_threshold = false;
+  bool bypass_proximity = false;
   Mesh merged;
   Mesh combined_hull;
   double combined_volume = 0.0;
@@ -93,6 +95,13 @@ size_t packed_pair_index(size_t first, size_t second) {
   return packed_pair_count(first) + second;
 }
 
+size_t packed_pair_index_any_order(size_t first, size_t second) {
+  if (first == second)
+    throw std::logic_error("Packed merge pair contains one part");
+  return packed_pair_index(std::max(first, second),
+                           std::min(first, second));
+}
+
 Mesh merge_meshes(const Mesh &first, const Mesh &second) {
   if (first.vertices.size() >
       static_cast<size_t>(std::numeric_limits<int>::max()) -
@@ -115,7 +124,49 @@ Mesh merge_meshes(const Mesh &first, const Mesh &second) {
                                 triangle[1] + offset,
                                 triangle[2] + offset});
   }
+  const bool track_interfaces =
+      !first.triangle_interfaces.empty() ||
+      !second.triangle_interfaces.empty();
+  if (track_interfaces) {
+    result.triangle_interfaces.reserve(result.triangles.size());
+    if (first.triangle_interfaces.empty()) {
+      result.triangle_interfaces.insert(
+          result.triangle_interfaces.end(), first.triangles.size(), 0);
+    } else {
+      result.triangle_interfaces.insert(
+          result.triangle_interfaces.end(),
+          first.triangle_interfaces.begin(),
+          first.triangle_interfaces.end());
+    }
+    if (second.triangle_interfaces.empty()) {
+      result.triangle_interfaces.insert(
+          result.triangle_interfaces.end(), second.triangles.size(), 0);
+    } else {
+      result.triangle_interfaces.insert(
+          result.triangle_interfaces.end(),
+          second.triangle_interfaces.begin(),
+          second.triangle_interfaces.end());
+    }
+  }
   return result;
+}
+
+bool parts_are_adjacent(const Mesh &first, const Mesh &second) {
+  std::vector<int64_t> interfaces;
+  for (int64_t token : first.triangle_interfaces) {
+    if (token != 0)
+      interfaces.push_back(token);
+  }
+  std::sort(interfaces.begin(), interfaces.end());
+  interfaces.erase(std::unique(interfaces.begin(), interfaces.end()),
+                   interfaces.end());
+  for (int64_t token : second.triangle_interfaces) {
+    if (token != 0 &&
+        std::binary_search(interfaces.begin(), interfaces.end(), -token)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 void validate_inputs(const std::vector<MergeBatchInput> &inputs) {
@@ -131,6 +182,17 @@ void validate_inputs(const std::vector<MergeBatchInput> &inputs) {
         input.part_hausdorff->size() != count) {
       throw std::invalid_argument(
           "Merge batch input arrays have different sizes");
+    }
+    if (input.target_part_count == 0 && !input.use_threshold_merging) {
+      throw std::invalid_argument(
+          "Merge request has neither a target nor threshold merging");
+    }
+    for (const Mesh &part : *input.parts) {
+      if (!part.triangle_interfaces.empty() &&
+          part.triangle_interfaces.size() != part.triangles.size()) {
+        throw std::invalid_argument(
+            "Merge part interface metadata has the wrong size");
+      }
     }
     if (!std::isfinite(input.current_concavity) ||
         input.current_concavity < 0.0 ||
@@ -190,7 +252,10 @@ void merge_convex_hulls_batch(
     state.bounds.reserve(count);
     for (const Mesh &hull : *input.hulls)
       state.bounds.push_back(compute_bounds(hull));
-    state.finished = count < 2;
+    state.finished =
+        count < 2 ||
+        (!input.use_threshold_merging &&
+         (input.target_part_count == 0 || count <= input.target_part_count));
     states.push_back(std::move(state));
   }
 
@@ -223,10 +288,17 @@ void merge_convex_hulls_batch(
     const size_t matrix_size = packed_pair_count(count);
     state.cost_matrix.assign(matrix_size, INF);
     state.precost_matrix.resize(matrix_size);
+    state.adjacency_matrix.assign(matrix_size, 0);
     for (size_t first = 1; first < count; ++first) {
       for (size_t second = 0; second < first; ++second) {
-        state.precost_matrix[packed_pair_index(first, second)] =
+        const size_t pair_index = packed_pair_index(first, second);
+        state.precost_matrix[pair_index] =
             std::max(state.pre_costs[first], state.pre_costs[second]);
+        state.adjacency_matrix[pair_index] =
+            parts_are_adjacent((*state.input.parts)[first],
+                               (*state.input.parts)[second])
+                ? 1
+                : 0;
       }
     }
   }
@@ -282,6 +354,12 @@ void merge_convex_hulls_batch(
     std::vector<MeshProximityBatchInput> proximity_inputs;
     for (PairCandidate &candidate : candidates) {
       MergeState &state = states[candidate.state_index];
+      if (candidate.bypass_proximity) {
+        candidate.within_threshold = true;
+        continue;
+      }
+      if (!state.input.use_threshold_merging)
+        continue;
       candidate.needs_proximity =
           bounds_can_overlap(state.bounds[candidate.first],
                              state.bounds[candidate.second],
@@ -362,6 +440,9 @@ void merge_convex_hulls_batch(
         candidate.first = first;
         candidate.second = second;
         candidate.matrix_index = packed_pair_index(first, second);
+        candidate.bypass_proximity =
+            states[state_index].input.target_part_count > 0 &&
+            states[state_index].adjacency_matrix[candidate.matrix_index] != 0;
         initial_candidates.push_back(std::move(candidate));
       }
     }
@@ -382,21 +463,40 @@ void merge_convex_hulls_batch(
       MergeState &state = states[state_index];
       if (state.finished)
         continue;
+      const bool enforcing_limit =
+          state.input.target_part_count > 0 &&
+          state.input.hulls->size() > state.input.target_part_count;
+      if (!enforcing_limit && !state.input.use_threshold_merging) {
+        state.finished = true;
+        continue;
+      }
       while (true) {
         size_t best_index = state.cost_matrix.size();
         double best_cost = INF;
         for (size_t index = 0; index < state.cost_matrix.size(); ++index) {
-          if (state.cost_matrix[index] < best_cost) {
+          if (enforcing_limit && state.adjacency_matrix[index] == 0)
+            continue;
+          if (best_index == state.cost_matrix.size() ||
+              state.cost_matrix[index] < best_cost) {
             best_cost = state.cost_matrix[index];
             best_index = index;
           }
         }
-        if (best_index == state.cost_matrix.size() ||
-            best_cost > state.input.threshold) {
+        if (best_index == state.cost_matrix.size()) {
+          if (enforcing_limit) {
+            throw std::runtime_error(
+                "Adjacent part limit is infeasible: no split-provenance "
+                "adjacent merge remains");
+          }
           state.finished = true;
           break;
         }
-        if (best_cost + state.precost_matrix[best_index] >
+        if (!enforcing_limit && best_cost > state.input.threshold) {
+          state.finished = true;
+          break;
+        }
+        if (!enforcing_limit &&
+            best_cost + state.precost_matrix[best_index] >
             state.input.current_concavity) {
           state.cost_matrix[best_index] = INF;
           continue;
@@ -424,30 +524,81 @@ void merge_convex_hulls_batch(
     for (PairCandidate &candidate : accepted)
       accepted_pointers.push_back(&candidate);
     build_candidate_hulls(accepted_pointers);
-
     for (PairCandidate &candidate : accepted) {
       MergeState &state = states[candidate.state_index];
+      MeshList &parts = *state.input.parts;
       MeshList &hulls = *state.input.hulls;
-      auto &devices = *state.input.hull_devices;
+      auto &part_devices = *state.input.part_devices;
+      auto &hull_devices = *state.input.hull_devices;
+      std::vector<double> &part_hausdorff =
+          *state.input.part_hausdorff;
       const size_t first = candidate.first;
       const size_t second = candidate.second;
+      const size_t old_count = hulls.size();
+      const size_t last = old_count - 1;
+
+      for (size_t other = 0; other < old_count; ++other) {
+        if (other == first || other == second)
+          continue;
+        const size_t second_edge =
+            packed_pair_index_any_order(second, other);
+        const size_t first_edge =
+            packed_pair_index_any_order(first, other);
+        state.adjacency_matrix[second_edge] =
+            state.adjacency_matrix[second_edge] ||
+                    state.adjacency_matrix[first_edge]
+                ? 1
+                : 0;
+      }
+      if (first != last) {
+        for (size_t other = 0; other < last; ++other) {
+          if (other == first)
+            continue;
+          state.adjacency_matrix[
+              packed_pair_index_any_order(first, other)] =
+              state.adjacency_matrix[
+                  packed_pair_index_any_order(last, other)];
+        }
+      }
+      state.adjacency_matrix.resize(packed_pair_count(last));
+
+      parts[second] = merge_meshes(parts[first], parts[second]);
+      part_devices[second] = runtime.impl_->device_meshes.try_upload(
+          parts[second], memory_fraction);
+      state.part_volumes[second] += state.part_volumes[first];
+      state.pre_costs[second] =
+          std::max(state.pre_costs[first], state.pre_costs[second]) +
+          candidate.cost;
+      part_hausdorff[second] = std::max(
+          {part_hausdorff[first], part_hausdorff[second],
+           candidate.hausdorff});
 
       hulls[second] = std::move(candidate.combined_hull);
-      devices[second] = runtime.impl_->device_meshes.try_upload(
+      hull_devices[second] = runtime.impl_->device_meshes.try_upload(
           hulls[second], memory_fraction);
       state.hull_volumes[second] = candidate.combined_volume;
       state.bounds[second] = compute_bounds(hulls[second]);
 
-      const size_t last = hulls.size() - 1;
       if (first != last) {
+        std::swap(parts[first], parts[last]);
         std::swap(hulls[first], hulls[last]);
-        std::swap(devices[first], devices[last]);
+        std::swap(part_devices[first], part_devices[last]);
+        std::swap(hull_devices[first], hull_devices[last]);
+        std::swap(part_hausdorff[first], part_hausdorff[last]);
+        std::swap(state.part_volumes[first],
+                  state.part_volumes[last]);
+        std::swap(state.pre_costs[first], state.pre_costs[last]);
         std::swap(state.hull_volumes[first],
                   state.hull_volumes[last]);
         std::swap(state.bounds[first], state.bounds[last]);
       }
+      parts.pop_back();
       hulls.pop_back();
-      devices.pop_back();
+      part_devices.pop_back();
+      hull_devices.pop_back();
+      part_hausdorff.pop_back();
+      state.part_volumes.pop_back();
+      state.pre_costs.pop_back();
       state.hull_volumes.pop_back();
       state.bounds.pop_back();
     }
@@ -478,6 +629,9 @@ void merge_convex_hulls_batch(
         candidate.second = std::min(other, merge.second);
         candidate.matrix_index =
             packed_pair_index(candidate.first, candidate.second);
+        candidate.bypass_proximity =
+            state.input.target_part_count > 0 &&
+            state.adjacency_matrix[candidate.matrix_index] != 0;
         updates.push_back(std::move(candidate));
       }
     }
@@ -528,7 +682,13 @@ void merge_convex_hulls_batch(
       }
       state.cost_matrix.resize(erase_index);
       state.precost_matrix.resize(erase_index);
-      state.finished = count < 2;
+      if (state.adjacency_matrix.size() != erase_index)
+        throw std::logic_error("Merge adjacency matrix is out of sync");
+      state.finished =
+          count < 2 ||
+          (!state.input.use_threshold_merging &&
+           (state.input.target_part_count == 0 ||
+            count <= state.input.target_part_count));
     }
   }
 }

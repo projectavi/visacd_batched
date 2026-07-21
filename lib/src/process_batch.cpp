@@ -106,7 +106,8 @@ class StageProfiler {
 public:
   StageProfiler() {
     const char *value = getenv("VISACD_STAGE_TIMING");
-    enabled_ = value && *value && string(value) != "0";
+    enabled_ = config.batch_logging && value && *value &&
+               string(value) != "0";
     for (auto &value : nanoseconds_)
       value.store(0, memory_order_relaxed);
     for (auto &value : calls_)
@@ -240,7 +241,7 @@ void profiled_manifold_preprocess(Mesh &mesh, double scale,
   if (device_mesh)
     device_mesh->reset();
   const char *trace_value = getenv("VISACD_PREPROCESS_TRACE");
-  const bool trace = trace_value && *trace_value &&
+  const bool trace = config.batch_logging && trace_value && *trace_value &&
                      string(trace_value) != "0";
   if (!profiler.enabled() && !trace) {
     if (surface) {
@@ -417,6 +418,7 @@ struct FinalizeWork {
   MeshList hulls;
   vector<shared_ptr<DeviceMesh>> hull_devices;
   vector<double> part_hausdorff;
+  bool finish_after_concavity = false;
   atomic<size_t> remaining{0};
 };
 
@@ -436,6 +438,8 @@ struct MergeWork {
   size_t state_index;
   double final_concavity;
   size_t initial_hull_count;
+  size_t target_part_count = 0;
+  bool use_threshold_merging = false;
   shared_ptr<FinalizeWork> finalize_work;
   vector<shared_ptr<DeviceMesh>> part_devices;
 };
@@ -1123,6 +1127,8 @@ private:
 };
 
 void log(size_t mesh_index, const string &message) {
+  if (!config.batch_logging)
+    return;
   static mutex log_mutex;
   lock_guard<mutex> lock(log_mutex);
   cout << "[visacd batch " << mesh_index << "] " << message << "\n";
@@ -1151,6 +1157,11 @@ void validate_parameters(const MeshList &meshes, double concavity,
     throw invalid_argument("max_batch_size cannot be negative");
   if (config.batch_cpu_threads < 0)
     throw invalid_argument("batch_cpu_threads cannot be negative");
+  if (config.part_limit_policy != "split_budget" &&
+      config.part_limit_policy != "adjacent_merge") {
+    throw invalid_argument(
+        "part_limit_policy must be 'split_budget' or 'adjacent_merge'");
+  }
   if (config.batch_memory_fraction <= 0.0 ||
       config.batch_memory_fraction > 1.0) {
     throw invalid_argument("batch_memory_fraction must be in (0, 1]");
@@ -1457,7 +1468,12 @@ vector<ProcessResult> process_batch_impl(MeshList meshes, double concavity,
   schedule_merge_or_finish =
       [&](shared_ptr<FinalizeWork> finalize_work,
           double final_concavity) {
-        if (!config.use_merging || finalize_work->hulls.size() < 2) {
+        const bool enforce_limit =
+            config.part_limit_policy == "adjacent_merge" &&
+            finalize_work->hulls.size() >
+                static_cast<size_t>(num_parts);
+        if (!enforce_limit &&
+            (!config.use_merging || finalize_work->hulls.size() < 2)) {
           finish_state(move(finalize_work), final_concavity);
           return;
         }
@@ -1472,6 +1488,9 @@ vector<ProcessResult> process_batch_impl(MeshList meshes, double concavity,
         work->state_index = finalize_work->state_index;
         work->final_concavity = final_concavity;
         work->initial_hull_count = finalize_work->hulls.size();
+        work->target_part_count =
+            enforce_limit ? static_cast<size_t>(num_parts) : 0;
+        work->use_threshold_merging = config.use_merging;
         work->part_devices.reserve(state.parts.size());
         for (size_t part_index = 0; part_index < state.parts.size();
              ++part_index) {
@@ -1711,6 +1730,14 @@ vector<ProcessResult> process_batch_impl(MeshList meshes, double concavity,
 
           if (work->initial) {
             state.parts = move(work->parts);
+            if (config.part_limit_policy == "adjacent_merge" &&
+                state.parts.size() > static_cast<size_t>(num_parts)) {
+              throw invalid_argument(
+                  "Adjacent part limit is infeasible: initial disconnected "
+                  "component count " +
+                  to_string(state.parts.size()) + " exceeds num_parts " +
+                  to_string(num_parts));
+            }
             state.part_cache.resize(state.parts.size());
             if (work->source_device &&
                 work->source_vertex_maps.size() == state.parts.size()) {
@@ -1819,13 +1846,17 @@ vector<ProcessResult> process_batch_impl(MeshList meshes, double concavity,
           int *first_map = nullptr;
           int *second_map = nullptr;
           MeshList new_parts;
+          const uint32_t split_sequence =
+              config.part_limit_policy == "adjacent_merge"
+                  ? static_cast<uint32_t>(state.iteration + 1)
+                  : 0;
           if (split->prepared_clip.empty()) {
             new_parts = clip(split->part, split->selected_plane, first_map,
-                             second_map);
+                             second_map, split_sequence);
           } else {
             new_parts = clip_prepared(
                 split->part, split->selected_plane, first_map, second_map,
-                split->prepared_clip);
+                split->prepared_clip, split_sequence);
           }
           if (new_parts.size() < 2) {
             delete[] first_map;
@@ -2105,13 +2136,20 @@ vector<ProcessResult> process_batch_impl(MeshList meshes, double concavity,
           log(work->state_index,
               "Evaluating GPU merge costs for " +
                   to_string(work->initial_hull_count) + " hulls...");
-          inputs.push_back(
-              {&state.parts, &work->finalize_work->hulls,
-               &work->part_devices,
-               &work->finalize_work->hull_devices,
-               &work->finalize_work->part_hausdorff,
-               work->final_concavity, concavity,
-               &state.random_engine});
+          MergeBatchInput input;
+          input.parts = &state.parts;
+          input.hulls = &work->finalize_work->hulls;
+          input.part_devices = &work->part_devices;
+          input.hull_devices = &work->finalize_work->hull_devices;
+          input.part_hausdorff =
+              &work->finalize_work->part_hausdorff;
+          input.target_part_count = work->target_part_count;
+          input.use_threshold_merging =
+              work->use_threshold_merging;
+          input.current_concavity = work->final_concavity;
+          input.threshold = concavity;
+          input.engine = &state.random_engine;
+          inputs.push_back(move(input));
         }
         coordinator.submit_gpu(
             [&, lane = gpu_lane,
@@ -2134,8 +2172,22 @@ vector<ProcessResult> process_batch_impl(MeshList meshes, double concavity,
                           to_string(work->initial_hull_count - remaining) +
                           " hull(s); " + to_string(remaining) +
                           " remain.");
-                  finish_state(move(work->finalize_work),
-                               work->final_concavity);
+                  BatchState &state = states[work->state_index];
+                  if (state.parts.size() != remaining ||
+                      work->part_devices.size() != remaining) {
+                    throw logic_error(
+                        "Merged source parts are out of sync");
+                  }
+                  state.part_cache.clear();
+                  state.part_cache.resize(remaining);
+                  for (size_t part_index = 0; part_index < remaining;
+                       ++part_index) {
+                    state.part_cache[part_index].device =
+                        move(work->part_devices[part_index]);
+                  }
+                  work->finalize_work->part_hausdorff.resize(remaining);
+                  work->finalize_work->finish_after_concavity = true;
+                  schedule_final_concavity(move(work->finalize_work));
                 }
                 coordinator.complete_gpu_batch(GpuWorkKind::merges,
                                                lane);
@@ -2391,8 +2443,13 @@ vector<ProcessResult> process_batch_impl(MeshList meshes, double concavity,
                         ->part_hausdorff[job_index] = result;
                     final_concavity = max(final_concavity, result);
                   }
-                  schedule_merge_or_finish(
-                      move(work->finalize_work), final_concavity);
+                  if (work->finalize_work->finish_after_concavity) {
+                    finish_state(move(work->finalize_work),
+                                 final_concavity);
+                  } else {
+                    schedule_merge_or_finish(
+                        move(work->finalize_work), final_concavity);
+                  }
                 }
                 coordinator.complete_gpu_batch(
                     GpuWorkKind::hausdorff, lane);

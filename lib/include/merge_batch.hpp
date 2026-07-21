@@ -14,7 +14,9 @@ struct MergeBatchInput {
   MeshList *hulls = nullptr;
   std::vector<std::shared_ptr<DeviceMesh>> *part_devices = nullptr;
   std::vector<std::shared_ptr<DeviceMesh>> *hull_devices = nullptr;
-  const std::vector<double> *part_hausdorff = nullptr;
+  std::vector<double> *part_hausdorff = nullptr;
+  size_t target_part_count = 0;
+  bool use_threshold_merging = true;
   double current_concavity = 0.0;
   double threshold = 0.0;
   RandomEngine *engine = nullptr;
