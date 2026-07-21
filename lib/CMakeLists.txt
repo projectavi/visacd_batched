@@ -1,8 +1,27 @@
 cmake_minimum_required(VERSION 3.18)
-if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.24")
+
+set(_VISACD_PTX_COMPUTE "")
+if(DEFINED ENV{PTX_COMPUTE} AND NOT "$ENV{PTX_COMPUTE}" STREQUAL "")
+    if(NOT "$ENV{PTX_COMPUTE}" MATCHES "^[0-9]+$")
+        message(FATAL_ERROR
+            "PTX_COMPUTE must be one numeric compute capability, for example 120")
+    endif()
+    set(_VISACD_PTX_COMPUTE "$ENV{PTX_COMPUTE}")
+endif()
+
+# A command-line CMAKE_CUDA_ARCHITECTURES value has highest precedence.
+# Otherwise PTX_COMPUTE selects both the linked CUDA objects and OptiX PTX,
+# avoiding fragile native-architecture inference during compiler detection.
+if(DEFINED CMAKE_CUDA_ARCHITECTURES AND
+   NOT "${CMAKE_CUDA_ARCHITECTURES}" STREQUAL "")
+    message(STATUS
+        "Using explicit CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
+elseif(_VISACD_PTX_COMPUTE)
+    set(CMAKE_CUDA_ARCHITECTURES "${_VISACD_PTX_COMPUTE}")
+    message(STATUS
+        "Using PTX_COMPUTE for CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
+elseif(CMAKE_VERSION VERSION_GREATER_EQUAL "3.24")
     set(CMAKE_CUDA_ARCHITECTURES native)
-elseif(CMAKE_VERSION VERSION_GREATER_EQUAL "3.23")
-    set(CMAKE_CUDA_ARCHITECTURES all)
 else()
     execute_process(
         COMMAND nvidia-smi --query-gpu=compute_cap --format=csv,noheader
@@ -13,10 +32,12 @@ else()
     if(_GPU_COMPUTE_CAP)
         string(REPLACE "." "" _CUDA_ARCH ${_GPU_COMPUTE_CAP})
         set(CMAKE_CUDA_ARCHITECTURES ${_CUDA_ARCH})
-        message(STATUS "Auto-detected CUDA architecture: ${_GPU_COMPUTE_CAP} -> ${_CUDA_ARCH}")
+        message(STATUS
+            "Auto-detected CUDA architecture: ${_GPU_COMPUTE_CAP} -> ${_CUDA_ARCH}")
     else()
         set(CMAKE_CUDA_ARCHITECTURES 75)
-        message(STATUS "nvidia-smi not found, defaulting to CUDA architecture 75")
+        message(STATUS
+            "nvidia-smi not found, defaulting to CUDA architecture 75")
     endif()
 endif()
 project(visacd LANGUAGES CXX C CUDA)
@@ -148,8 +169,10 @@ set(PTX_SOURCES
     ${CMAKE_SOURCE_DIR}/ptx/ray_segments.cu
 )
 
-if(DEFINED ENV{PTX_COMPUTE})
-    set(PTX_SM $ENV{PTX_COMPUTE})
+if(_VISACD_PTX_COMPUTE)
+    set(PTX_SM "${_VISACD_PTX_COMPUTE}")
+    message(STATUS
+        "Using PTX_COMPUTE for OptiX PTX architecture: sm_${PTX_SM}")
 else()
     execute_process(
         COMMAND nvidia-smi --query-gpu=compute_cap --format=csv,noheader
