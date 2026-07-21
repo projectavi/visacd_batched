@@ -106,7 +106,8 @@ class StageProfiler {
 public:
   StageProfiler() {
     const char *value = getenv("VISACD_STAGE_TIMING");
-    enabled_ = value && *value && string(value) != "0";
+    enabled_ = config.batch_logging && value && *value &&
+               string(value) != "0";
     for (auto &value : nanoseconds_)
       value.store(0, memory_order_relaxed);
     for (auto &value : calls_)
@@ -240,7 +241,7 @@ void profiled_manifold_preprocess(Mesh &mesh, double scale,
   if (device_mesh)
     device_mesh->reset();
   const char *trace_value = getenv("VISACD_PREPROCESS_TRACE");
-  const bool trace = trace_value && *trace_value &&
+  const bool trace = config.batch_logging && trace_value && *trace_value &&
                      string(trace_value) != "0";
   if (!profiler.enabled() && !trace) {
     if (surface) {
@@ -1126,6 +1127,8 @@ private:
 };
 
 void log(size_t mesh_index, const string &message) {
+  if (!config.batch_logging)
+    return;
   static mutex log_mutex;
   lock_guard<mutex> lock(log_mutex);
   cout << "[visacd batch " << mesh_index << "] " << message << "\n";

@@ -3,6 +3,7 @@
 #include "core.hpp"
 #include <CDT.h>
 #include <CDTUtils.h>
+#include <config.hpp>
 #include <cost.hpp>
 #include <deque>
 #include <fstream>
@@ -162,7 +163,8 @@ short Triangulation(vector<Vec3D> &border, vector<pair<int, int>> border_edges,
         [](const pair<int, int> &p) { return (int)p.second - 1; });
     cdt.eraseOuterTrianglesAndHoles();
   } catch (const runtime_error &e) {
-    cout << e.what() << endl;
+    if (config.batch_logging)
+      cout << e.what() << endl;
     return 2;
   }
 

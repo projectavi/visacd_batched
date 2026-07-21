@@ -364,6 +364,7 @@ host workers, memory-aware GPU waves, and reusable GPU state.
 | `batch_cpu_threads` | `0` | Host executor size. `0` selects `min(useful batch items, available hardware threads, 200)`; a positive value requests an explicit count, still capped by useful work. This is a worker count, not the number of meshes accepted by the API. |
 | `max_batch_size` | `0` | Maximum number of ready items placed in most GPU waves. `0` leaves wave length to the memory-aware scheduler. A positive value is a cap rather than a target; memory pressure can produce smaller waves. Packed preprocessing waves are additionally capped at 200 items. |
 | `batch_memory_fraction` | `0.7` | Fraction of currently free VRAM that VisACD may budget for growing a wave. Valid range: `(0, 1]`. The coordinator divides the budget conservatively among overlapping GPU host lanes; retained buffers from earlier work are accounted for separately. Lower this when another CUDA workload must keep headroom. |
+| `batch_logging` | `True` | Emit native batch progress and explicitly enabled trace/diagnostic output. Set to `False` to keep successful `process_batch` calls silent on both stdout and stderr; failures still propagate as Python exceptions. |
 | `retain_gpu_resources` | `True` | Keep streams, OptiX objects, the private asynchronous pool, and grow-only scratch capacity for faster warm batches. `False` performs automatic release before `process_batch` or `process` returns. See [GPU resource lifetime](#gpu-resource-lifetime). |
 
 The defaults are the recommended starting point for heterogeneous batches and
@@ -380,6 +381,7 @@ For example:
 visacd.config.batch_cpu_threads = 0       # automatic host parallelism
 visacd.config.max_batch_size = 0          # automatic wave length
 visacd.config.batch_memory_fraction = 0.5 # preserve half of free VRAM
+visacd.config.batch_logging = False       # silence native batch output
 visacd.config.retain_gpu_resources = False
 results = visacd.process_batch(meshes, concavity=0.04, num_parts=32)
 ```

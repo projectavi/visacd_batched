@@ -3,6 +3,8 @@ import hashlib
 import os
 from pathlib import Path
 import struct
+import sys
+import tempfile
 import unittest
 
 import numpy as np
@@ -57,6 +59,35 @@ def free_cuda_memory():
     return free.value
 
 
+def capture_native_output(callback):
+    sys.stdout.flush()
+    sys.stderr.flush()
+    with tempfile.TemporaryFile() as stdout_file:
+        with tempfile.TemporaryFile() as stderr_file:
+            saved_stdout = os.dup(sys.stdout.fileno())
+            saved_stderr = os.dup(sys.stderr.fileno())
+            try:
+                os.dup2(stdout_file.fileno(), sys.stdout.fileno())
+                os.dup2(stderr_file.fileno(), sys.stderr.fileno())
+                result = callback()
+                sys.stdout.flush()
+                sys.stderr.flush()
+                libc = ctypes.CDLL(None)
+                libc.fflush.argtypes = [ctypes.c_void_p]
+                libc.fflush.restype = ctypes.c_int
+                libc.fflush(None)
+            finally:
+                os.dup2(saved_stdout, sys.stdout.fileno())
+                os.dup2(saved_stderr, sys.stderr.fileno())
+                os.close(saved_stdout)
+                os.close(saved_stderr)
+            stdout_file.seek(0)
+            stderr_file.seek(0)
+            stdout = stdout_file.read()
+            stderr = stderr_file.read()
+    return result, stdout, stderr
+
+
 def load_sample(name, x_offset=0.0):
     tm = trimesh.load(ROOT / "data" / "samples" / name, force="mesh")
     vertices = np.asarray(tm.vertices, dtype=np.float64).copy()
@@ -102,12 +133,14 @@ class BatchValidationTests(unittest.TestCase):
         self.batch_memory_fraction = visacd.config.batch_memory_fraction
         self.batch_cpu_threads = visacd.config.batch_cpu_threads
         self.part_limit_policy = visacd.config.part_limit_policy
+        self.batch_logging = visacd.config.batch_logging
 
     def tearDown(self):
         visacd.config.max_batch_size = self.max_batch_size
         visacd.config.batch_memory_fraction = self.batch_memory_fraction
         visacd.config.batch_cpu_threads = self.batch_cpu_threads
         visacd.config.part_limit_policy = self.part_limit_policy
+        visacd.config.batch_logging = self.batch_logging
 
     def test_empty_batch(self):
         self.assertEqual(visacd.process_batch([], 0.04, 2), [])
@@ -181,6 +214,7 @@ class BatchGpuTests(unittest.TestCase):
             "part_limit_policy": visacd.config.part_limit_policy,
             "max_batch_size": visacd.config.max_batch_size,
             "batch_memory_fraction": visacd.config.batch_memory_fraction,
+            "batch_logging": visacd.config.batch_logging,
             "batch_cpu_threads": visacd.config.batch_cpu_threads,
             "retain_gpu_resources": visacd.config.retain_gpu_resources,
         }
@@ -189,6 +223,7 @@ class BatchGpuTests(unittest.TestCase):
         visacd.config.use_flat_surfaces = False
         visacd.config.use_merging = False
         visacd.config.part_limit_policy = "split_budget"
+        visacd.config.batch_logging = True
         visacd.config.batch_memory_fraction = 0.7
         visacd.config.batch_cpu_threads = 0
         visacd.config.retain_gpu_resources = True
@@ -556,6 +591,47 @@ class BatchGpuTests(unittest.TestCase):
         self.assertEqual(expected_digest, result_digest(one_request_waves))
         self.assertEqual(expected_digest, result_digest(one_cpu_thread))
         self.assertEqual(expected_digest, result_digest(host_packed_fallback))
+
+    def test_batch_logging_can_silence_all_native_output(self):
+        diagnostic_names = (
+            "VISACD_STAGE_TIMING",
+            "VISACD_PREPROCESS_TRACE",
+            "VISACD_CLIP_COMPACTION_DIAGNOSTICS",
+            "VISACD_HULL_TOPOLOGY_DIAGNOSTICS",
+        )
+        saved_diagnostics = {
+            name: os.environ.get(name) for name in diagnostic_names
+        }
+        for name in diagnostic_names:
+            os.environ[name] = "1"
+
+        mesh = load_cow()
+        visacd.config.part_limit_policy = "adjacent_merge"
+        visacd.config.score_mode = "edge"
+        try:
+            visacd.config.batch_logging = False
+            visacd.set_seed(31415)
+            quiet, quiet_stdout, quiet_stderr = capture_native_output(
+                lambda: visacd.process_batch([mesh], 0.2, 4)
+            )
+
+            visacd.config.batch_logging = True
+            visacd.set_seed(31415)
+            verbose, verbose_stdout, verbose_stderr = capture_native_output(
+                lambda: visacd.process_batch([mesh], 0.2, 4)
+            )
+        finally:
+            for name, value in saved_diagnostics.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
+        self.assertEqual(quiet_stdout, b"")
+        self.assertEqual(quiet_stderr, b"")
+        self.assertIn(b"[visacd batch 0]", verbose_stdout)
+        self.assertIn(b"[visacd stages]", verbose_stderr)
+        self.assertEqual(result_digest(quiet), result_digest(verbose))
 
     def run_adjacent_limit(
         self,
