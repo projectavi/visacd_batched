@@ -476,7 +476,8 @@ void merge_convex_hulls_batch(
         for (size_t index = 0; index < state.cost_matrix.size(); ++index) {
           if (enforcing_limit && state.adjacency_matrix[index] == 0)
             continue;
-          if (state.cost_matrix[index] < best_cost) {
+          if (best_index == state.cost_matrix.size() ||
+              state.cost_matrix[index] < best_cost) {
             best_cost = state.cost_matrix[index];
             best_index = index;
           }

@@ -651,6 +651,17 @@ class BatchGpuTests(unittest.TestCase):
             self.assertGreaterEqual(triangles.min(), 0)
             self.assertLess(triangles.max(), len(vertices))
 
+    def test_adjacent_part_limit_handles_infinite_cost_fallback(self):
+        visacd.config.part_limit_policy = "adjacent_merge"
+        visacd.config.score_mode = "edge"
+        visacd.config.use_flat_surfaces = True
+        visacd.set_seed(2026)
+        result = visacd.process_batch(
+            [load_sample("Octocat-v2.obj")], 0.2, 4
+        )[0]
+        self.assertEqual(result.num_parts, 4)
+        self.assertTrue(np.isfinite(result.concavity))
+
     def test_adjacent_part_limit_rejects_initially_disconnected_mesh(self):
         first = trimesh.creation.icosphere(subdivisions=1)
         second = first.copy()
