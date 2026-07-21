@@ -627,11 +627,11 @@ region. Seven warm measurements alternated policy order.
 
 | Final batch policy | Median batch time | Throughput | Output parts per mesh |
 |---|---:|---:|---:|
-| `"split_budget"` | 0.8403 s | 38.08 meshes/s | 6--7 |
-| `"adjacent_merge"` | 1.9647 s | 16.29 meshes/s | exactly 4 |
+| `"split_budget"` | 0.7881 s | 40.60 meshes/s | 6--7 |
+| `"adjacent_merge"` | 1.1268 s | 28.40 meshes/s | exactly 4 |
 
 For this deliberately over-limit workload, enforcing the guarantee added
-1.1244 s per 32-mesh batch (133.8%). The cost includes batched adjacent-pair
+0.3387 s per 32-mesh batch (43.0%). The cost includes batched adjacent-pair
 concavity scoring, two or three forced merges per mesh, resident-mesh updates,
 and final concavity measurement. If decomposition already produces at most
 `num_parts`, strict mode skips the merge phase; its remaining cost is only
