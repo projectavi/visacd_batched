@@ -1151,6 +1151,11 @@ void validate_parameters(const MeshList &meshes, double concavity,
     throw invalid_argument("max_batch_size cannot be negative");
   if (config.batch_cpu_threads < 0)
     throw invalid_argument("batch_cpu_threads cannot be negative");
+  if (config.part_limit_policy != "split_budget" &&
+      config.part_limit_policy != "adjacent_merge") {
+    throw invalid_argument(
+        "part_limit_policy must be 'split_budget' or 'adjacent_merge'");
+  }
   if (config.batch_memory_fraction <= 0.0 ||
       config.batch_memory_fraction > 1.0) {
     throw invalid_argument("batch_memory_fraction must be in (0, 1]");

@@ -101,11 +101,13 @@ class BatchValidationTests(unittest.TestCase):
         self.max_batch_size = visacd.config.max_batch_size
         self.batch_memory_fraction = visacd.config.batch_memory_fraction
         self.batch_cpu_threads = visacd.config.batch_cpu_threads
+        self.part_limit_policy = visacd.config.part_limit_policy
 
     def tearDown(self):
         visacd.config.max_batch_size = self.max_batch_size
         visacd.config.batch_memory_fraction = self.batch_memory_fraction
         visacd.config.batch_cpu_threads = self.batch_cpu_threads
+        visacd.config.part_limit_policy = self.part_limit_policy
 
     def test_empty_batch(self):
         self.assertEqual(visacd.process_batch([], 0.04, 2), [])
@@ -121,6 +123,11 @@ class BatchValidationTests(unittest.TestCase):
             visacd.process_batch([visacd.Mesh()], 0.04, 2)
 
     def test_invalid_batch_controls(self):
+        visacd.config.part_limit_policy = "invalid"
+        with self.assertRaisesRegex(ValueError, "part_limit_policy"):
+            visacd.process_batch([], 0.04, 2)
+
+        visacd.config.part_limit_policy = "split_budget"
         visacd.config.batch_cpu_threads = -1
         with self.assertRaisesRegex(ValueError, "batch_cpu_threads"):
             visacd.process_batch([], 0.04, 2)
@@ -171,6 +178,7 @@ class BatchGpuTests(unittest.TestCase):
             "score_mode": visacd.config.score_mode,
             "use_flat_surfaces": visacd.config.use_flat_surfaces,
             "use_merging": visacd.config.use_merging,
+            "part_limit_policy": visacd.config.part_limit_policy,
             "max_batch_size": visacd.config.max_batch_size,
             "batch_memory_fraction": visacd.config.batch_memory_fraction,
             "batch_cpu_threads": visacd.config.batch_cpu_threads,
@@ -180,6 +188,7 @@ class BatchGpuTests(unittest.TestCase):
         visacd.config.score_mode = "concavity"
         visacd.config.use_flat_surfaces = False
         visacd.config.use_merging = False
+        visacd.config.part_limit_policy = "split_budget"
         visacd.config.batch_memory_fraction = 0.7
         visacd.config.batch_cpu_threads = 0
         visacd.config.retain_gpu_resources = True

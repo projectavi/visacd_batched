@@ -92,6 +92,8 @@ PYBIND11_MODULE(visacd, m)
         .def_readwrite("flat_surface_k",
                        &neural_acd::Config::flat_surface_k)
         .def_readwrite("use_merging", &neural_acd::Config::use_merging)
+        .def_readwrite("part_limit_policy",
+                       &neural_acd::Config::part_limit_policy)
         .def_readwrite("max_batch_size",
                        &neural_acd::Config::max_batch_size)
         .def_readwrite("batch_memory_fraction",
